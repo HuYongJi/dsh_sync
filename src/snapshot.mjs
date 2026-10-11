@@ -83,28 +83,64 @@ export async function captureCheckpoint({ root, projectId, deviceId, parentId = 
   return { manifest, skipped };
 }
 
+const destinationFailure = code => Object.assign(new Error(code), { code });
+/** Native absolute paths only, while rejecting Windows device/ADS aliases on every platform. */
+export async function validateRestoreDestination(value, protectedRoots = [], { reserved = false } = {}) {
+  if (typeof value !== 'string' || !value || value.length > 4096 || value !== value.normalize('NFC') || !path.isAbsolute(value) || /[\x00-\x1f\x7f<>"|?*]/.test(value) || /^[\\/]{2}/.test(value)) throw destinationFailure('BAD_DESTINATION');
+  const windows = process.platform === 'win32';
+  if (windows ? !/^[A-Za-z]:[\\/]/.test(value) : /[:\\]/.test(value)) throw destinationFailure('BAD_DESTINATION');
+  const tail = windows ? value.slice(3) : value.slice(1);
+  if (tail.includes(':') || tail.split(/[\\/]/).some(part => !part || part === '.' || part === '..' || part.length > 255 || /[. ]$/.test(part) || /^(con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³])(?:\.|$)/i.test(part))) throw destinationFailure('BAD_DESTINATION');
+  const root = path.resolve(value), key = input => windows ? path.resolve(input).toLowerCase() : path.resolve(input);
+  const contains = (a, b) => a === b || a.startsWith(b.endsWith(path.sep) ? b : b + path.sep);
+  const candidate = key(root);
+  for (const protectedRoot of protectedRoots) {
+    const spelling = key(protectedRoot);
+    let real;
+    try { real = key(await fs.realpath(protectedRoot)); } catch (error) { if (error.code !== 'ENOENT') throw destinationFailure('BAD_DESTINATION'); }
+    if ([spelling, real].filter(Boolean).some(item => contains(candidate, item) || contains(item, candidate))) throw destinationFailure('PROTECTED_DESTINATION');
+  }
+  try {
+    const parent = await assertNoSymlinks(path.dirname(root));
+    if (!(await fs.lstat(parent)).isDirectory()) throw destinationFailure('BAD_DESTINATION');
+    if (reserved) { await assertNoSymlinks(root); if (!(await fs.lstat(root)).isDirectory()) throw destinationFailure('BAD_DESTINATION'); }
+    else {
+      try { await fs.lstat(root); } catch (error) { if (error.code === 'ENOENT') return root; throw error; }
+      throw destinationFailure('DESTINATION_EXISTS');
+    }
+  } catch (error) { if (error.code === 'DESTINATION_EXISTS') throw error; throw destinationFailure('BAD_DESTINATION'); }
+  return root;
+}
+
 /** Never merge or overwrite. A failed restore deliberately leaves an INCOMPLETE marker. */
-export async function restoreCheckpoint({ manifest, destination, getBlob }) {
+export async function restoreCheckpoint({ manifest, destination, getBlob, signal, beforeWrite }) {
   manifest = validateManifest(manifest);
   destination = path.resolve(destination);
   await assertNoSymlinks(path.dirname(destination));
+  await beforeWrite?.(); signal?.throwIfAborted();
   // An exclusive directory reservation is the conflict policy for all local files.
   await fs.mkdir(destination, { mode: 0o700 });
   const meta = path.join(destination, '.dsh-sync');
+  // Finish the safety marker even if cancellation races the exclusive mkdir;
+  // never leave a reserved, half-restored directory appearing complete.
   await fs.mkdir(meta, { mode: 0o700 });
   const marker = path.join(meta, 'INCOMPLETE');
   await writeNewFile(marker, Buffer.from('Restore is incomplete. Do not import or run this project.\n'));
   for (const file of manifest.files) {
+    signal?.throwIfAborted();
     const bytes = await getBlob(file.sha256, file.size);
     assert(Buffer.isBuffer(bytes) && bytes.length === file.size && sha256(bytes) === file.sha256, `Corrupt blob: ${file.sha256}`);
     const relative = file.path.startsWith('project/') ? file.path.slice(8) : `.dsh-sync/${file.path}`;
     const target = path.join(destination, ...relative.split('/'));
     await assertNoSymlinks(destination);
+    await beforeWrite?.(); signal?.throwIfAborted();
     await writeNewFile(target, bytes, file.executable);
   }
+  await beforeWrite?.(); signal?.throwIfAborted();
   await writeNewFile(path.join(meta, 'manifest.json'), Buffer.from(JSON.stringify(manifest, null, 2)));
   // This exact marker was exclusively created above; no arbitrary path cleanup.
   await assertNoSymlinks(marker);
+  await beforeWrite?.(); signal?.throwIfAborted();
   await fs.unlink(marker);
   return { root: destination, metadataDirectory: meta, sessionIds: manifest.sessionIds };
 }

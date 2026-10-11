@@ -83,6 +83,19 @@ test('installation check preserves the verified Cordis peer contract', async t =
   await assert.rejects(checkInstall(target), /verified Cordis peer range/);
 });
 
+test('installation check keeps native plugin updating version-pinned and optional', async t => {
+  const target = await installedFixture(t);
+  const filename = path.join(target, 'package.json');
+  const pkg = JSON.parse(await readFile(filename, 'utf8'));
+  pkg.peerDependenciesMeta['@deepseek-ai/dsh-plugin-manager'].optional = false;
+  await writeFile(filename, JSON.stringify(pkg));
+  await assert.rejects(checkInstall(target), /optional Host capability/);
+  pkg.peerDependenciesMeta['@deepseek-ai/dsh-plugin-manager'].optional = true;
+  pkg.peerDependencies['@deepseek-ai/dsh-plugin-manager'] = '*';
+  await writeFile(filename, JSON.stringify(pkg));
+  await assert.rejects(checkInstall(target), /verified native update contract/);
+});
+
 test('installation check refuses automatic sync in the default bundle', async t => {
   const target = await installedFixture(t);
   const filename = path.join(target, 'cordis.patch.yml');

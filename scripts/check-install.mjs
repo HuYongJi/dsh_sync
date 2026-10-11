@@ -27,6 +27,8 @@ export async function checkInstall(directory = sourceRoot) {
     assert.deepEqual(pkg[field] ?? [], [], `${field}: do not bundle host dependencies`);
   }
   assert.equal(pkg.peerDependencies?.['@deepseek-ai/cordis'], '~4.0.4', 'Keep the verified Cordis peer range');
+  assert.equal(pkg.peerDependencies?.['@deepseek-ai/dsh-plugin-manager'], '0.2.0-rc.2', 'Keep the verified native update contract');
+  assert.equal(pkg.peerDependenciesMeta?.['@deepseek-ai/dsh-plugin-manager']?.optional, true, 'Plugin updates must remain an optional Host capability');
   assert.ok(pkg.files?.includes('client/dist/client.js'), 'Explicitly publish the prebuilt client entry');
   for (const name of ['dsh-session', 'dsh-llm', 'dsh-session-format-catalog', 'dsh-client-ui-settings', 'dsh-client-connection']) {
     assert.equal(pkg.peerDependencies?.[`@deepseek-ai/${name}`], '0.2.0-rc.2', 'Do not bypass host compatibility checks');

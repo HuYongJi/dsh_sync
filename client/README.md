@@ -73,6 +73,14 @@ Host/Origin 与 DSH 浏览器会话验证发生在 exact route 分派之前；�
 | `preferences` | `{revision, autoSync, projectIds}` | 新公共状态 |
 | `sync` | `{}` 或 `{projectId: 本机宿主项目ID}` | `{scheduled:true}`，亦兼容公共状态 |
 | `logout` | `{}` | 公共状态，可带 `warning` |
+| `projects` | `{revision, server, username}` | `{projects:[{projectId, checkpointCount, latestCreatedAt}]}` |
+| `checkpoints` | 上述身份绑定 + `{projectId}` | `{checkpoints:[{id, projectId, deviceId, parentId, createdAt, fileCount, totalBytes}], heads:[ID]}` |
+| `restore` | 上述身份绑定 + `{projectId, checkpointId, destination, confirm:true, requestId}` | `{recovery}`，接受后异步下载 |
+| `import` | 上述身份绑定 + `{restoreId, confirm:true, requestId}` | `{recovery}`，接受后异步导入 |
+| `updatestatus` | `{}` | `{update}`，只读本机状态，不请求 GitHub |
+| `checkupdate` | `{}` | `{update}`，显式检查固定仓库版本 |
+| `installupdate` | `{candidateId, requestId, confirm:true}` | `{update}`，原生安装接受后异步执行 |
+| `cancelupdate` | `{requestId}` | `{update}`，只请求取消本插件自己的安装 |
 
 公共状态：
 
@@ -80,7 +88,12 @@ Host/Origin 与 DSH 浏览器会话验证发生在 exact route 分派之前；�
 {
   revision, server, username, loggedIn, expiresAt?, autoSync, intervalMs,
   projects: [{ id, label, root, selected, available, projectId?, warning? }],
-  pending, running, lastResult?: { at, ok, message }, warning?
+  pending, running, lastResult?: { at, ok, message }, warning?,
+  recovery?: {
+    id, kind: 'restore' | 'import', state: 'running' | 'succeeded' | 'failed', root,
+    checkpointId?, sessionCount?, importedCount?, skippedCount?, failedCount?, errorCode?,
+    sessions?: [{sourceId, sessionId?, outcome: 'imported' | 'skipped' | 'failed', workspaceAttached?}]
+  }
 }
 ```
 
@@ -104,6 +117,39 @@ Host 会验证当前密码，成功后撤销云端所有旧 token、退出本机
 - 自动同步开关、全局保存/撤销和立即同步位于“同步状态”卡。运行中仍可取消项目/关闭自动同步后保存；有未保存草稿时不能立即同步。主页面撤销更改会恢复已保存的项目与自动同步设置。
 - 复用宿主 Modal 的焦点约束、Escape 和焦点恢复。搜索框使用 `data-modal-autofocus`，不自行实现对话框或创建第二套 React；主题样式沿用宿主变量。此界面调整不修改 Host RPC、云端接口或 8 位密码策略。
 
+## 0.4.0 云端下载
+
+- “云端下载”提供云端项目浏览、手动云端项目 ID 查询（兼容旧服务器）、检查点列表、分支 head 标记、宿主新目录输入和显式下载确认。不会自动选择一个冲突分支，也不会从远端 sourceRoot 推导本机写入目录。
+- 只读浏览不授权上传；无需选择任何本机同步项目。浏览数据与确认意图绑定保存的 server/username/revision，身份或版本变化后失效。远端响应只保留已验证字段，额外秘密字段不会进入状态。
+- 下载不是浏览器文件保存：目标在 DSH Host 机器，必须是不存在的新目录且父目录存在。Host 拒绝受保护目录、已注册工作区内目录、已有目录和跳转路径。
+- `restore/import` 返回任务状态后由 Host 继续执行。页面轮询 `status.recovery`，关闭页面只停止轮询，同一登录下重新打开读取已有结果；任务记录仅存于本次插件生命周期，不会带到新登录。超时/断线先读取状态，不自动重放写操作；请先检查已有目录和新会话。
+- 下载成功只保存项目文件与档案。用户检查后再确认“导入安全会话”，仅导入支持的安全子集为新 ID，不启动 agent、不自动勾选上传。部分失败、跳过或 workspace 挂载失败需人工核对，页面显示计数和会话 ID，不能用“已归档”等同于“全部可续接”。
+- 导入只接受当前成功恢复的 `restoreId`。插件重启后的旧恢复目录仍可检查后使用 `/sync-import`，不是让浏览器提交任意目录读取。上传/自动同步的原有语义不变，不包含自动拉取或冲突合并。
+
+## 0.5.0 可选原生更新入口
+
+设置页增加“插件更新”卡和确认弹窗，复用原生 Button/Input/Modal 等现有控件。检查更新独立于个人同步登录：页面打开只读取本机 `update` 状态，不自动请求 GitHub。用户点击检查后，Host 查询固定仓库默认分支，取得新稳定版本与固定提交；前端不能提交任意 URL/spec/registry/路径或脚本批准。
+
+`UpdateStatus` 是普通 `status.update` 与四个更新 RPC 的公共值：
+
+```js
+{
+  currentVersion, installedVersion?, supported, restartRequired,
+  state: 'idle' | 'checking' | 'available' | 'up-to-date' | 'installing' |
+    'cancelling' | 'restart-required' | 'cancelled' | 'failed' | 'uncertain',
+  candidate?: {id, version, commit, checkedAt}, requestId?, errorCode?
+}
+```
+
+- 确认意图绑定候选 ID、版本、40 位提交与当前运行版本，只发送 `{candidateId,requestId,confirm:true}`。重复点击、陈旧回调或检查后分支移动不会换成另一个未确认版本。
+- 实际替换仅调用当前 profile 的原生 `pluginManager.installBundle`，服务缺失时仅更新功能不可用。运行版本与已安装版本分开显示；完整重启 DSH 前不能显示新版已经运行。
+- `installing/cancelling` 轮询本机更新状态，即使未登录同步账号也可观察。关闭页面不会自动取消安装；重新打开通过普通状态获知任务。未知回包不重发安装，自动只读核对有界，用户仍可手动刷新。
+- 更新期间锁定其他写操作；原生安装启动后的失败/取消/未知结果同样可能需要重启，不能靠刷新 UI 清除屏障。安装结束后仍允许退出同步账号。确认框说明需要完整重启 DSH 再刷新，不自动重启或更新服务器。
+- 错误只呈现本地安全映射；构建脚本批准和兼容拒绝交回原生 Plugins，不能借此绕过批准或关闭检查。不会把原生安装日志、环境变量、诊断路径或同步凭据回传浏览器。
+- 首次仍需安装含更新入口的 0.5.0；后续需维护者递增稳定版本并把预构建 Client 一起推送到固定仓库默认分支。这不是 GitHub Releases 检查，也不是同版本强制重装工具。
+
+主测试使用合成 Connection、原生控件对象树与 native manager mock，元数据响应也为合成。已只读核对 rc.2 的 manager/可选 `ctx.get`/安装生命周期契约，但没有运行真实 pnpm 安装、修改真实 profile 或验收实际 GUI 更新。
+
 ## 源码、安全与生命周期
 
 - [状态模块](<state.mjs>)：无框架校验、公共响应字段白名单、不可变状态、并发互斥、过期响应丢弃、超时与取消、有限排队确认及挂载期轮询。
@@ -112,7 +158,7 @@ Host 会验证当前密码，成功后撤销云端所有旧 token、退出本机
 - 错误使用本地安全中文 code 映射，不展示可能回显输入的任意异常文本或错误体。公共状态也不保留额外 token/password 字段。
 - 未登录不允许上传；登录、修改选择、保存选择都不调用 `sync`。开启自动同步必须显式操作开关并保存，由 Host 执行调度。
 - `pending` 是待上传/重试的检查点数量，不代表运行中。即使自动同步关闭或队列中有已取消项目，仍可手动重试当前所选项目；只有 `running` 或尚待确认的 `scheduled` 才阻止重复提交。
-- 同步运行中仍可编辑选择、关闭自动同步并保存，或退出登录。Host 会先取消并等待活动操作，再提交设置/退出；已发送内容不能撤回。运行中继续禁止账号重登和新同步。
+- 上传运行中仍可编辑选择、关闭自动同步并保存，或退出登录。Host 会先取消并等待活动上传，再提交设置/退出；已发送内容不能撤回。下载/导入期间其他设置写入锁定，退出会取消并等待任务；native 导入中已落盘的会话不回滚。运行中继续禁止账号重登和新同步。
 - `PROTECTED_QUEUE` 表示旧队列含受保护路径：宿主保留队列但不上传，页面提示检查而不绕过保护。
 - 页面打开、手动刷新与 DSH connection reset 读取状态；仅页面仍挂载且有 `pending/running/scheduled` 时轮询。运行时约 3 秒、仅待上传约 10 秒；出错停止，关闭页面停止轮询。自动上传不由浏览器轮询驱动。
 - dirty 草稿不会被同 revision 轮询覆盖；revision 变化不自动套用新版本覆盖外部选择。

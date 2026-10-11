@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { atomicWrite, readStableFile, assertNoSymlinks } from '../src/files.mjs';
 import { sha256, validateId, validateManifest, MAX_MANIFEST_BYTES } from '../src/protocol.mjs';
 import { validateServerUrl, validatePasswordChange } from '../src/client.mjs';
+import { validateRestoreDestination } from '../src/snapshot.mjs';
 
 export const MAX_PROJECTS = 200;
 export const settingsFailure = (code, message) => Object.assign(new Error(message), { code });
@@ -139,6 +140,22 @@ export function createSettingsService(ctx, controller, { profileDir, dshHome } =
     if (restored) return validateManifest(restored).projectId;
     return `project-${randomUUID()}`;
   }
+  function recoveryBinding(input, fields) {
+    requireValue(exact(input, ['revision', 'server', 'username', ...fields]) && Number.isSafeInteger(input.revision) && input.revision >= 0 && typeof input.server === 'string' && input.server.length <= 2048 && typeof input.username === 'string' && input.username.length > 0 && Buffer.byteLength(input.username) <= 128 && !/[\x00-\x1f\x7f]/.test(input.username));
+    let server;
+    try { server = validateServerUrl(input.server); } catch { throw settingsFailure('BAD_REQUEST', '服务器无效'); }
+    requireValue(server === input.server);
+    return async () => {
+      await initialize();
+      if (input.revision !== preferences.revision) throw settingsFailure('CONFIG_CONFLICT', '设置已变更');
+      if (server !== preferences.server || input.username !== preferences.username) throw settingsFailure('ACCOUNT_MISMATCH', '账号已变更');
+    };
+  }
+  async function admitDestination(destination, options) {
+    // All registered roots are protected, not just the selected upload set.
+    const roots = [...protectedRoots, ...listedWorkspaces().map(item => item.root), ...preferences.bindings.map(item => item.root)];
+    return validateRestoreDestination(destination, roots, options);
+  }
   const service = {
     filename,
     initialize,
@@ -152,8 +169,9 @@ export function createSettingsService(ctx, controller, { profileDir, dshHome } =
     },
     async status() {
       await initialize();
-      const state = await controller.status();
-      return { revision: preferences.revision, server: preferences.server || '', username: preferences.username || '', loggedIn: state.loggedIn, ...(state.expiresAt ? { expiresAt: state.expiresAt } : {}), autoSync: state.reauthRequired ? false : preferences.autoSync, intervalMs: preferences.intervalMs, projects: await projectRows(), pending: state.pending, running: state.running, ...(state.lastResult ? { lastResult: summarizeLastResult(state.lastResult) } : {}) };
+      const snapshot = preferences, projects = await projectRows(), state = await controller.status();
+      if (snapshot.revision !== preferences.revision || snapshot.server !== preferences.server || snapshot.username !== preferences.username) throw settingsFailure('CONFIG_CONFLICT', '设置已变更');
+      return { revision: snapshot.revision, server: snapshot.server || '', username: snapshot.username || '', loggedIn: state.loggedIn, ...(state.expiresAt ? { expiresAt: state.expiresAt } : {}), autoSync: state.reauthRequired ? false : snapshot.autoSync, intervalMs: snapshot.intervalMs, projects, pending: state.pending, running: state.running, ...(state.recovery ? { recovery: state.recovery } : {}), ...(state.lastResult ? { lastResult: summarizeLastResult(state.lastResult) } : {}) };
     },
     async login(input, signal) {
       requireValue(exact(input, ['server', 'username', 'password']) && typeof input.server === 'string' && input.server.length <= 2048 && typeof input.username === 'string' && typeof input.password === 'string');
@@ -212,6 +230,26 @@ export function createSettingsService(ctx, controller, { profileDir, dshHome } =
       });
       return service.status();
     },
+    async projects(input, signal) {
+      const checkBinding = recoveryBinding(input, []); await checkBinding();
+      return controller.browse('projects', undefined, { checkBinding, signal });
+    },
+    async checkpoints(input, signal) {
+      const checkBinding = recoveryBinding(input, ['projectId']); validateId(input.projectId); await checkBinding();
+      return controller.browse('checkpoints', input.projectId, { checkBinding, signal });
+    },
+    async restore(input, signal) {
+      const checkBinding = recoveryBinding(input, ['projectId', 'checkpointId', 'destination', 'confirm', 'requestId']);
+      validateId(input.projectId); validateId(input.checkpointId); validateId(input.requestId); requireValue(input.confirm === true);
+      if (typeof input.destination !== 'string' || !path.isAbsolute(input.destination) || (process.platform === 'win32' && !/^[A-Za-z]:[\\/]/.test(input.destination)) || input.destination.length > 4096 || /[\x00-\x1f\x7f]/.test(input.destination)) throw settingsFailure('BAD_DESTINATION', '恢复目录无效');
+      await checkBinding();
+      return controller.startRecovery('restore', { requestId: input.requestId, projectId: input.projectId, checkpointId: input.checkpointId, destination: input.destination }, { checkBinding, admitDestination, signal });
+    },
+    async import(input, signal) {
+      const checkBinding = recoveryBinding(input, ['restoreId', 'confirm', 'requestId']);
+      validateId(input.restoreId); validateId(input.requestId); requireValue(input.confirm === true); await checkBinding();
+      return controller.startRecovery('import', { requestId: input.requestId, restoreId: input.restoreId }, { checkBinding, signal });
+    },
     async sync(input = {}) {
       requireValue(exact(input, ['projectId']) && (input.projectId === undefined || validWorkspaceId(input.projectId)));
       await initialize(); return controller.scheduleSelected(input.projectId);
@@ -224,6 +262,7 @@ export function createSettingsService(ctx, controller, { profileDir, dshHome } =
   };
   controller.setInitializer(initialize); controller.setRootAdmission(mapping => service.admit(mapping));
   controller.setCaptureExclusions(mapping => protectedExclusions(mapping.root));
+  controller.setRestoreAdmission(admitDestination);
   controller.setIdentityPersister(async (identity, { pauseAutoSync = false } = {}) => {
     const before = preferences;
     const changed = before.server !== identity.server || before.username !== identity.username;

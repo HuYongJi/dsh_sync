@@ -6,7 +6,7 @@
 node --test --test-isolation=none tests/*.test.mjs
 ```
 
-当前开发验证环境为 **Windows / Node.js 25.8.1**。全套测试已经运行：**188 项通过，0 失败，0 跳过**。服务只监听测试进程动态分配的 loopback 端口，使用测试密码和合成数据；临时文件局限在本仓库 `.test-tmp` 的独立子目录。
+当前开发验证环境为 **Windows / Node.js 25.8.1**。0.5.0 全套测试已经运行：**284 项通过，0 失败，0 跳过**。服务只监听测试进程动态分配的 loopback 端口，使用测试密码和合成数据；临时文件局限在本仓库 `.test-tmp` 的独立子目录。
 
 `--test-isolation=none` 避免 Windows 受限环境中测试运行器为子进程建立捕获管道。未开启替代 Web GUI 服务器、未访问真实账号数据、未上传真实项目、未修改已安装 DSH 或日常 profile。
 
@@ -22,7 +22,13 @@ node --test --test-isolation=none tests/*.test.mjs
 | [改密 Client](../tests/password-client.test.mjs) | 20 | 三个密码框清理、CAS 身份绑定、确认不发送、长度规则、当前密码拒绝、未知结果锁定、取消/超时不重发及精简 UI |
 | [改密 Host 与链路](../tests/password-host.test.mjs) | 19（含 2 个子测试） | 真实云端改密、所有旧 token 撤销、旧服务能力探测、intent 持久化/恢复、损坏回包、清理失败、秘密不落盘、Client→Host→云端闭环 |
 | [改密云服务](../tests/password-server.test.mjs) | 14 | 当前密码而非 token 鉴权、Unicode/JSON 边界、原子撤销、并发 CAS、旧登录/写入竞态、重启兼容及失败原子性 |
-| [GitHub 安装包](../tests/package.test.mjs) | 9 | 包入口、预构建产物一致性、仅发布白名单的独立包、缺失 Client、安装 lifecycle、可选/捆绑依赖、Cordis peer、不安全默认配置、错误模块 ID |
+| [GitHub 安装包](../tests/package.test.mjs) | 10 | 包入口、预构建产物一致性、仅发布白名单的独立包、缺失 Client、安装 lifecycle、可选/捆绑依赖、Cordis peer、不安全默认配置、错误模块 ID |
+| [下载恢复 Client](<../tests/recovery-client.test.mjs>) | 21 | 云端浏览与旧服务手填 ID、检查点单选、绑定确认、异步轮询、超时不重放、部分结果、原生控件对象树 |
+| [下载恢复 Host](<../tests/recovery-host.test.mjs>) | 19 | 认证项目目录、真实 HTTP 下载、目录/哈希保护、重复 ID、部分导入、取消/等待、账号与并发边界 |
+| [下载恢复完整链路](<../tests/recovery-integration.test.mjs>) | 3 | 生产 Client→RPC→Host→真实云服务下载、独立导入确认、陈旧 revision 拒绝、部分持久化 ID 与秘密隔离 |
+| [插件更新 Client](<../tests/update-client.test.mjs>) | 28 | 显式检查/确认、固定提交与严格字段、未登录可用、轮询/取消、陈旧回调、未知结果不重放、重启屏障和原生控件对象树 |
+| [插件更新 Host](<../tests/update-host.test.mjs>) | 22 | 固定匿名元数据、压缩与字节限额、可选原生 manager、提交固定、候选过期、并发锁、批准拒绝、取消/终态与 HMR dispose 互等回归 |
+| [插件更新联合链路](<../tests/update-integration.test.mjs>) | 2 | 生产 Client→RPC→Host→模拟原生安装器，版本/提交固定、无秘密、重启门禁与构建批准失败 |
 
 ## GitHub 地址安装的验证边界
 
@@ -80,6 +86,24 @@ Client 对象树回归覆盖：登录后整个登录表单不挂载、只显示�
 管理弹窗验证搜索与批量选择、关闭保留未保存草稿且不发 RPC、全局撤销、显式保存成功才关闭、保存失败留在弹窗、保存中旧关闭 handler 不能绕过锁定，以及冲突时弹窗内刷新。运行中仍可取消项目和关闭自动同步后保存；不可用项目能取消但不能重新选择。
 
 只读核对了 rc.2 原生 Modal/Input/Checkbox 契约，构建复用宿主控件。此处仍是对象树/接口测试，**未执行真实浏览器的视觉、焦点或窄屏验收，也未安装到日常 profile**；不能将构建完成等同于当前 GUI 已更新。
+
+## 0.4.0 图形化下载恢复
+
+新增下载相关测试区分三个层次：Client 状态/原生控件对象树、Host 与真实 loopback 云服务、生产 Client → 原生 RPC envelope → Host → 真实 HTTP/磁盘的完整下载链路。云端目录只列出已提交检查点所属项目；旧服务器可使用已知项目 ID 查询。
+
+重点验证显式选择/确认、不自动上传或导入、跨账号/版本的陈旧意图、异步状态读取、重复请求不重做，以及新目录、受保护路径、大小/哈希、失败标记、部分导入的新会话 ID。下载成功与导入成功分别报告，未知结果不能自动重发。
+
+下载链路使用合成二进制文件与合成会话档案；链路中的 credentials/workspaceRegistry 和会话导入为隔离 mock。真正 native 会话 codec/provider 的既有验证见上文，不把这些测试或重建 bundle 冒称为当前日常 GUI 的安装、视觉、焦点或实机跨设备验收。
+
+## 0.5.0 一键更新
+
+更新测试分为 Client 状态与原生控件对象树、Host 更新服务与控制器，以及生产 Client → RPC envelope → Host 的联合测试。GitHub 元数据与 `pluginManager` 安装器全部为合成替身，**不执行真实 pnpm、下载外部代码、改写真实 profile 或安装目录**。
+
+已只读核实 DSH 0.2.0-rc.2 的原生 `ctx.get('pluginManager')` 可选访问、`listBundles` 直接依赖判断、固定 Git 提交替换、`restart-required`、构建批准与版本检查、取消/应用阶段和 HMR 队列契约。测试验证无隐式检查/安装、匿名固定域请求、版本和提交校验、大小/时间限制、压缩响应、候选过期、严格 RPC 参数、重复/陈旧意图、并发拒绝、结果脱敏、重启屏障和取消状态。插件 dispose 的合成用例还验证不与原生 applying/HMR 互相等待。
+
+联合测试覆盖未登录个人云账号时检查/确认固定提交安装、仅原生 manager 调用、不转发任何 token/密码、运行版与已安装版分开显示、脚本批准拒绝不自动重试，以及安装后其他写操作被锁定。安装包检查额外验证 native manager peer 精确且可选。
+
+这些是契约/状态测试，不宣称验证了当前桌面 GUI 的一键安装、真实 GitHub 网络、代理配置、pnpm 缓存行为或完整重启。实际验收仍需用户批准的独立 profile；此次未发布仓库提交，也未执行客户端更新。
 
 ## 注意测试层次
 

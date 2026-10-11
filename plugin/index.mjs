@@ -3,6 +3,7 @@ import { assert } from '../src/protocol.mjs';
 import { createController } from './controller.mjs';
 import { createSettingsService, credentialKeyForProfile } from './settings-service.mjs';
 import { createSettingsHttp, registerSettingsRoutes } from './settings-http.mjs';
+import { createUpdateService, withUpdateStatus } from './update-service.mjs';
 export { createController, normalizeConfig, CREDENTIAL_KEY } from './controller.mjs';
 export { credentialKeyForProfile } from './settings-service.mjs';
 
@@ -15,7 +16,8 @@ export function apply(ctx, config = {}) {
   assert(typeof profileDir === 'string' && path.isAbsolute(profileDir), '个人同步需要可识别的 DSH profileContext');
   assert(typeof dshHome === 'string' && path.isAbsolute(dshHome), '个人同步需要可识别的 DSH 数据目录');
   const controller = createController(ctx, { ...config, stateDir: config.stateDir || path.join(profileDir, 'dsh-personal-sync') }, { credentialKey: credentialKeyForProfile(profileDir), allowLegacyCli: config.allowLegacyCli === true });
-  const settings = createSettingsService(ctx, controller, { profileDir, dshHome });
+  const updates = createUpdateService(ctx, controller);
+  const settings = withUpdateStatus(createSettingsService(ctx, controller, { profileDir, dshHome }), updates);
   const bridge = createSettingsHttp(settings);
   registerSettingsRoutes(ctx, bridge);
   ctx.authorization.registerFlow({ key: controller.credentialKey, label: '个人云同步', methods: [{ id: 'password', label: '登录个人同步服务器' }], run: session => controller.authorize(session) });
@@ -42,5 +44,10 @@ export function apply(ctx, config = {}) {
     finally { checking = false; }
   }, 5000);
   timer.unref?.();
-  ctx.on('dispose', async () => { clearInterval(timer); bridge.dispose(); controller.stop(); await controller.drain(); });
+  ctx.on('dispose', async () => {
+    clearInterval(timer); bridge.dispose(); updates.dispose(); controller.stop();
+    // Native applying may need the HMR queue currently disposing us. Request
+    // cancellation, but leave native task cleanup to its owning manager.
+    await Promise.all([updates.drain({ native: false }), controller.drain()]);
+  });
 }

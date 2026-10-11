@@ -4,6 +4,27 @@ export const SETTINGS_API = '/api/dsh-personal-sync/';
 export const MAX_SETTINGS_BODY = 64 * 1024;
 const messages = Object.freeze({
   BAD_REQUEST: '参数无效',
+  UPDATE_UNAVAILABLE: '当前宿主没有可用的原生插件管理器',
+  UPDATE_UNMANAGED: '此插件不是可更新的当前配置依赖，请使用原生插件管理',
+  UPDATE_CHECK_FAILED: '检查插件更新失败，请稍后重试',
+  UPDATE_INVALID_METADATA: '更新元数据无效或不兼容',
+  UPDATE_CHECK_REQUIRED: '更新检查已失效，请重新检查',
+  UPDATE_NOT_NEWER: '候选版本不是更新版本',
+  UPDATE_BUILD_APPROVAL_REQUIRED: '需要在原生插件管理中确认构建脚本',
+  UPDATE_INCOMPATIBLE: '更新与当前 DSH 版本不兼容',
+  UPDATE_FAILED: '插件更新失败，请检查原生插件管理',
+  UPDATE_UNCERTAIN: '更新结果未确认，请检查原生插件管理并重启 DSH',
+  UPDATE_CANCEL_TOO_LATE: '原生管理器已开始应用更新，无法取消',
+  UPDATE_RESTART_REQUIRED: '插件文件可能已变更，请先重启 DSH',
+  CLOUD_BROWSE_UNSUPPORTED: '请升级同步服务器，或填写云端项目 ID',
+  BAD_DESTINATION: '恢复目录无效，父目录必须已存在且无链接',
+  DESTINATION_EXISTS: '恢复目录已存在',
+  PROTECTED_DESTINATION: '不能恢复到 DSH 或已有项目目录中',
+  CHECKPOINT_MISMATCH: '检查点不属于所选项目',
+  RESTORE_FAILED: '下载恢复未完成，请检查不完整目录',
+  IMPORT_FAILED: '会话导入未全部完成，请检查结果',
+  RECOVERY_UNAVAILABLE: '没有可导入的本次下载恢复',
+  RECOVERY_LIMIT: '本次插件运行的恢复请求已达上限',
   NOT_LOGGED_IN: '请重新登录',
   ACCOUNT_MISMATCH: '账号不一致，请重新登录',
   ACCOUNT_BOUND: '账号已绑定同步记录',
@@ -81,7 +102,7 @@ async function readBody(request, timeoutMs) {
 export function createSettingsHttp(service, { bodyTimeoutMs = 10_000, maxActive = 16 } = {}) {
   let disposed = false, active = 0;
   const loginAttempts = [];
-  const actions = new Set(['status', 'login', 'password', 'preferences', 'sync', 'logout']);
+  const actions = new Set(['status', 'login', 'password', 'preferences', 'sync', 'logout', 'projects', 'checkpoints', 'restore', 'import', 'updatestatus', 'checkupdate', 'installupdate', 'cancelupdate']);
   return {
     async fetch(action, request) {
       let rpcId, payload;
@@ -112,6 +133,7 @@ export function createSettingsHttp(service, { bodyTimeoutMs = 10_000, maxActive 
           value = action === 'login' ? await service.login(payload, request.signal) : await service.password(payload, request.signal);
         } else if (action === 'preferences') value = await service.savePreferences(payload, request.signal);
         else if (action === 'sync') value = await service.sync(payload);
+        else if (['projects', 'checkpoints', 'restore', 'import', 'updatestatus', 'checkupdate', 'installupdate', 'cancelupdate'].includes(action)) value = await service[action](payload, request.signal);
         else value = await service.logout(payload);
         return response(rpcId ? { type: 'server-response', rpcId, result: { ok: true, value } } : value);
       } catch (error) {
@@ -130,7 +152,7 @@ export function createSettingsHttp(service, { bodyTimeoutMs = 10_000, maxActive 
   };
 }
 export function registerSettingsRoutes(ctx, bridge) {
-  for (const action of ['status', 'login', 'password', 'preferences', 'sync', 'logout']) {
+  for (const action of ['status', 'login', 'password', 'preferences', 'sync', 'logout', 'projects', 'checkpoints', 'restore', 'import', 'updatestatus', 'checkupdate', 'installupdate', 'cancelupdate']) {
     ctx.connection.fetch.register({ path: SETTINGS_API + action, methods: ['POST'], requestBody: 'streaming', fetch: request => bridge.fetch(action, request) });
   }
 }

@@ -107,9 +107,11 @@ export class LocalStore {
     }
     return results;
   }
-  async restore(client, id, destination) {
+  async restore(client, id, destination, { projectId, signal = client.signal, beforeWrite } = {}) {
     const manifest = await client.getCheckpoint(id);
-    const result = await restoreCheckpoint({ manifest, destination, getBlob: (hash, size) => client.downloadBlob(hash, size) });
+    if (projectId !== undefined && manifest.projectId !== projectId) throw Object.assign(new Error('Checkpoint project mismatch'), { code: 'CHECKPOINT_MISMATCH' });
+    signal?.throwIfAborted();
+    const result = await restoreCheckpoint({ manifest, destination, signal, beforeWrite, getBlob: (hash, size) => client.downloadBlob(hash, size) });
     return { ...result, manifest };
   }
 }

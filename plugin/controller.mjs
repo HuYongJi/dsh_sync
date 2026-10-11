@@ -1,8 +1,8 @@
 import path from 'node:path';
 import os from 'node:os';
 import fs from 'node:fs/promises';
-import { assert, validateId, sha256 } from '../src/protocol.mjs';
-import { atomicWrite, assertNoSymlinks } from '../src/files.mjs';
+import { assert, validateId, validateManifest, sha256, MAX_FILES, MAX_MANIFEST_BYTES } from '../src/protocol.mjs';
+import { atomicWrite, assertNoSymlinks, readStableFile } from '../src/files.mjs';
 import { SyncClient, validateServerUrl, validatePasswordChange } from '../src/client.mjs';
 import { LocalStore, newDeviceId } from '../src/local-store.mjs';
 import { isExcluded } from '../src/snapshot.mjs';
@@ -29,7 +29,7 @@ async function revokeOwnedGrant(record) {
   catch { return { remoteRevoked: false }; } // A damaged owned origin must not trap local logout.
 }
 
-export function createController(ctx, initialConfig, { exportSessions = exportProjectSessions, importSessions = importProjectSessions, credentialKey = CREDENTIAL_KEY, allowLegacyCli = true } = {}) {
+export function createController(ctx, initialConfig, { exportSessions = exportProjectSessions, importSessions = importProjectSessions, credentialKey = CREDENTIAL_KEY, allowLegacyCli = true, maxRecoveryRequests = 1000 } = {}) {
   let config = normalizeConfig(initialConfig), initializer = async () => {}, rootAdmission = async () => {}, captureExclusions = async () => [], identityPersister;
   const store = new LocalStore(config.stateDir), lifetime = new AbortController(), scheduled = new Set();
   const reauthMarker = path.join(store.directory, `reauth-${sha256(credentialKey).slice(0, 24)}.json`);
@@ -42,7 +42,16 @@ export function createController(ctx, initialConfig, { exportSessions = exportPr
     await assertNoSymlinks(reauthMarker);
     await fs.unlink(reauthMarker); // Only this profile-owned, exactly identified marker.
   }
+  assert(Number.isSafeInteger(maxRecoveryRequests) && maxRecoveryRequests > 0 && maxRecoveryRequests <= 10_000, 'Invalid recovery limit');
+  const recoveryIds = new Map();
+  let recoveryTask = null, recoveryAbort, latestRecovery, latestRestore;
+  let restoreAdmission = async () => {};
   let stopped = false, mutating = false, batchRunning = false, active = null, activeAbort, mutationTask = null, generation = 0, lastResult = null;
+  let updateRunning = false, updateRestartRequired = false;
+  function updateAdmission(allowAfterUpdate = false) {
+    if (updateRunning) throw failure('BUSY', '插件更新进行中');
+    if (updateRestartRequired && !allowAfterUpdate) throw failure('UPDATE_RESTART_REQUIRED', '插件文件可能已变更，请先重启 DSH');
+  }
   const ready = async () => { assert(!stopped, 'Plugin is stopped'); await initializer(); lifetime.signal.throwIfAborted(); };
   async function account() {
     if (await requiresReauthentication()) throw failure('NOT_LOGGED_IN', '请重新登录');
@@ -66,12 +75,13 @@ export function createController(ctx, initialConfig, { exportSessions = exportPr
     config = normalized;
   }
   function clearScheduled() { for (const handle of scheduled) clearImmediate(handle); scheduled.clear(); }
-  async function mutate(action) {
-    await ready();
-    if (mutating) throw failure('BUSY', '另一项设置操作尚未完成，请稍后重试');
+  async function mutate(action, { cancelRecovery = false, requireIdle = false, allowAfterUpdate = false } = {}) {
+    await ready(); updateAdmission(allowAfterUpdate);
+    if (mutating || (recoveryTask && !cancelRecovery) || (requireIdle && (active || batchRunning || scheduled.size))) throw failure('BUSY', '另一项操作尚未完成，请稍后重试');
     mutating = true; generation++; clearScheduled(); activeAbort?.abort();
+    if (cancelRecovery) recoveryAbort?.abort();
     const operation = (async () => {
-      await active?.catch(() => {}); lifetime.signal.throwIfAborted();
+      await Promise.allSettled([active, cancelRecovery ? recoveryTask : null].filter(Boolean)); lifetime.signal.throwIfAborted();
       return store.exclusive(async () => { lifetime.signal.throwIfAborted(); return action(); });
     })();
     mutationTask = operation;
@@ -178,8 +188,8 @@ export function createController(ctx, initialConfig, { exportSessions = exportPr
     return { changed: true, ...(cleanupFailed ? { warning: '密码已修改，本机清理未完成' } : {}) };
   }
   async function push(id) {
-    await ready();
-    if (mutating || active) throw failure('BUSY', '同步或设置操作正在进行');
+    await ready(); updateAdmission();
+    if (mutating || active || recoveryTask) throw failure('BUSY', '同步或设置操作正在进行');
     const mapping = project(id), epoch = generation, abort = new AbortController(); activeAbort = abort;
     const operation = (async () => {
       try {
@@ -225,14 +235,134 @@ export function createController(ctx, initialConfig, { exportSessions = exportPr
     active = operation;
     try { return await operation; } finally { if (active === operation) active = null; }
   }
+  const sameAccount = (a, b) => a && b && ['server', 'username', 'deviceId', 'token'].every(key => a[key] === b[key]);
+  const publicRecovery = job => structuredClone(job.value);
+  function importSummary(result, manifest) {
+    const sessions = [], known = new Set(manifest.sessionIds), seen = new Set(), reported = new Set();
+    for (const [field, outcome] of [['imported', 'imported'], ['skipped', 'skipped'], ['failed', 'failed']]) {
+      assert(Array.isArray(result?.[field]) && result[field].length <= MAX_FILES * 2, 'Invalid import result');
+      for (const entry of result[field]) {
+        const sourceId = validateId(outcome === 'imported' ? entry?.sourceId : entry?.id);
+        assert(known.has(sourceId), 'Unknown import source');
+        const sessionId = entry.sessionId === undefined ? undefined : validateId(entry.sessionId);
+        if (outcome === 'imported') assert(sessionId && typeof entry.workspaceAttached === 'boolean', 'Invalid imported session');
+        const key = `${outcome}:${sourceId}:${sessionId || ''}`;
+        if (seen.has(key)) continue; seen.add(key); reported.add(sourceId);
+        sessions.push({ sourceId, ...(sessionId ? { sessionId } : {}), outcome, ...(outcome === 'imported' ? { workspaceAttached: entry.workspaceAttached } : {}) });
+      }
+    }
+    assert(manifest.sessionIds.every(id => reported.has(id)), 'Incomplete import result');
+    return { importedCount: sessions.filter(item => item.outcome === 'imported').length, skippedCount: sessions.filter(item => item.outcome === 'skipped').length, failedCount: sessions.filter(item => item.outcome === 'failed').length, sessions };
+  }
+  function recoveryError(error, kind) {
+    const safe = new Set(['NOT_LOGGED_IN', 'ACCOUNT_MISMATCH', 'CONFIG_CONFLICT', 'BAD_DESTINATION', 'DESTINATION_EXISTS', 'PROTECTED_DESTINATION', 'CHECKPOINT_MISMATCH', 'RECOVERY_UNAVAILABLE', 'BUSY']);
+    if (stopped) return 'DISPOSED';
+    if (safe.has(error?.code)) return error.code;
+    if (error?.status === 401) return 'NOT_LOGGED_IN';
+    if (error?.code === 'EEXIST' && kind === 'restore') return 'DESTINATION_EXISTS';
+    return kind === 'restore' ? 'RESTORE_FAILED' : 'IMPORT_FAILED';
+  }
+  async function startRecovery(kind, input, { checkBinding, admitDestination, signal } = {}) {
+    await ready(); updateAdmission(); await checkBinding(); signal?.throwIfAborted();
+    const credentials = await account();
+    await checkBinding(); signal?.throwIfAborted(); lifetime.signal.throwIfAborted();
+    if (Date.parse(credentials.expiresAt) <= Date.now()) throw failure('NOT_LOGGED_IN', '请重新登录');
+    const fingerprint = JSON.stringify({ kind, ...input });
+    const prior = recoveryIds.get(input.requestId);
+    if (prior) {
+      if (!sameAccount(prior.identity, credentials)) throw failure('RECOVERY_UNAVAILABLE', '恢复请求不可用');
+      if (prior.fingerprint !== fingerprint) throw failure('BAD_REQUEST', '请求 ID 已使用');
+      return { recovery: publicRecovery(prior) };
+    }
+    updateAdmission();
+    if (mutating || active || batchRunning || scheduled.size || recoveryTask) throw failure('BUSY', '另一项操作尚未完成');
+    if (recoveryIds.size >= maxRecoveryRequests) throw failure('RECOVERY_LIMIT', '恢复请求已达上限');
+    const restored = latestRestore;
+    if (kind === 'import' && (!restored || restored.value.id !== input.restoreId || restored.consumed || !sameAccount(restored.identity, credentials))) throw failure('RECOVERY_UNAVAILABLE', '没有可导入的本次恢复');
+    const job = { identity: credentials, fingerprint, value: { id: input.requestId, kind, state: 'running', root: kind === 'restore' ? input.destination : restored.value.root, checkpointId: kind === 'restore' ? input.checkpointId : restored.value.checkpointId, ...(kind === 'import' ? { sessionCount: restored.value.sessionCount } : {}) } };
+    recoveryIds.set(input.requestId, job); latestRecovery = job;
+    const abort = new AbortController(); recoveryAbort = abort;
+    const taskSignal = AbortSignal.any([lifetime.signal, abort.signal]);
+    // Page-request cancellation is intentionally not linked after acceptance.
+    const operation = Promise.resolve().then(async () => {
+      let completedRestore;
+      try {
+        await store.exclusive(async () => {
+          const check = async () => {
+            taskSignal.throwIfAborted(); await checkBinding();
+            if (!sameAccount(credentials, await account())) throw failure('ACCOUNT_MISMATCH', '账号已变更');
+            taskSignal.throwIfAborted();
+          };
+          await check();
+          if (kind === 'restore') {
+            await admitDestination(input.destination);
+            let reserved = false;
+            const result = await store.restore(new SyncClient({ ...credentials, signal: taskSignal }), input.checkpointId, input.destination, {
+              projectId: input.projectId, signal: taskSignal,
+              beforeWrite: async () => { await check(); await admitDestination(input.destination, { reserved }); reserved = true; taskSignal.throwIfAborted(); },
+            });
+            job.value.sessionCount = result.sessionIds.length;
+            job.manifest = result.manifest; completedRestore = job;
+          } else {
+            // Consume before invoking the native adapter: a partial/durable import must
+            // not be replayed with a fresh request ID after an ambiguous failure.
+            restored.consumed = true;
+            const filename = await assertNoSymlinks(path.join(restored.value.root, '.dsh-sync', 'manifest.json'));
+            const manifest = validateManifest(JSON.parse((await readStableFile(filename, MAX_MANIFEST_BYTES * 2)).bytes.toString('utf8')));
+            assert(JSON.stringify(manifest) === JSON.stringify(restored.manifest), 'Restored manifest changed');
+            await check();
+            const result = await importSessions(ctx, { manifest, root: restored.value.root });
+            Object.assign(job.value, importSummary(result, manifest));
+            await check(); // Keep counts/IDs even if logout/disposal happened mid-adapter.
+            if (job.value.skippedCount || job.value.failedCount || job.value.sessions.some(item => item.outcome === 'imported' && !item.workspaceAttached)) throw failure('IMPORT_FAILED', '导入未全部完成');
+          }
+        });
+        job.value.state = 'succeeded';
+        if (completedRestore) {
+          if (latestRestore) delete latestRestore.manifest;
+          latestRestore = completedRestore;
+        }
+      } catch (error) { job.value.state = 'failed'; job.value.errorCode = recoveryError(error, kind); }
+    }).finally(() => {
+      if (kind === 'import' && restored.consumed) delete restored.manifest;
+      if (recoveryTask === operation) { recoveryTask = null; recoveryAbort = undefined; }
+    });
+    recoveryTask = operation;
+    return { recovery: publicRecovery(job) };
+  }
   const controller = {
     get config() { return config; }, store, credentialKey,
     setInitializer(value) { initializer = value; },
     setRootAdmission(value) { rootAdmission = value; },
     setCaptureExclusions(value) { captureExclusions = value; },
+    setRestoreAdmission(value) { restoreAdmission = value; },
+    startRecovery,
+    async browse(kind, projectId, { checkBinding, signal } = {}) {
+      return mutate(async () => {
+        const requestSignal = signal ? AbortSignal.any([signal, lifetime.signal]) : lifetime.signal;
+        requestSignal.throwIfAborted(); await checkBinding();
+        const identity = await account(), client = new SyncClient({ ...identity, signal: requestSignal });
+        const result = kind === 'projects' ? await client.projects() : await client.list(projectId);
+        await checkBinding(); requestSignal.throwIfAborted();
+        if (!sameAccount(identity, await account())) throw failure('ACCOUNT_MISMATCH', '账号已变更');
+        return result;
+      }, { requireIdle: true });
+    },
     setIdentityPersister(value) { identityPersister = value; },
     replaceConfiguration,
     mutate,
+    // Only admission/acceptance is under the shared mutation lock. Native work is
+    // Host-owned; a permanent write barrier remains after it starts, even on failure.
+    markUpdateRestartRequired() { updateRestartRequired = true; },
+    runUpdate(action) {
+      return mutate(() => action({
+        begin() {
+          lifetime.signal.throwIfAborted(); updateAdmission();
+          updateRunning = true; updateRestartRequired = true;
+        },
+        settled() { updateRunning = false; },
+      }), { requireIdle: true });
+    },
     login(input, options) { return mutate(() => loginWithinMutation(input, options)); },
     async changePassword(input, options) {
       validatePasswordChange(input);
@@ -262,7 +392,7 @@ export function createController(ctx, initialConfig, { exportSessions = exportPr
     },
     push,
     async tick() {
-      await ready(); if (mutating || batchRunning || active) return;
+      await ready(); if (updateRestartRequired || updateRunning || mutating || batchRunning || active || recoveryTask) return;
       batchRunning = true; const epoch = generation, results = [];
       try {
         for (const item of [...config.projects]) {
@@ -275,37 +405,42 @@ export function createController(ctx, initialConfig, { exportSessions = exportPr
       } finally { batchRunning = false; }
     },
     schedulePush(id) {
-      project(id); assert(!stopped, 'Plugin is stopped');
+      updateAdmission(); project(id); assert(!stopped, 'Plugin is stopped');
+      if (recoveryTask || mutating) throw failure('BUSY', '另一项操作尚未完成');
       const handle = setImmediate(() => {
         scheduled.delete(handle); if (!stopped) void push(id).catch(() => {});
       });
       scheduled.add(handle); return { scheduled: true, next: '命令结束后执行同步，请用设置页或 /sync-status 查看结果。' };
     },
     async scheduleSelected(workspaceId) {
-      await ready();
-      if (mutating || active || batchRunning || scheduled.size) throw failure('BUSY', '同步或设置操作正在进行');
+      await ready(); updateAdmission();
+      if (mutating || active || batchRunning || scheduled.size || recoveryTask) throw failure('BUSY', '同步或设置操作正在进行');
       const credentials = await account();
       if (Date.parse(credentials.expiresAt) <= Date.now()) throw failure('NOT_LOGGED_IN', '登录已过期，请重新登录');
       if (workspaceId !== undefined) {
         const mapping = config.projects.find(item => item.workspaceId === workspaceId);
         assert(mapping, 'Project is not selected'); return controller.schedulePush(mapping.id);
       }
+      updateAdmission();
       assert(config.projects.length > 0, 'No projects selected');
       const handle = setImmediate(() => { scheduled.delete(handle); if (!stopped) void controller.tick().catch(() => {}); });
       scheduled.add(handle); return { scheduled: true };
     },
     async status() {
       await ready(); await store.init();
-      let loggedIn = false, expiresAt, reauthRequired = true;
+      const epoch = generation, pending = (await store.pending()).length;
+      let loggedIn = false, expiresAt, identity, reauthRequired = true;
       try { reauthRequired = await requiresReauthentication() || (await store.config())?.reauthRequired === true; } catch {}
-      try { const record = await account(); expiresAt = record.expiresAt; loggedIn = Number.isFinite(Date.parse(expiresAt)) && Date.parse(expiresAt) > Date.now(); } catch {}
-      return { server: config.server, username: config.username, loggedIn, reauthRequired, ...(expiresAt ? { expiresAt } : {}), autoSync: !reauthRequired && config.autoSync, intervalMs: config.intervalMs, projects: config.projects, pending: (await store.pending()).length, running: Boolean(active || batchRunning || scheduled.size), lastResult };
+      try { const record = await account(); identity = record; expiresAt = record.expiresAt; loggedIn = Number.isFinite(Date.parse(expiresAt)) && Date.parse(expiresAt) > Date.now(); } catch {}
+      return { server: config.server, username: config.username, loggedIn, reauthRequired, ...(expiresAt ? { expiresAt } : {}), autoSync: !reauthRequired && config.autoSync, intervalMs: config.intervalMs, projects: config.projects, pending, running: Boolean(updateRunning || active || batchRunning || scheduled.size || recoveryTask), lastResult, ...(latestRecovery && loggedIn && !mutating && epoch === generation && sameAccount(latestRecovery.identity, identity) ? { recovery: publicRecovery(latestRecovery) } : {}) };
     },
     async list(id) { await ready(); validateId(id); return new SyncClient({ ...await account(), signal: lifetime.signal }).list(id); },
     async restore(id, destination) {
       await ready(); assert(typeof destination === 'string' && path.isAbsolute(destination), '恢复目录必须是绝对路径且尚不存在');
       return mutate(async () => {
-        const result = await store.restore(new SyncClient({ ...await account(), signal: lifetime.signal }), id, destination);
+        await restoreAdmission(destination);
+        let reserved = false;
+        const result = await store.restore(new SyncClient({ ...await account(), signal: lifetime.signal }), id, destination, { beforeWrite: async () => { await restoreAdmission(destination, { reserved }); reserved = true; } });
         return { root: result.root, sessionIds: result.sessionIds, next: '检查新目录内容后执行 /sync-import；不会自动执行恢复的项目。' };
       });
     },
@@ -327,12 +462,14 @@ export function createController(ctx, initialConfig, { exportSessions = exportPr
         await ctx.credentials.deleteRecord(credentialKey);
         if (local) { delete local.token; delete local.expiresAt; await store.saveConfig(local); }
         config.autoSync = false; await persistLogout?.();
+        if (latestRestore) delete latestRestore.manifest;
+        latestRestore = undefined;
         const remoteRevoked = results.every(result => result.remoteRevoked);
         return { loggedOut: true, remoteRevoked, ...(remoteRevoked ? {} : { warning: '远端撤销未确认' }) };
-      });
+      }, { cancelRecovery: true, allowAfterUpdate: true });
     },
-    stop() { stopped = true; generation++; lifetime.abort(); activeAbort?.abort(); clearScheduled(); },
-    async drain() { await Promise.allSettled([active, mutationTask].filter(Boolean)); },
+    stop() { stopped = true; generation++; lifetime.abort(); activeAbort?.abort(); recoveryAbort?.abort(); clearScheduled(); },
+    async drain() { await Promise.allSettled([active, mutationTask, recoveryTask].filter(Boolean)); },
   };
   return controller;
 }

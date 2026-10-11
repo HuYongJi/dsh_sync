@@ -7,7 +7,7 @@ window.__ModuleLoader__.load({
 // Framework-free personal-sync state. Only the DSH Connection may carry requests.
 const RPC_CHANNEL = '/api';
 const RPC_PREFIX = 'dsh-personal-sync/';
-const CLIENT_ACTIONS = Object.freeze(['status', 'login', 'password', 'preferences', 'sync', 'logout']);
+const CLIENT_ACTIONS = Object.freeze(['status', 'login', 'password', 'preferences', 'sync', 'logout', 'projects', 'checkpoints', 'restore', 'import', 'updatestatus', 'checkupdate', 'installupdate', 'cancelupdate']);
 
 const MESSAGES = Object.freeze({
   BAD_SERVER: '服务器地址无效',
@@ -53,6 +53,29 @@ const MESSAGES = Object.freeze({
   UNSAVED_CHANGES: '请先保存或撤销更改',
   TIMEOUT: '请求超时，请刷新状态',
   REQUEST_FAILED: '请求失败，请刷新状态',
+  CLOUD_BROWSE_UNSUPPORTED: '云端不支持项目浏览，请手动输入项目 ID',
+  BAD_DESTINATION: '请输入 DSH Host 机器上的绝对路径',
+  DESTINATION_EXISTS: '目标目录已存在，请选择全新目录',
+  PROTECTED_DESTINATION: '目标目录受保护，不能下载到此处',
+  CHECKPOINT_MISMATCH: '检查点与项目不匹配，请重新选择',
+  RESTORE_FAILED: '下载未完成，目标目录可能不完整，请检查后使用新目录',
+  IMPORT_FAILED: '导入未全部完成，请检查结果，勿重复导入',
+  RECOVERY_UNAVAILABLE: '恢复功能或安全会话导入不可用',
+  RECOVERY_LIMIT: '恢复记录达到限制，请检查已有结果',
+  RECOVERY_UNCERTAIN: '请求结果未确认，请刷新状态；勿重复下载或导入',
+  BAD_REQUEST_ID: '无法生成安全请求 ID，请升级浏览器',
+  UPDATE_UNAVAILABLE: '此宿主不支持原生插件更新，请检查 DSH Plugins',
+  UPDATE_UNMANAGED: '此插件未由原生插件管理器管理，请检查 DSH Plugins',
+  UPDATE_CHECK_FAILED: '检查更新失败，请稍后手动重试',
+  UPDATE_INVALID_METADATA: '更新元数据无效，未允许安装',
+  UPDATE_CHECK_REQUIRED: '请重新检查更新后再确认',
+  UPDATE_NOT_NEWER: '候选版本不比运行版本新，请重新检查更新',
+  UPDATE_BUILD_APPROVAL_REQUIRED: '原生安装需要脚本审批，请在 DSH Plugins 中手动检查',
+  UPDATE_INCOMPATIBLE: '版本不兼容，请在 DSH Plugins 中手动检查',
+  UPDATE_FAILED: '更新未完成，请在 DSH Plugins 中手动检查',
+  UPDATE_UNCERTAIN: '更新结果未确认，请核对更新状态，勿重复安装',
+  UPDATE_CANCEL_TOO_LATE: '已无法取消；这不表示回滚，请核对状态并检查 DSH Plugins',
+  UPDATE_RESTART_REQUIRED: '插件文件可能已变更，请重启 DSH 后刷新页面（仅刷新无效）',
 });
 
 class SettingsClientError extends Error {
@@ -114,6 +137,106 @@ function optionalText(value, max = 1024) {
   return value;
 }
 
+const validId = value => typeof value === 'string' && /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,99}$/.test(value) && !['constructor', 'prototype', '__proto__'].includes(value.toLowerCase());
+const validRequestId = value => typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+const absolutePath = value => text(value, 4096, false) && (value.startsWith('/') || /^[a-z]:[\\/]/i.test(value) || /^\\\\[^\\/]+[\\/][^\\/]+/.test(value));
+const sameBinding = (a, b) => Boolean(a && b && a.revision === b.revision && a.server === b.server && a.username === b.username);
+const bindingOf = status => freeze({ revision: status.revision, server: status.server, username: status.username });
+function validateBinding(status, binding) {
+  if (!status?.loggedIn || !status.server || !status.username) fail('NOT_LOGGED_IN');
+  if (!binding || binding.server !== status.server || binding.username !== status.username) fail('ACCOUNT_MISMATCH');
+  if (!integer(binding.revision) || binding.revision !== status.revision) fail('CONFIG_CONFLICT');
+  return bindingOf(status);
+}
+function requiredDate(value) {
+  if (typeof value !== 'string' || optionalDate(value) !== value || new Date(value).toISOString() !== value) fail('INVALID_RESPONSE');
+  return value;
+}
+
+/** New remote surfaces retain no names, manifests, credentials or arbitrary error text. */
+function parseCloudProjects(value) {
+  if (!isRecord(value) || !Array.isArray(value.projects) || value.projects.length > 20000) fail('INVALID_RESPONSE');
+  const ids = new Set();
+  return freeze(value.projects.map(item => {
+    if (!isRecord(item) || !validId(item.projectId) || ids.has(item.projectId) || !integer(item.checkpointCount)) fail('INVALID_RESPONSE');
+    ids.add(item.projectId);
+    const latestCreatedAt = item.latestCreatedAt === null && item.checkpointCount === 0 ? null : requiredDate(item.latestCreatedAt);
+    return freeze({ projectId: item.projectId, checkpointCount: item.checkpointCount, latestCreatedAt });
+  }));
+}
+function parseCheckpoints(value, projectId) {
+  if (!validId(projectId) || !isRecord(value) || !Array.isArray(value.checkpoints) || value.checkpoints.length > 20000 || !Array.isArray(value.heads)) fail('INVALID_RESPONSE');
+  const ids = new Set();
+  const checkpoints = value.checkpoints.map(item => {
+    if (!isRecord(item) || !validId(item.id) || ids.has(item.id) || item.projectId !== projectId || !validId(item.deviceId) || !(item.parentId === null || validId(item.parentId)) || item.parentId === item.id || !integer(item.fileCount) || !integer(item.totalBytes)) fail('INVALID_RESPONSE');
+    ids.add(item.id);
+    return freeze({ id: item.id, projectId, deviceId: item.deviceId, parentId: item.parentId, createdAt: requiredDate(item.createdAt), fileCount: item.fileCount, totalBytes: item.totalBytes });
+  });
+  if (value.heads.some(id => !validId(id) || !ids.has(id)) || new Set(value.heads).size !== value.heads.length) fail('INVALID_RESPONSE');
+  return freeze({ checkpoints: freeze(checkpoints), heads: freeze([...value.heads]) });
+}
+function parseRecovery(value) {
+  if (!isRecord(value) || !validId(value.id) || !['restore', 'import'].includes(value.kind) || !['running', 'succeeded', 'failed'].includes(value.state) || !absolutePath(value.root)) fail('INVALID_RESPONSE');
+  const result = { id: value.id, kind: value.kind, state: value.state, root: value.root };
+  if (value.checkpointId !== undefined) { if (!validId(value.checkpointId)) fail('INVALID_RESPONSE'); result.checkpointId = value.checkpointId; }
+  for (const key of ['sessionCount', 'importedCount', 'skippedCount', 'failedCount']) {
+    if (value[key] !== undefined) { if (!integer(value[key])) fail('INVALID_RESPONSE'); result[key] = value[key]; }
+  }
+  if (value.errorCode !== undefined) {
+    if (typeof value.errorCode !== 'string' || !Object.hasOwn(MESSAGES, value.errorCode)) fail('INVALID_RESPONSE');
+    result.errorCode = value.errorCode;
+  }
+  if (value.sessions !== undefined) {
+    if (!Array.isArray(value.sessions) || value.sessions.length > 20000) fail('INVALID_RESPONSE');
+    const sources = new Set();
+    result.sessions = freeze(value.sessions.map(item => {
+      if (!isRecord(item) || !validId(item.sourceId) || sources.has(item.sourceId) || !['imported', 'skipped', 'failed'].includes(item.outcome) || (item.sessionId !== undefined && !validId(item.sessionId)) || (item.workspaceAttached !== undefined && typeof item.workspaceAttached !== 'boolean')) fail('INVALID_RESPONSE');
+      sources.add(item.sourceId);
+      return freeze({ sourceId: item.sourceId, outcome: item.outcome, ...(item.sessionId === undefined ? {} : { sessionId: item.sessionId }), ...(item.workspaceAttached === undefined ? {} : { workspaceAttached: item.workspaceAttached }) });
+    }));
+  }
+  return freeze(result);
+}
+const UPDATE_STATES = freeze(['idle', 'checking', 'available', 'up-to-date', 'installing', 'cancelling', 'restart-required', 'cancelled', 'failed', 'uncertain']);
+const UPDATE_ERRORS = freeze(['UPDATE_UNAVAILABLE', 'UPDATE_UNMANAGED', 'UPDATE_CHECK_FAILED', 'UPDATE_INVALID_METADATA', 'UPDATE_CHECK_REQUIRED', 'UPDATE_NOT_NEWER', 'UPDATE_BUILD_APPROVAL_REQUIRED', 'UPDATE_INCOMPATIBLE', 'UPDATE_FAILED', 'UPDATE_UNCERTAIN', 'UPDATE_CANCEL_TOO_LATE', 'UPDATE_RESTART_REQUIRED', 'BAD_REQUEST', 'BUSY', 'DISPOSED', 'RATE_LIMITED']);
+const validVersion = value => typeof value === 'string' && /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(value) && value.split('.').every(part => integer(Number(part)));
+const newerVersion = (a, b) => {
+  const left = a.split('.').map(Number), right = b.split('.').map(Number);
+  const index = left.findIndex((part, at) => part !== right[at]);
+  return index !== -1 && left[index] > right[index];
+};
+const updateRunning = value => ['installing', 'cancelling'].includes(value?.state);
+const matchesUpdate = (intent, value) => Boolean(intent && value && intent.currentVersion === value.currentVersion && intent.candidateId === value.candidate?.id && intent.version === value.candidate.version && intent.commit === value.candidate.commit);
+
+/** Only typed public metadata is retained. Native logs, specs, paths and credentials never enter state. */
+function parseUpdateStatus(value) {
+  if (!isRecord(value) || !validVersion(value.currentVersion) || typeof value.supported !== 'boolean' || !UPDATE_STATES.includes(value.state) || typeof value.restartRequired !== 'boolean') fail('INVALID_RESPONSE');
+  const result = { currentVersion: value.currentVersion, supported: value.supported, state: value.state, restartRequired: value.restartRequired };
+  if (value.installedVersion !== undefined) {
+    if (!validVersion(value.installedVersion)) fail('INVALID_RESPONSE');
+    result.installedVersion = value.installedVersion;
+  }
+  if (value.requestId !== undefined) {
+    if (!validId(value.requestId)) fail('INVALID_RESPONSE');
+    result.requestId = value.requestId;
+  }
+  if (value.errorCode !== undefined) {
+    if (!UPDATE_ERRORS.includes(value.errorCode)) fail('INVALID_RESPONSE');
+    result.errorCode = value.errorCode;
+  }
+  if (value.candidate !== undefined) {
+    const item = value.candidate;
+    if (!isRecord(item) || !validId(item.id) || !validVersion(item.version) || !newerVersion(item.version, value.currentVersion) || typeof item.commit !== 'string' || !/^[0-9a-f]{40}$/.test(item.commit)) fail('INVALID_RESPONSE');
+    result.candidate = freeze({ id: item.id, version: item.version, commit: item.commit, checkedAt: requiredDate(item.checkedAt) });
+  }
+  if ((value.state === 'available' && !result.candidate) || (updateRunning(value) && !result.requestId) || (value.state === 'restart-required' && !value.restartRequired)) fail('INVALID_RESPONSE');
+  return freeze(result);
+}
+
+function newCloud() {
+  return freeze({ binding: null, projects: freeze([]), projectId: '', checkpoints: freeze([]), heads: freeze([]), checkpointId: '', destination: '', loaded: false, browseUnsupported: false, error: null, intent: null });
+}
+
 /** Allowlist the public contract. Extra fields (including credentials) are discarded. */
 function parseStatus(value) {
   if (!isRecord(value) || !integer(value.revision) || typeof value.loggedIn !== 'boolean' || typeof value.running !== 'boolean' || !integer(value.pending) || !integer(value.intervalMs) || value.intervalMs < 1 || (value.autoSync !== undefined && typeof value.autoSync !== 'boolean') || !Array.isArray(value.projects) || value.projects.length > 20000) fail('INVALID_RESPONSE');
@@ -143,7 +266,9 @@ function parseStatus(value) {
   return freeze({ revision: value.revision, server, username, loggedIn: value.loggedIn, autoSync: value.autoSync === true,
     intervalMs: value.intervalMs, projects: freeze(projects), pending: value.pending, running: value.running,
     ...(expiresAt === undefined ? {} : { expiresAt }), ...(warning === undefined ? {} : { warning }),
-    ...(lastResult === undefined ? {} : { lastResult }) });
+    ...(lastResult === undefined ? {} : { lastResult }),
+    ...(value.recovery === undefined ? {} : { recovery: parseRecovery(value.recovery) }),
+    ...(value.update === undefined ? {} : { update: parseUpdateStatus(value.update) }) });
 }
 
 function publicError(error) {
@@ -206,11 +331,29 @@ function deriveView(state) {
   const status = state.status;
   const locked = !state.ready || state.loading || state.refreshing || Boolean(state.busy);
   // Preferences/logout are safety controls: Host aborts and joins active work before committing them.
-  const editable = !locked && !state.conflict;
+  const recovering = status?.recovery?.state === 'running' || Boolean(state.recoveryPending);
+  const updater = state.update ?? status?.update;
+  // Host 'uncertain' with a known terminal request means installation settled, not that rollback occurred.
+  const settledUncertain = updater?.state === 'uncertain' && updater.restartRequired === true && Boolean(updater.requestId) && !state.updatePendingId;
+  const updaterBusy = updateRunning(updater) || Boolean(state.updatePendingId) || (state.updateUncertain === true && !settledUncertain);
+  const restartRequired = updater?.restartRequired === true;
+  const updateBlocked = updaterBusy || restartRequired || state.updateUncertain === true;
+  const editable = !locked && !state.conflict && !recovering && !updateBlocked;
+  const canBrowse = !locked && !status?.running && !recovering && !updateBlocked && Boolean(status?.loggedIn && status.server && status.username);
+  const canRecover = canBrowse && !status.running && !recovering && !state.scheduled && !state.conflict && !state.dirty;
   const selectedAvailable = status?.projects.filter(project => project.selected && project.available).length ?? 0;
-  return freeze({ locked, editable, canLogin: !locked && !status?.running, canLogout: !locked && Boolean(status?.loggedIn),
-    canChangePassword: !locked && !state.passwordUncertain && Boolean(status?.server && status?.username),
-    canSave: editable && state.dirty, canSync: !locked && Boolean(status?.loggedIn) && !status?.running && !state.scheduled && !state.dirty && !state.conflict && selectedAvailable > 0,
+  return freeze({ locked, editable, recovering, canBrowse, canRecover, updaterBusy, restartRequired, updateBlocked,
+    updateError: state.updateError?.message ?? (updater?.errorCode ? MESSAGES[updater.errorCode] : ''),
+    canCheckUpdate: !locked && !updateBlocked && updater?.supported !== false && updater?.state !== 'checking',
+    canUpdate: !locked && !updateBlocked && !state.updateError && !recovering && !status?.running && !state.scheduled && !state.dirty && !state.conflict && updater?.supported === true && updater.state === 'available' && Boolean(updater.candidate),
+    // A local read must not hide cancellation; cancellation invalidates the read before writing.
+    canCancelUpdate: !state.busy && updateRunning(updater) && updater.state !== 'cancelling' && updater.errorCode !== 'UPDATE_CANCEL_TOO_LATE' && state.updateError?.code !== 'UPDATE_CANCEL_TOO_LATE' && Boolean(state.updatePendingId && state.updatePendingId === updater.requestId),
+    canRestore: canRecover && Boolean(state.cloud?.checkpointId && absolutePath(state.cloud.destination)),
+    canImport: canRecover && status?.recovery?.kind === 'restore' && status.recovery.state === 'succeeded' && status.recovery.sessionCount !== 0,
+    recoveryError: status?.recovery?.errorCode ? MESSAGES[status.recovery.errorCode] : '',
+    canLogin: !locked && !status?.running && !recovering && !updateBlocked, canLogout: !locked && !updaterBusy && Boolean(status?.loggedIn),
+    canChangePassword: !locked && !recovering && !updateBlocked && !state.passwordUncertain && Boolean(status?.server && status?.username),
+    canSave: editable && state.dirty, canSync: !locked && !recovering && !updateBlocked && Boolean(status?.loggedIn) && !status?.running && !state.scheduled && !state.dirty && !state.conflict && selectedAvailable > 0,
     selectedAvailable, selectedCount: state.draft.projectIds.length });
 }
 
@@ -222,7 +365,9 @@ function createController(connection, options = {}) {
   const pollMs = Math.max(1000, options.pollMs ?? 3000);
   const timeoutMs = Math.max(1000, options.timeoutMs ?? 60000);
   let state = freeze({ status: null, draft: newDraft(), dirty: false, conflict: false, loading: true, refreshing: false,
-    ready: false, busy: null, error: null, notice: '', scheduled: false, passwordUncertain: false });
+    ready: false, busy: null, error: null, notice: '', scheduled: false, passwordUncertain: false,
+    cloud: newCloud(), recoveryPending: null, recoveryUncertain: false,
+    update: null, updateIntent: null, updatePendingId: null, updateUncertain: false, updateError: null });
   const listeners = new Set();
   let disposed = false;
   let watchers = 0;
@@ -233,6 +378,8 @@ function createController(connection, options = {}) {
   let scheduledChecks = 0;
   let scheduledBaseline;
   let observedWork = false;
+  let uncertainChecks = 0;
+  let updateUncertainChecks = 0;
   const update = patch => {
     if (disposed) return;
     state = freeze({ ...state, ...patch });
@@ -242,9 +389,43 @@ function createController(connection, options = {}) {
   const invalidateRefresh = () => { ++generation; refreshAbort?.abort(); refreshAbort = undefined; };
   function queuePoll() {
     clearPoll();
-    if (disposed || !watchers || state.busy || state.refreshing || state.error || !state.status?.loggedIn || !(state.status.running || state.status.pending || state.scheduled)) return;
-    const delay = state.status.running || state.scheduled ? pollMs : Math.max(10000, pollMs);
+    if (disposed || !watchers || state.busy || state.refreshing) return;
+    if (state.updateUncertain && updateUncertainChecks >= 10) return; // Manual read only after bounded reconciliation.
+    if (updateRunning(state.update) || state.update?.state === 'checking' || state.updateUncertain || state.updatePendingId) {
+      pollTimer = setTimer(() => { pollTimer = undefined; void refreshUpdate(); }, pollMs);
+      return;
+    }
+    const recoveryWork = (state.recoveryPending && (!state.recoveryUncertain || uncertainChecks < 10)) || state.status?.recovery?.state === 'running';
+    if (disposed || !watchers || state.busy || state.refreshing || (!recoveryWork && (state.error || !state.status?.loggedIn)) || !(recoveryWork || state.status?.running || state.status?.pending || state.scheduled)) return;
+    const delay = recoveryWork || state.status.running || state.scheduled ? pollMs : Math.max(10000, pollMs);
     pollTimer = setTimer(() => { pollTimer = undefined; void refresh(); }, delay);
+  }
+  function updatePatch(incoming) {
+    const runtimeChanged = state.update && incoming.currentVersion !== state.update.currentVersion;
+    // Native install may have changed files even on cancellation/failure. Only a new runtime clears this latch.
+    const value = !runtimeChanged && state.update?.restartRequired && !incoming.restartRequired ? freeze({ ...incoming, restartRequired: true }) : incoming;
+    let updatePendingId = runtimeChanged ? null : state.updatePendingId;
+    let updateUncertain = runtimeChanged ? false : state.updateUncertain;
+    let updateError = runtimeChanged ? null : state.updateError;
+    if (!updatePendingId || value.requestId === updatePendingId) {
+      updatePendingId = updateRunning(value) ? value.requestId : null;
+      updateUncertain = value.state === 'uncertain';
+      if (!updateUncertain) {
+        updateUncertainChecks = 0;
+        if (updateError?.code === 'UPDATE_UNCERTAIN') updateError = null;
+      }
+    } else {
+      // A different/missing task cannot acknowledge our write or authorize cancelling somebody else's task.
+      updateUncertain = true;
+      updateError = publicError(new SettingsClientError('UPDATE_UNCERTAIN'));
+    }
+    if (runtimeChanged) updateUncertainChecks = 0;
+    const updateIntent = value.supported && value.state === 'available' && !value.restartRequired && matchesUpdate(state.updateIntent, value) ? state.updateIntent : null;
+    return { update: value, updateIntent, updatePendingId, updateUncertain, updateError };
+  }
+  function acceptUpdate(value) {
+    const patch = updatePatch(value);
+    update({ ...patch, ...(state.status ? { status: freeze({ ...state.status, update: patch.update }) } : {}) });
   }
   function acceptStatus(status, resetDraft = false) {
     // A late/stale status must not revive tokens after an uncertain password write.
@@ -267,7 +448,22 @@ function createController(connection, options = {}) {
       ++scheduledChecks;
       if (!status.loggedIn || status.lastResult?.at !== scheduledBaseline || (observedWork && !status.running) || scheduledChecks >= 10) scheduled = false;
     }
+    const changed = state.status && (!sameBinding(status, state.status) || status.loggedIn !== state.status.loggedIn);
+    let recoveryPending = changed ? null : state.recoveryPending;
+    let recoveryUncertain = changed ? false : state.recoveryUncertain;
+    if (recoveryPending && status.recovery?.id === recoveryPending.requestId) {
+      if (status.recovery.kind !== recoveryPending.kind || (recoveryPending.kind === 'restore' && status.recovery.checkpointId !== undefined && status.recovery.checkpointId !== recoveryPending.checkpointId)) fail('INVALID_RESPONSE');
+      recoveryUncertain = false;
+      if (status.recovery.state !== 'running') recoveryPending = null;
+    }
+    let cloud = changed ? newCloud() : state.cloud;
+    if (!recoveryUncertain && cloud.error?.code === 'RECOVERY_UNCERTAIN') cloud = freeze({ ...cloud, error: null });
+    if (cloud.intent?.kind === 'import' && (status.recovery?.id !== cloud.intent.restoreId || status.recovery?.kind !== 'restore' || status.recovery?.state !== 'succeeded' || status.recovery?.root !== cloud.intent.root)) cloud = freeze({ ...cloud, intent: null });
+    const updater = status.update ? updatePatch(status.update) : {};
+    const latestUpdate = updater.update ?? state.update;
+    if (latestUpdate) status = freeze({ ...status, update: latestUpdate });
     update({ status, draft, dirty: isDirty(status, draft), conflict, ready: true, loading: false, scheduled,
+      cloud, recoveryPending, recoveryUncertain, ...updater,
       error: conflict ? publicError(new SettingsClientError('CONFIG_CONFLICT')) : null });
   }
   async function withDeadline(action, body, abort) {
@@ -300,6 +496,7 @@ function createController(connection, options = {}) {
     const abort = new AbortController();
     refreshAbort = abort;
     update({ refreshing: true });
+    if (state.recoveryUncertain) ++uncertainChecks;
     try {
       const result = await withDeadline('status', {}, abort);
       if (disposed || current !== generation) return false;
@@ -319,6 +516,10 @@ function createController(connection, options = {}) {
   function report(error) { update({ error: publicError(error), notice: '' }); return false; }
   function guardAction(action) {
     if (disposed || !state.ready || state.busy || state.loading || state.refreshing) return false;
+    const view = deriveView(state);
+    if (view.updaterBusy) return report(new SettingsClientError('BUSY'));
+    if (view.restartRequired && action !== 'logout') return report(new SettingsClientError('UPDATE_RESTART_REQUIRED'));
+    if ((state.status.recovery?.state === 'running' || state.recoveryPending) && ['login', 'password', 'preferences', 'sync'].includes(action)) return report(new SettingsClientError('BUSY'));
     if (state.status.running && (action === 'login' || action === 'sync')) return report(new SettingsClientError('BUSY'));
     if (action === 'sync' && !state.status.loggedIn) return report(new SettingsClientError('NOT_LOGGED_IN'));
     return true;
@@ -396,8 +597,244 @@ function createController(connection, options = {}) {
       }
     }
   }
+  const cloudUpdate = patch => update({ cloud: freeze({ ...state.cloud, ...patch }) });
+  const cloudReport = error => { cloudUpdate({ error: publicError(error), intent: null }); return false; };
+  function cloudEditable() { return deriveView(state).canBrowse && !state.recoveryPending; }
+  async function browse(action) {
+    if (!deriveView(state).canBrowse) return false;
+    let binding, projectId;
+    try {
+      binding = validateBinding(state.status, bindingOf(state.status));
+      projectId = state.cloud.projectId;
+      if (action === 'checkpoints' && !validId(projectId)) fail('BAD_REQUEST');
+    } catch (error) { return cloudReport(error); }
+    invalidateRefresh(); clearPoll();
+    const abort = new AbortController(); active = abort;
+    if (action === 'projects') update({ cloud: freeze({ ...newCloud(), binding }) });
+    else cloudUpdate({ binding, checkpoints: freeze([]), heads: freeze([]), checkpointId: '', loaded: false, intent: null, error: null });
+    update({ busy: action });
+    let needsStatus = false;
+    try {
+      const result = await withDeadline(action, action === 'projects' ? binding : { ...binding, projectId }, abort);
+      if (disposed || !sameBinding(state.status, binding)) return false;
+      if (action === 'projects') cloudUpdate({ projects: parseCloudProjects(result) });
+      else cloudUpdate({ ...parseCheckpoints(result, projectId), loaded: true });
+      return true;
+    } catch (error) {
+      if (!disposed) {
+        const safe = publicError(error);
+        if (['ACCOUNT_MISMATCH', 'CONFIG_CONFLICT', 'NOT_LOGGED_IN'].includes(safe.code)) {
+          update({ cloud: newCloud() }); needsStatus = true;
+        }
+        cloudUpdate({ error: safe, browseUnsupported: action === 'projects' && safe.code === 'CLOUD_BROWSE_UNSUPPORTED' });
+      }
+      return false;
+    } finally {
+      active = undefined;
+      if (!disposed) { update({ busy: null }); if (needsStatus) await refresh(); else queuePoll(); }
+    }
+  }
+  function requestId() {
+    const crypto = options.crypto ?? globalThis.crypto;
+    let id;
+    try {
+      if (typeof crypto?.randomUUID === 'function') id = crypto.randomUUID();
+      else if (typeof crypto?.getRandomValues === 'function') {
+        const bytes = crypto.getRandomValues(new Uint8Array(16));
+        bytes[6] = (bytes[6] & 15) | 64; bytes[8] = (bytes[8] & 63) | 128;
+        const hex = [...bytes].map(byte => byte.toString(16).padStart(2, '0')).join('');
+        id = `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+      }
+    } catch { fail('BAD_REQUEST_ID'); }
+    if (!validRequestId(id)) fail('BAD_REQUEST_ID');
+    return id;
+  }
+  function prepareRecovery(kind) {
+    if (!deriveView(state).canRecover) return null;
+    try {
+      const binding = validateBinding(state.status, kind === 'restore' ? state.cloud.binding : bindingOf(state.status));
+      let fields;
+      if (kind === 'restore') {
+        const cloud = state.cloud;
+        if (!cloud.checkpoints.some(item => item.id === cloud.checkpointId && item.projectId === cloud.projectId)) fail('CHECKPOINT_MISMATCH');
+        if (!absolutePath(cloud.destination)) fail('BAD_DESTINATION');
+        fields = { projectId: cloud.projectId, checkpointId: cloud.checkpointId, destination: cloud.destination };
+      } else {
+        if (!deriveView(state).canImport) fail('RECOVERY_UNAVAILABLE');
+        fields = { restoreId: state.status.recovery.id, root: state.status.recovery.root };
+      }
+      const prior = state.cloud.intent;
+      // Opening the same confirmation twice does not create a new request identity.
+      if (prior?.kind === kind && sameBinding(prior, binding) && Object.entries(fields).every(([key, value]) => prior[key] === value)) return prior;
+      const intent = freeze({ kind, ...binding, ...fields, requestId: requestId() });
+      cloudUpdate({ intent, error: null });
+      return intent;
+    } catch (error) { cloudReport(error); return null; }
+  }
+  async function confirmRecovery(intent) {
+    if (!intent || intent !== state.cloud.intent || !deriveView(state).canRecover) return false;
+    let payload;
+    try {
+      const binding = validateBinding(state.status, intent);
+      if (!validRequestId(intent.requestId)) fail('BAD_REQUEST_ID');
+      if (intent.kind === 'restore') {
+        if (intent.projectId !== state.cloud.projectId || intent.checkpointId !== state.cloud.checkpointId || intent.destination !== state.cloud.destination || !state.cloud.checkpoints.some(item => item.id === intent.checkpointId)) fail('CHECKPOINT_MISMATCH');
+        payload = { ...binding, projectId: intent.projectId, checkpointId: intent.checkpointId, destination: intent.destination, confirm: true, requestId: intent.requestId };
+      } else {
+        if (!deriveView(state).canImport || intent.restoreId !== state.status.recovery.id || intent.root !== state.status.recovery.root) fail('RECOVERY_UNAVAILABLE');
+        payload = { ...binding, restoreId: intent.restoreId, confirm: true, requestId: intent.requestId };
+      }
+    } catch (error) { return cloudReport(error); }
+    invalidateRefresh(); clearPoll();
+    const abort = new AbortController(); active = abort;
+    cloudUpdate({ intent: null, error: null });
+    uncertainChecks = 0;
+    update({ busy: intent.kind, recoveryPending: intent, recoveryUncertain: false, error: null, notice: '' });
+    let accepted = false;
+    try {
+      const result = await withDeadline(intent.kind, payload, abort);
+      if (disposed) return false;
+      const recovery = parseRecovery(result?.recovery);
+      if (recovery.id !== intent.requestId || recovery.kind !== intent.kind || (recovery.checkpointId !== undefined && intent.kind === 'restore' && recovery.checkpointId !== intent.checkpointId)) fail('INVALID_RESPONSE');
+      update({ status: freeze({ ...state.status, recovery, running: recovery.state === 'running' }),
+        recoveryPending: recovery.state === 'running' ? intent : null });
+      accepted = true;
+    } catch (error) {
+      if (!disposed) {
+        const safe = publicError(error);
+        const rejected = ['BAD_REQUEST', 'BAD_DESTINATION', 'DESTINATION_EXISTS', 'PROTECTED_DESTINATION', 'CHECKPOINT_MISMATCH', 'RECOVERY_UNAVAILABLE', 'RECOVERY_LIMIT', 'CONFIG_CONFLICT', 'ACCOUNT_MISMATCH', 'NOT_LOGGED_IN', 'BUSY', 'AUTH_REQUIRED', 'FORBIDDEN', 'NOT_DEPLOYED', 'RATE_LIMITED'].includes(safe.code);
+        update({ recoveryPending: rejected ? null : intent, recoveryUncertain: !rejected });
+        cloudUpdate({ error: rejected ? safe : publicError(new SettingsClientError('RECOVERY_UNCERTAIN')) });
+        if (['CONFIG_CONFLICT', 'ACCOUNT_MISMATCH', 'NOT_LOGGED_IN'].includes(safe.code)) update({ cloud: newCloud() });
+      }
+    } finally {
+      active = undefined;
+      if (!disposed) {
+        update({ busy: null });
+        // Acceptance and transport failures are reconciled only by reads, never replayed.
+        await refresh({ discardDraft: false });
+        if (!state.recoveryUncertain && state.cloud.error?.code === 'RECOVERY_UNCERTAIN') cloudUpdate({ error: null });
+      }
+    }
+    return accepted;
+  }
+  const updateReport = error => { update({ updateError: publicError(error), updateIntent: null }); return false; };
+  async function refreshUpdate() {
+    if (disposed || state.busy) return false;
+    clearPoll(); invalidateRefresh();
+    const current = generation;
+    const abort = new AbortController(); refreshAbort = abort;
+    update({ refreshing: true });
+    if (state.updateUncertain) ++updateUncertainChecks;
+    try {
+      const result = await withDeadline('updatestatus', {}, abort);
+      if (disposed || current !== generation) return false;
+      acceptUpdate(parseUpdateStatus(result?.update));
+      return true;
+    } catch (error) {
+      if (!disposed && current === generation) {
+        const uncertain = Boolean(state.updatePendingId || updateRunning(state.update) || state.updateUncertain);
+        update({ updateUncertain: uncertain, updateError: publicError(uncertain ? new SettingsClientError('UPDATE_UNCERTAIN') : error) });
+      }
+      return false;
+    } finally {
+      if (!disposed && current === generation) { refreshAbort = undefined; update({ refreshing: false }); queuePoll(); }
+    }
+  }
+  async function checkUpdate() {
+    if (disposed || !deriveView(state).canCheckUpdate) return false;
+    invalidateRefresh(); clearPoll();
+    const abort = new AbortController(); active = abort;
+    update({ busy: 'checkupdate', updateIntent: null, updateError: null });
+    try {
+      const result = await withDeadline('checkupdate', {}, abort);
+      if (disposed) return false;
+      const next = parseUpdateStatus(result?.update);
+      acceptUpdate(next);
+      return ['available', 'up-to-date'].includes(next.state);
+    } catch (error) {
+      if (!disposed) updateReport(error);
+      return false;
+    } finally {
+      active = undefined;
+      if (!disposed) { update({ busy: null }); queuePoll(); }
+    }
+  }
+  function prepareUpdate() {
+    if (disposed || !deriveView(state).canUpdate) return null;
+    if (matchesUpdate(state.updateIntent, state.update)) return state.updateIntent;
+    try {
+      const { candidate, currentVersion } = state.update;
+      const intent = freeze({ candidateId: candidate.id, version: candidate.version, commit: candidate.commit, currentVersion, requestId: requestId() });
+      update({ updateIntent: intent, updateError: null });
+      return intent;
+    } catch (error) { updateReport(error); return null; }
+  }
+  async function updateMutation(action, intent) {
+    // The caller's live, consumed intent is the only authority; caller-provided extra fields never cross Connection.
+    const id = intent.requestId;
+    invalidateRefresh(); clearPoll();
+    const abort = new AbortController(); active = abort;
+    updateUncertainChecks = 0;
+    update({ busy: action, refreshing: false, updateIntent: null, updatePendingId: id, updateUncertain: false, updateError: null });
+    let accepted = false;
+    try {
+      const payload = action === 'installupdate' ? { candidateId: intent.candidateId, requestId: id, confirm: true } : { requestId: id };
+      const result = await withDeadline(action, payload, abort);
+      if (disposed) return false;
+      const next = parseUpdateStatus(result?.update);
+      if (next.requestId !== id || !['installing', 'cancelling', 'restart-required', 'cancelled', 'failed', 'uncertain'].includes(next.state)) fail('INVALID_RESPONSE');
+      acceptUpdate(next);
+      accepted = ['installing', 'cancelling', 'restart-required'].includes(next.state) && !next.errorCode;
+    } catch (error) {
+      if (!disposed) {
+        const safe = publicError(error);
+        const rejected = action === 'installupdate' && ['BAD_REQUEST', 'BUSY', 'DISPOSED', 'RATE_LIMITED', 'AUTH_REQUIRED', 'FORBIDDEN', 'NOT_DEPLOYED', 'UPDATE_UNAVAILABLE', 'UPDATE_UNMANAGED', 'UPDATE_CHECK_REQUIRED', 'UPDATE_NOT_NEWER', 'UPDATE_INVALID_METADATA', 'UPDATE_INCOMPATIBLE', 'UPDATE_RESTART_REQUIRED'].includes(safe.code);
+        update({ updatePendingId: rejected ? null : id, updateUncertain: !rejected,
+          updateError: rejected || safe.code === 'UPDATE_CANCEL_TOO_LATE' ? safe : publicError(new SettingsClientError('UPDATE_UNCERTAIN')) });
+        if (safe.code === 'UPDATE_RESTART_REQUIRED' && state.update) acceptUpdate(freeze({ ...state.update, restartRequired: true }));
+      }
+    } finally {
+      active = undefined;
+      if (!disposed) {
+        update({ busy: null });
+        // Acceptance, native failures and response loss are reconciled by local reads only, never mutation replay.
+        await refreshUpdate();
+      }
+    }
+    return accepted;
+  }
+  function confirmUpdate(intent) {
+    if (disposed || !intent || intent !== state.updateIntent || !deriveView(state).canUpdate || !matchesUpdate(intent, state.update)) return Promise.resolve(false);
+    return updateMutation('installupdate', intent);
+  }
+  function cancelUpdate() {
+    if (disposed || !deriveView(state).canCancelUpdate) return Promise.resolve(false);
+    return updateMutation('cancelupdate', { requestId: state.updatePendingId });
+  }
   return {
     getSnapshot: () => state,
+    checkUpdate, prepareUpdate, confirmUpdate, cancelUpdate, refreshUpdate,
+    cancelUpdateIntent() { update({ updateIntent: null }); },
+    browseProjects: () => browse('projects'),
+    loadCheckpoints: () => browse('checkpoints'),
+    setCloudProject(projectId) {
+      if (!cloudEditable() || !text(projectId, 100)) return false;
+      cloudUpdate({ binding: bindingOf(state.status), projectId, checkpoints: freeze([]), heads: freeze([]), checkpointId: '', loaded: false, intent: null, error: null });
+      return true;
+    },
+    selectCheckpoint(id) {
+      if (!cloudEditable() || (id !== '' && !state.cloud.checkpoints.some(item => item.id === id))) return false;
+      cloudUpdate({ checkpointId: id, intent: null, error: null }); return true;
+    },
+    setDestination(destination) {
+      if (!cloudEditable() || !text(destination, 4096)) return false;
+      cloudUpdate({ destination, intent: null, error: null }); return true;
+    },
+    prepareRestore: () => prepareRecovery('restore'),
+    prepareImport: () => prepareRecovery('import'),
+    confirmRecovery,
+    cancelRecoveryIntent() { cloudUpdate({ intent: null }); },
     subscribe(listener) { if (disposed) return () => {}; listeners.add(listener); return () => listeners.delete(listener); },
     refresh,
     refreshIfWatching() { if (watchers > 0) return refresh({ discardDraft: false }); return Promise.resolve(false); },
@@ -412,7 +849,7 @@ function createController(connection, options = {}) {
         if (--watchers === 0) {
           clearPoll();
           invalidateRefresh();
-          update({ refreshing: false, loading: !state.status });
+          update({ refreshing: false, loading: !state.status, updateIntent: null });
         }
       };
     },
@@ -530,6 +967,7 @@ function createClientPlugin(require) {
     const [username, setUsername] = React.useState(status?.username ?? '');
     const [search, setSearch] = React.useState('');
     const [projectManagerOpen, setProjectManagerOpen] = React.useState(false);
+    const [cloudOpen, setCloudOpen] = React.useState(false);
     const [confirmLogout, setConfirmLogout] = React.useState(false);
     const [passwordIdentity, setPasswordIdentity] = React.useState(null);
     // Secrets live in uncontrolled native inputs, never React/controller state or storage.
@@ -552,7 +990,7 @@ function createClientPlugin(require) {
       // Invalidate immediately on Host changes, before React can render a stale submit handler.
       const unsubscribe = controller.subscribe(() => {
         const next = controller.getSnapshot();
-        if (!sameIdentity(next.status, previous.status) || next.status?.loggedIn !== previous.status?.loggedIn || next.busy !== previous.busy) clearSecrets();
+        if (!sameIdentity(next.status, previous.status) || next.status?.loggedIn !== previous.status?.loggedIn || next.busy !== previous.busy || deriveView(next).updateBlocked !== deriveView(previous).updateBlocked) clearSecrets();
         previous = next;
         if (passwordBinding.current && !sameIdentity(next.status, passwordBinding.current)) closePassword();
       });
@@ -596,7 +1034,7 @@ function createClientPlugin(require) {
     };
     const blurSecrets = event => { if (!event.currentTarget.contains(event.relatedTarget)) clearSecrets(); };
     const openProjects = () => {
-      if (!controller.getSnapshot().status) return;
+      if (!controller.getSnapshot().status || deriveView(controller.getSnapshot()).updateBlocked) return;
       clearSecrets();
       setSearch('');
       setProjectManagerOpen(true);
@@ -612,12 +1050,33 @@ function createClientPlugin(require) {
       clearSecrets();
       void controller.savePreferences().then(saved => { if (saved) closeProjects(); });
     };
+    const openCloud = () => {
+      if (!deriveView(controller.getSnapshot()).canBrowse) return;
+      clearSecrets(); setCloudOpen(true); void controller.browseProjects();
+    };
+    const closeCloud = () => { setCloudOpen(false); controller.cancelRecoveryIntent(); };
+    const cloud = state.cloud;
+    const intent = cloud.intent;
+    const recovery = status?.recovery;
+    const updater = state.update;
+    const updateIntent = state.updateIntent;
+    const updateLabel = state.updateUncertain ? '结果未确认' : state.busy === 'checkupdate' ? '检查中…' : ({ idle: '尚未检查', checking: '检查中…', available: '有新版本', 'up-to-date': '已是最新版本', installing: '原生安装中…', cancelling: '正在请求取消…', 'restart-required': '待重启 DSH', cancelled: '已取消（非回滚）', failed: '更新未完成', uncertain: '结果未确认' }[updater?.state] ?? '尚未检查');
     const projects = filterProjects(status?.projects ?? [], search);
     const checkedIds = new Set(state.draft.projectIds);
     const selectedProjects = (status?.projects ?? []).filter(project => checkedIds.has(project.id));
     const loginState = state.loading ? '读取中' : !state.ready ? '状态未确认' : status?.loggedIn ? '已登录' : '未登录';
     const passwordOpen = sameIdentity(status, passwordIdentity) && passwordBinding.current === passwordIdentity;
     const body = (content, extra = {}) => h('p', { style: styles.body, ...extra }, content);
+    const recoveryResult = recovery && h('div', { style: styles.form, role: 'status', 'aria-live': 'polite', 'data-personal-sync': 'recovery-result' },
+      body(`${recovery.kind === 'restore' ? '下载' : '导入'}${recovery.state === 'running' ? '进行中…（Host 后台运行，可关闭页面）' : recovery.state === 'succeeded' ? '完成' : '未完成'}`),
+      body(recovery.root, { style: styles.root }),
+      recovery.kind === 'restore' && recovery.sessionCount !== undefined && body(`会话归档 ${recovery.sessionCount} 个；归档不等于可续接会话`),
+      recovery.kind === 'import' && body(`已导入 ${recovery.importedCount ?? '未确认'} · 已跳过 ${recovery.skippedCount ?? '未确认'} · 失败 ${recovery.failedCount ?? '未确认'}`),
+      view.recoveryError && body(view.recoveryError, { role: 'alert', style: { ...styles.body, ...styles.warning } }),
+      recovery.state === 'failed' && body(recovery.kind === 'restore' ? '目录可能不完整，勿作为完整副本使用；请检查后使用新目录。' : '部分会话可能已写入，请检查下方结果，勿重复导入。', { style: { ...styles.body, ...styles.warning } }),
+      recovery.sessions?.length > 0 && h('div', { style: styles.list, 'aria-label': '会话导入结果' }, ...recovery.sessions.map(item => h('div', { key: item.sourceId, style: styles.project },
+        body(`${item.sourceId} → ${item.sessionId ?? '无新会话 ID'} · ${{ imported: '已导入', skipped: '已跳过', failed: '失败' }[item.outcome]}`),
+        item.workspaceAttached === false && body('未关联工作区；请按会话 ID 手动检查，勿重复导入。', { style: { ...styles.body, ...styles.warning } })) )));
     return h('section', { style: styles.page, 'aria-label': '个人云同步', 'aria-busy': state.loading || state.refreshing || Boolean(state.busy), 'data-personal-sync': 'settings' },
       h('div', { style: styles.between },
         h('h2', { style: { ...styles.heading, fontSize: 18 } }, '个人云同步'),
@@ -625,6 +1084,25 @@ function createClientPlugin(require) {
           onClick: () => { clearSecrets(); void controller.refresh(); } }, state.refreshing ? '刷新中…' : state.conflict ? '刷新并重新选择' : '刷新')),
       state.error && !passwordOpen && !projectManagerOpen && h('div', { role: 'alert', style: { ...styles.card, ...styles.error }, 'data-personal-sync': 'error' }, state.error.message),
       state.notice && body(state.notice, { role: 'status', 'aria-live': 'polite' }),
+      h('section', { style: styles.card, 'aria-labelledby': `${id}-update-title`, 'data-personal-sync': 'update-summary' },
+        h('div', { style: styles.between },
+          h('h3', { id: `${id}-update-title`, style: styles.heading }, '插件更新'),
+          h('span', { style: styles.badge, role: 'status', 'aria-live': 'polite' }, updater?.supported === false ? '此宿主不可用' : updateLabel)),
+        body(`运行版本 ${updater?.currentVersion ?? '未确认'}`),
+        updater?.installedVersion && updater.installedVersion !== updater.currentVersion && body(`已安装 ${updater.installedVersion} · 待重启`),
+        body('固定来源：GitHub HuYongJi/dsh_sync（仓库发布版本）；仅点击检查时访问 GitHub，无需云账号登录。'),
+        updater?.candidate && body(`目标版本 ${updater.candidate.version} · 提交 ${updater.candidate.commit}`, { style: styles.root }),
+        view.updaterBusy && body('更新器忙碌；其他设置、登录、密码、上传和恢复操作已锁定。Host 后台运行，可关闭页面。', { role: 'status' }),
+        (view.restartRequired || state.updateUncertain) && body('插件文件可能已变更；确认安装结束后，必须重启 DSH 再刷新页面（仅刷新无效）。不会自动重启；重启前禁止同步、恢复、导入和修改设置。', { style: { ...styles.body, ...styles.warning } }),
+        state.updateUncertain && body('更新结果未确认，不会自动重装；自动核对次数有限，之后请手动核对更新状态并检查 DSH Plugins。', { role: 'alert', style: { ...styles.body, ...styles.warning } }),
+        view.updateError && body(view.updateError, { role: 'alert', style: { ...styles.body, ...styles.warning } }),
+        body('使用 DSH 原生插件管理器；脚本可能需要在 DSH Plugins 手动审批，兼容性与安全检查不会绕过。'),
+        (state.dirty || state.conflict) && body('更新前请先保存或撤销同步设置更改。'),
+        h('div', { style: styles.row },
+          h(Button, { type: 'button', variant: 'outline', disabled: !view.canCheckUpdate, onClick: () => { clearSecrets(); void controller.checkUpdate(); } }, '检查更新'),
+          h(Button, { type: 'button', variant: 'primary', disabled: !view.canUpdate, onClick: () => { clearSecrets(); controller.prepareUpdate(); } }, '一键更新'),
+          h(Button, { type: 'button', variant: 'ghost', disabled: Boolean(state.busy) || state.refreshing, onClick: () => { void controller.refreshUpdate(); } }, '核对更新状态'),
+          (view.updaterBusy || state.busy === 'installupdate' || state.busy === 'cancelupdate') && h(Button, { type: 'button', variant: 'outline', disabled: !view.canCancelUpdate, onClick: () => { void controller.cancelUpdate(); } }, '取消更新'))),
       h('section', { style: styles.card, 'aria-labelledby': `${id}-account-title` },
         h('div', { style: styles.between },
           h('h3', { id: `${id}-account-title`, style: styles.heading }, '账号'),
@@ -662,7 +1140,18 @@ function createClientPlugin(require) {
               : status && body(status.projects.length ? '暂未选择项目' : '暂无项目'),
             selectedProjects.length > 3 && body(`另有 ${selectedProjects.length - 3} 个项目`),
             state.dirty && h('span', { style: styles.body, role: 'status' }, '未保存')),
-          h(Button, { type: 'button', variant: 'outline', disabled: !status, onClick: openProjects }, '管理'))),
+          h(Button, { type: 'button', variant: 'outline', disabled: !status || view.updateBlocked, onClick: openProjects }, '管理'))),
+      h('section', { style: styles.card, 'aria-labelledby': `${id}-cloud-title`, 'data-personal-sync': 'cloud-summary' },
+        h('div', { style: styles.between },
+          h('h3', { id: `${id}-cloud-title`, style: styles.heading }, '云端下载'),
+          h('div', { style: styles.row },
+            h(Button, { type: 'button', variant: 'outline', disabled: !view.canBrowse, onClick: openCloud }, '浏览云端'),
+            recovery?.kind === 'restore' && recovery.state === 'succeeded' && h(Button, { type: 'button', variant: 'outline', disabled: !view.canImport,
+              onClick: () => { clearSecrets(); controller.prepareImport(); } }, '导入安全会话'))),
+        !recovery && body('下载到 Host 全新目录，不会自动加入同步项目。'),
+        recoveryResult,
+        state.recoveryUncertain && body('请求结果未确认，请刷新状态；先检查目标目录和会话 ID，勿重复下载或导入，也勿通过重新登录或重启来重试。', { role: 'alert', style: { ...styles.body, ...styles.warning } }),
+        cloud.error && !cloudOpen && h('div', { role: 'alert', style: styles.error }, cloud.error.message)),
       h('section', { style: styles.card, 'aria-labelledby': `${id}-status-title` },
         h('div', { style: styles.between },
           h('h3', { id: `${id}-status-title`, style: styles.heading }, '同步状态'),
@@ -681,6 +1170,68 @@ function createClientPlugin(require) {
           h(Button, { type: 'button', variant: 'ghost', disabled: !view.editable || !state.dirty, onClick: () => controller.discardChanges() }, '撤销更改'),
           h(Button, { type: 'button', variant: 'outline', disabled: !view.canSync, 'aria-busy': state.busy === 'sync',
             onClick: () => { clearSecrets(); void controller.sync(); } }, state.busy === 'sync' ? '提交中…' : '立即同步'))),
+      h(Modal, { open: Boolean(updateIntent), onClose: () => controller.cancelUpdateIntent(), title: '确认更新插件？', closeLabel: '取消' },
+        updateIntent && h('div', { style: styles.form },
+          body(`运行版本 ${updateIntent.currentVersion} → 目标版本 ${updateIntent.version}`),
+          body('来源：GitHub HuYongJi/dsh_sync；仅安装本次检查确认的精确提交。'),
+          body(`提交 ${updateIntent.commit}`, { style: styles.root }),
+          body('由 DSH 原生插件管理器安装，不更新云同步服务器，不自动重启，也不会自动启用同步。'),
+          body('原生安装可能需要脚本审批，请在 DSH Plugins 中手动检查。保留兼容性、安全检查和原生审批，不会自动授权或添加版本豁免。'),
+          body('安装开始后即使失败或取消，文件也可能已变更；结束后必须重启 DSH 再刷新页面（仅刷新无效）。取消不保证回滚。', { style: { ...styles.body, ...styles.warning } }),
+          h('div', { style: styles.row },
+            h(Button, { type: 'button', variant: 'ghost', onClick: () => controller.cancelUpdateIntent() }, '取消'),
+            h(Button, { type: 'button', variant: 'primary', disabled: !view.canUpdate, onClick: () => { void controller.confirmUpdate(updateIntent); } }, '确认更新')))),
+      h(Modal, { open: cloudOpen, onClose: closeCloud, title: '云端下载', closeLabel: '关闭' },
+        cloudOpen && h('div', { style: styles.form },
+          body('云端仅提供项目 ID；名称来自本机已知项目。请选择明确检查点，不会自动选择分支。'),
+          cloud.projects.length > 0 && h('div', { style: styles.list, 'aria-label': '云端项目' }, ...cloud.projects.map(project => {
+            const local = status?.projects.find(item => item.projectId === project.projectId);
+            return h('div', { key: project.projectId, style: styles.project },
+              h(Button, { type: 'button', variant: 'ghost', disabled: !view.canBrowse || Boolean(state.recoveryPending), onClick: () => {
+                if (controller.setCloudProject(project.projectId)) void controller.loadCheckpoints();
+              } }, `${project.projectId}${local ? ` · ${local.label}` : ''}`),
+              body(`${project.checkpointCount} 个检查点 · ${when(project.latestCreatedAt)}`));
+          })),
+          h('label', { style: styles.label, htmlFor: `${id}-cloud-project` }, '项目 ID（可手动输入，无需项目浏览支持）',
+            h(Input, { id: `${id}-cloud-project`, value: cloud.projectId, onChange: event => controller.setCloudProject(event.target.value),
+              disabled: !view.canBrowse || Boolean(state.recoveryPending), maxLength: 100, autoComplete: 'off', spellCheck: false, 'data-modal-autofocus': '' })),
+          h(Button, { type: 'button', variant: 'outline', disabled: !view.canBrowse || !cloud.projectId || Boolean(state.recoveryPending),
+            onClick: () => { void controller.loadCheckpoints(); } }, state.busy === 'checkpoints' ? '读取中…' : '读取检查点'),
+          cloud.heads.length > 1 && body(`存在 ${cloud.heads.length} 个 head 冲突分支，请逐项核对后只选择一个检查点。`, { style: { ...styles.body, ...styles.warning } }),
+          cloud.loaded && !cloud.checkpoints.length && body('暂无检查点'),
+          cloud.checkpoints.length > 0 && h('div', { style: styles.list, role: 'group', 'aria-label': '检查点列表（单选）' }, ...cloud.checkpoints.map(checkpoint => h('div', { key: checkpoint.id, style: styles.project },
+            h(Checkbox, { checked: cloud.checkpointId === checkpoint.id, label: `${checkpoint.id}${cloud.heads.includes(checkpoint.id) ? ' · head' : ''}`,
+              disabled: !view.canBrowse || Boolean(state.recoveryPending), onChange: selected => controller.selectCheckpoint(selected ? checkpoint.id : '') }),
+            body(`${when(checkpoint.createdAt)} · 设备 ${checkpoint.deviceId} · ${checkpoint.fileCount} 个文件 · ${checkpoint.totalBytes} 字节`),
+            body(`父检查点 ${checkpoint.parentId ?? '无'}`)))),
+          h('label', { style: styles.label, htmlFor: `${id}-cloud-destination` }, '目标：DSH Host 机器上的绝对路径（非浏览器机器）',
+            h(Input, { id: `${id}-cloud-destination`, value: cloud.destination, onChange: event => controller.setDestination(event.target.value),
+              disabled: !view.canBrowse || Boolean(state.recoveryPending), maxLength: 4096, autoComplete: 'off', spellCheck: false, placeholder: 'E:\\restored\\new-project 或 /srv/restored/new-project' })),
+          body('父目录必须存在，目标目录必须不存在；不会合并或覆盖，不自动注册项目、启用上传或执行任务。'),
+          body('会话归档不等于可续接会话；下载后可另行确认导入安全子集。'),
+          recoveryResult,
+          recovery?.kind === 'restore' && recovery.state === 'succeeded' && h(Button, { type: 'button', variant: 'outline', disabled: !view.canImport,
+            onClick: () => { clearSecrets(); controller.prepareImport(); } }, '导入安全会话'),
+          cloud.error && h('div', { role: 'alert', style: styles.error }, cloud.error.message),
+          state.error && h('div', { role: 'alert', style: styles.error }, state.error.message),
+          (state.dirty || state.conflict) && body('请先保存或撤销本机同步设置更改。'),
+          state.recoveryUncertain && body('结果未确认，勿重复提交；请刷新状态。', { role: 'alert', style: styles.warning }),
+          h('div', { style: styles.row },
+            h(Button, { type: 'button', variant: 'ghost', onClick: closeCloud }, '关闭'),
+            h(Button, { type: 'button', variant: 'outline', disabled: Boolean(state.busy) || state.refreshing, onClick: () => { void controller.refresh(); } }, '核对状态'),
+            h(Button, { type: 'button', variant: 'primary', disabled: !view.canRestore, onClick: () => controller.prepareRestore() }, '下载到新目录')))),
+      h(Modal, { open: Boolean(intent), onClose: () => controller.cancelRecoveryIntent(), title: intent?.kind === 'import' ? '确认导入安全会话？' : '确认云端下载？', closeLabel: '取消' },
+        intent && h('div', { style: styles.form },
+          body(`${intent.server} · ${intent.username}`),
+          intent.kind === 'restore' ? h('div', null,
+            body(`项目 ${intent.projectId} · 检查点 ${intent.checkpointId}`), body(`DSH Host 目标：${intent.destination}`),
+            body('确认父目录已存在、目标目录不存在。下载不注册或选择项目，不开启自动上传，不执行任务。'))
+            : h('div', null, body(`最近成功下载：${intent.root}`),
+              body('仅导入该目录的安全会话子集，可能注册工作区，但不会选择同步项目、开启上传或执行任务。归档不等于可续接；跳过、失败或未关联工作区时请检查结果，勿重复导入。')),
+          h('div', { style: styles.row },
+            h(Button, { type: 'button', variant: 'ghost', onClick: () => controller.cancelRecoveryIntent() }, '取消'),
+            h(Button, { type: 'button', variant: 'primary', disabled: intent.kind === 'restore' ? !view.canRestore : !view.canImport,
+              onClick: () => { void controller.confirmRecovery(intent); } }, intent.kind === 'restore' ? '确认下载' : '确认导入')))),
       h(Modal, { open: projectManagerOpen, onClose: closeProjects, title: '管理同步项目', closeLabel: '关闭',
         footer: projectManagerOpen && h('div', { style: styles.between },
           h('span', { style: styles.body, role: 'status' }, state.dirty ? '未保存' : `已选择 ${view.selectedCount} 项`),

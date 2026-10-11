@@ -463,6 +463,16 @@ export async function createSyncServer(options = {}) {
       });
       sendJson(req, res, 204); return;
     }
+    if (pathname === '/v1/projects' && req.method === 'GET') {
+      // Only the committed index is authoritative; never enumerate orphan manifests.
+      const projects = new Map();
+      for (const entry of store.state.checkpoints) {
+        const prior = projects.get(entry.projectId);
+        if (prior) { prior.checkpointCount++; if (Date.parse(entry.createdAt) > Date.parse(prior.latestCreatedAt)) prior.latestCreatedAt = entry.createdAt; }
+        else projects.set(entry.projectId, { projectId: entry.projectId, checkpointCount: 1, latestCreatedAt: entry.createdAt });
+      }
+      sendJson(req, res, 200, { projects: [...projects.values()].sort((a, b) => a.projectId.localeCompare(b.projectId, 'en')) }); return;
+    }
     if (pathname === '/v1/checkpoints' && req.method === 'GET') {
       const projectId = validateId(url.searchParams.get('projectId'));
       const state = store.state;

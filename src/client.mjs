@@ -1,4 +1,4 @@
-import { assert, validateManifest, validateId, validateBlobHash, sha256, MAX_MANIFEST_BYTES, MAX_BLOB_BYTES } from './protocol.mjs';
+import { assert, validateManifest, validateId, validateBlobHash, sha256, MAX_MANIFEST_BYTES, MAX_BLOB_BYTES, MAX_FILES, MAX_CHECKPOINT_BYTES } from './protocol.mjs';
 
 export function validateServerUrl(value) {
   const url = new URL(value);
@@ -26,6 +26,9 @@ async function limitedBody(response, maxBytes) {
     }
   }
   return Buffer.concat(chunks, size);
+}
+function validateTimestamp(value) {
+  assert(typeof value === 'string' && value.length <= 32 && Number.isFinite(Date.parse(value)) && new Date(value).toISOString() === value, 'Invalid checkpoint timestamp');
 }
 export class SyncClient {
   constructor({ server, token, deviceId, signal, timeoutMs = 60_000 }) {
@@ -92,7 +95,50 @@ export class SyncClient {
     this.token = undefined;
     return { remoteRevoked, ...(remoteRevoked ? {} : { warning: 'Local credentials removed; remote revocation could not be confirmed. The server token remains valid until expiry.' }) };
   }
-  async list(projectId) { validateId(projectId); return this.request(`/v1/checkpoints?projectId=${encodeURIComponent(projectId)}`); }
+  async projects() {
+    let result;
+    try { result = await this.request('/v1/projects'); }
+    catch (error) {
+      if (error.httpStatus === 404 || error.httpStatus === 405) throw Object.assign(new Error('Cloud browsing is unsupported'), { code: 'CLOUD_BROWSE_UNSUPPORTED' });
+      throw error;
+    }
+    assert(result && Array.isArray(result.projects) && result.projects.length <= 10_000, 'Invalid projects response');
+    const seen = new Set();
+    return { projects: result.projects.map(item => {
+      assert(item && typeof item === 'object' && !Array.isArray(item), 'Invalid project metadata');
+      const projectId = validateId(item.projectId);
+      assert(!seen.has(projectId), 'Duplicate cloud project'); seen.add(projectId);
+      assert(Number.isSafeInteger(item.checkpointCount) && item.checkpointCount > 0 && item.checkpointCount <= 1_000_000, 'Invalid checkpoint count');
+      validateTimestamp(item.latestCreatedAt);
+      return { projectId, checkpointCount: item.checkpointCount, latestCreatedAt: item.latestCreatedAt };
+    }) };
+  }
+  async list(projectId) {
+    validateId(projectId);
+    const result = await this.request(`/v1/checkpoints?projectId=${encodeURIComponent(projectId)}`);
+    assert(result && Array.isArray(result.checkpoints) && result.checkpoints.length <= 10_000 && Array.isArray(result.heads) && result.heads.length <= result.checkpoints.length, 'Invalid checkpoints response');
+    const seen = new Set();
+    const checkpoints = result.checkpoints.map(item => {
+      assert(item && typeof item === 'object' && !Array.isArray(item), 'Invalid checkpoint metadata');
+      const id = validateId(item.id), deviceId = validateId(item.deviceId), parentId = item.parentId === null ? null : validateId(item.parentId);
+      assert(item.projectId === projectId && parentId !== id && !seen.has(id), 'Invalid checkpoint identity'); seen.add(id);
+      validateTimestamp(item.createdAt);
+      assert(Number.isSafeInteger(item.fileCount) && item.fileCount >= 0 && item.fileCount <= MAX_FILES && Number.isSafeInteger(item.totalBytes) && item.totalBytes >= 0 && item.totalBytes <= MAX_CHECKPOINT_BYTES, 'Invalid checkpoint bounds');
+      return { id, projectId, deviceId, parentId, createdAt: item.createdAt, fileCount: item.fileCount, totalBytes: item.totalBytes };
+    });
+    const parents = new Set(checkpoints.filter(item => item.parentId !== null).map(item => item.parentId));
+    assert(checkpoints.every(item => item.parentId === null || seen.has(item.parentId)), 'Missing checkpoint parent');
+    const heads = result.heads.map(validateId);
+    assert(new Set(heads).size === heads.length && heads.every(id => seen.has(id) && !parents.has(id)) && heads.length === checkpoints.filter(item => !parents.has(item.id)).length, 'Invalid checkpoint heads');
+    // Reject parent cycles, including disconnected cycles hidden behind a valid head.
+    const byId = new Map(checkpoints.map(item => [item.id, item])), visited = new Set();
+    for (const item of checkpoints) {
+      const chain = new Set(); let current = item;
+      while (current && !visited.has(current.id)) { assert(!chain.has(current.id), 'Cyclic checkpoints'); chain.add(current.id); current = byId.get(current.parentId); }
+      for (const id of chain) visited.add(id);
+    }
+    return { checkpoints, heads };
+  }
   async getCheckpoint(id) { validateId(id); const manifest = validateManifest(await this.request(`/v1/checkpoints/${id}`)); assert(manifest.id === id, 'Server returned a different checkpoint'); return manifest; }
   async uploadBlob(hash, bytes) {
     validateBlobHash(hash);
