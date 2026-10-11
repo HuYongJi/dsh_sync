@@ -213,45 +213,53 @@ function pageSetup(t, handler) {
   t.after(() => { hooks.unmount(); cleanups.forEach(cleanup => cleanup?.()); });
   return { ...mock, ...hooks, required, controller: slot.props.controller, tree: () => hooks.render(slot.Component, slot.props) };
 }
-async function openCloud(page) { page.tree(); page.mount(); await settle(); button(page.tree(), '浏览云端').props.onClick(); await settle(); return modal(page, '云端下载'); }
+const managerTitle = '选择要下载的项目';
+const batchPlan = { latest: true, parent: plan.parent, destinations: [{ ...plan, projectId: project.projectId, label: project.label }] };
+async function openCloud(page) { page.tree(); page.mount(); await settle(); button(page.tree(), '选择项目').props.onClick(); await settle(); return modal(page, managerTitle); }
+async function chooseProject(page) {
+  await openCloud(page);
+  nodes(modal(page, managerTitle)).find(node => node.props?.role === 'combobox').props.onFocus();
+  nodes(modal(page, managerTitle)).find(node => node.props?.role === 'option').props.onClick(); await settle();
+  button(modal(page, managerTitle), '完成').props.onClick();
+}
 
-test('native React cloud uses readable folder labels/source paths, validates legacy metadata, and shows partial/empty results briefly', async t => {
+test('native React add dropdown uses readable folder labels, supports legacy metadata and concise partial/empty states', async t => {
   for (const metadata of [{ projects: [project], partial: true }, { projects: [{ projectId: project.projectId, checkpointCount: 2, latestCreatedAt: checkpoint.createdAt }], legacy: true }, { projects: [{ projectId: 'unknown', checkpointCount: 0, latestCreatedAt: null }] }, { projects: [] }]) {
-    const page = pageSetup(t, call => call.action === 'projects' ? ok(metadata) : reads(call)); const cloud = await openCloud(page);
-    assert.equal(nodes(cloud).some(node => node.type === 'native:Input'), false);
+    const page = pageSetup(t, call => call.action === 'projects' ? ok(metadata) : reads(call)); await openCloud(page);
+    nodes(modal(page, managerTitle)).find(node => node.props?.role === 'combobox').props.onFocus(); const cloud = modal(page, managerTitle);
+    assert.equal(nodes(cloud).filter(node => node.type === 'native:Input').length, 1);
     assert.match(text(cloud), metadata.partial ? /云端项目文件夹/ : metadata.legacy ? /本机项目名称/ : metadata.projects.length ? /项目文件夹/ : /暂无云端项目/);
-    if (metadata.partial) { assert.match(text(cloud), /部分项目读取失败/); assert.ok(text(cloud).includes(project.sourceRoot)); }
+    if (metadata.partial) assert.match(text(cloud), /部分项目读取失败/);
     assert.doesNotMatch(text(cloud), /project-one|项目 ID|手动输入|绝对路径|归档不等于|不自动/);
     assert.deepEqual(page.required, ['react', '@deepseek-ai/dsh-client-ui-primitives']);
   }
 });
 
-test('native React folder modal browses folders/crumbs, disables unsuitable parent and rejects stale callbacks', async t => {
-  const page = pageSetup(t, call => call.action === 'destinationpick' ? ok({ browser }) : call.action === 'destinationbrowse' ? ok({ browser: call.payload.nodeId === 'node-root' ? browser : nested }) : call.action === 'destinationselect' ? ok({ destination: plan }) : reads(call));
-  await openCloud(page); button(modal(page, '云端下载'), project.label).props.onClick(); await settle();
-  const boxes = nodes(modal(page, '云端下载')).filter(node => node.type === 'native:Checkbox'); assert.ok(boxes.every(node => !node.props.checked)); boxes[0].props.onChange(true);
-  button(modal(page, '云端下载'), '选择文件夹').props.onClick(); await settle();
-  let picker = modal(page, '选择文件夹'); assert.equal(picker.props.open, true); assert.equal(button(picker, '选择此文件夹').props.disabled, true);
+test('native React single cloud Modal browses folders/crumbs, disables unsuitable parent and rejects stale callbacks', async t => {
+  const page = pageSetup(t, call => call.action === 'downloadpick' ? ok({ latest: true, browser }) : call.action === 'downloadbrowse' ? ok({ latest: true, browser: call.payload.nodeId === 'node-root' ? browser : nested }) : call.action === 'downloadselect' ? ok(batchPlan) : reads(call));
+  await chooseProject(page); button(page.tree(), '保存位置').props.onClick(); await settle();
+  let picker = modal(page, '选择保存位置'); assert.equal(picker.props.open, true); assert.equal(button(picker, '选择此文件夹').props.disabled, true);
   assert.equal(nodes(picker).some(node => node.type === 'native:Input'), false);
+  assert.equal(nodes(page.tree()).filter(node => node.type === 'native:Modal' && node.props.open).length, 1);
   const old = button(picker, '保存目录').props.onClick; old(); await settle();
-  picker = modal(page, '选择文件夹'); assert.equal(button(picker, '选择此文件夹').props.disabled, false);
+  picker = modal(page, '选择保存位置'); assert.equal(button(picker, '选择此文件夹').props.disabled, false);
   const before = page.calls.length; old(); await settle(); assert.equal(page.calls.length, before);
-  button(picker, 'synthetic').props.onClick(); await settle(); button(modal(page, '选择文件夹'), '保存目录').props.onClick(); await settle();
-  button(modal(page, '选择文件夹'), '选择此文件夹').props.onClick(); await settle();
-  assert.equal(modal(page, '选择文件夹').props.open, false);
-  const cloud = modal(page, '云端下载'); assert.ok(text(cloud).includes(plan.root)); assert.equal(nodes(cloud).some(node => node.type === 'native:Input'), false);
-  button(cloud, '下载到新目录').props.onClick(); const confirm = modal(page, '确认云端下载？');
+  button(picker, 'synthetic').props.onClick(); await settle(); button(modal(page, '选择保存位置'), '保存目录').props.onClick(); await settle();
+  button(modal(page, '选择保存位置'), '选择此文件夹').props.onClick(); await settle();
+  assert.equal(modal(page, '选择保存位置').props.open, false); assert.ok(text(page.tree()).includes(plan.parent));
+  assert.equal(nodes(page.tree()).some(node => node.type === 'native:Input'), false);
+  button(page.tree(), '下载所选').props.onClick(); const confirm = modal(page, '确认下载所选项目');
   assert.equal(confirm.props.open, true); assert.ok(text(confirm).includes(plan.root)); assert.ok(text(confirm).includes(project.label));
-  assert.equal(page.calls.some(call => ['restore', 'import', 'sync', 'preferences'].includes(call.action)), false);
+  assert.equal(nodes(page.tree()).filter(node => node.type === 'native:Modal' && node.props.open).length, 1);
+  assert.equal(page.calls.some(call => ['downloadstart', 'restore', 'import', 'sync', 'preferences'].includes(call.action)), false);
 });
 
 test('native React folder close/unmount aborts native picker and never falls back to a browser-computer picker', async t => {
-  const late = deferred(); const page = pageSetup(t, call => call.action === 'destinationpick' ? late.promise : reads(call));
-  await openCloud(page); button(modal(page, '云端下载'), project.label).props.onClick(); await settle();
-  nodes(modal(page, '云端下载')).find(node => node.type === 'native:Checkbox').props.onChange(true);
-  button(modal(page, '云端下载'), '选择文件夹').props.onClick(); const request = page.calls.at(-1);
+  const late = deferred(); const page = pageSetup(t, call => call.action === 'downloadpick' ? late.promise : reads(call));
+  await chooseProject(page);
+  button(page.tree(), '保存位置').props.onClick(); const request = page.calls.at(-1);
   page.unmount(); await settle(); assert.equal(request.signal.aborted, true);
-  late.resolve(ok({ destination: plan })); await settle(); assert.equal(page.controller.getSnapshot().cloud.destinationId, '');
+  late.resolve(ok(batchPlan)); await settle(); assert.equal(page.controller.getSnapshot().downloadPlan, null);
   const source = await readFile(new URL('../client/adapter.mjs', import.meta.url), 'utf8');
   assert.equal(source.split(/\r?\n/)[0], "import { createController, deriveView, filterProjects } from './state.mjs';");
   assert.doesNotMatch(source, /showDirectoryPicker|webkitdirectory|setDestination\(|cloud-project|cloud-destination|createDirectory/);

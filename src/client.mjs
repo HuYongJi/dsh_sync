@@ -157,6 +157,16 @@ export class SyncClient {
     }
     return { checkpoints, heads };
   }
+  /** Latest means authoritative append-index order, never client clocks or a unique head. */
+  async latestCheckpoint(projectId) {
+    const { checkpoints } = await this.list(projectId), latest = checkpoints.at(-1);
+    if (!latest) throw Object.assign(new Error('Cloud project has no committed checkpoints'), { code: 'CLOUD_PROJECT_EMPTY' });
+    // A missing/corrupt last commit is an error, not permission to restore older history.
+    const manifest = await this.getCheckpoint(latest.id);
+    if (manifest.projectId !== projectId) throw Object.assign(new Error('Checkpoint does not belong to project'), { code: 'CHECKPOINT_MISMATCH' });
+    assert(manifest.deviceId === latest.deviceId && manifest.parentId === latest.parentId && manifest.createdAt === latest.createdAt && manifest.files.length === latest.fileCount && manifest.files.reduce((total, file) => total + file.size, 0) === latest.totalBytes, 'Checkpoint does not match committed metadata');
+    return manifest;
+  }
   async getCheckpoint(id) { validateId(id); const manifest = validateManifest(await this.request(`/v1/checkpoints/${id}`)); assert(manifest.id === id, 'Server returned a different checkpoint'); return manifest; }
   async uploadBlob(hash, bytes) {
     validateBlobHash(hash);

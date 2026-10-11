@@ -79,7 +79,11 @@ Host/Origin 与 DSH 浏览器会话验证发生在 exact route 分派之前；�
 | `destinationbrowse` | 上述身份绑定 + `{browserId, nodeId}` | `{browser:Browser}` |
 | `destinationselect` | 上述身份绑定 + `{browserId, nodeId}` | `{destination:Plan}` |
 | `restore` | 上述身份绑定 + `{projectId, checkpointId, destinationId, confirm:true, requestId}` | `{recovery}`，接受后异步下载；旧 `destination` 字符串保留兼容但新界面不发送 |
-| `import` | 上述身份绑定 + `{restoreId, confirm:true, requestId}` | `{recovery}`，接受后异步导入 |
+| `import` | 上述身份绑定 + `{restoreId, confirm:true, requestId}` | `{recovery}`，单次恢复或当前批次成功项的显式导入 |
+| `downloadpick` | 上述身份绑定 + `{latest:true,items:[{projectId}]}` | `{latest:true,parent,destinations}`、`{latest:true,browser}` 或 `{cancelled:true}` |
+| `downloadbrowse` | 上述身份绑定 + `{latest:true,browserId,nodeId}` | `{latest:true,browser}`，只接受同模式批次句柄 |
+| `downloadselect` | 上述身份绑定 + `{latest:true,browserId,nodeId}` | `{latest:true,parent,destinations}`，目标固定，内容在开始时取最新 |
+| `downloadstart` | 上述身份绑定 + `{latest:true,items:[{projectId,destinationId}],requestId,confirm:true}` | `{download:DownloadStatus}`，其中 `download.latest:true` |
 | `updatestatus` | `{}` | `{update}`，只读本机状态，不请求 GitHub |
 | `checkupdate` | `{}` | `{update}`，显式检查固定仓库版本 |
 | `installupdate` | `{candidateId, requestId, confirm:true}` | `{update}`，原生安装接受后异步执行 |
@@ -169,6 +173,43 @@ Browser = {id, path, currentId, crumbs:[{id,label}], directories:[{id,label}], s
 Host 把选定的真实父目录转为短期计划，自动建议不存在的新子目录（冲突时使用安全兄弟名称），确认前不创建目录。Client 新流程只发送 `destinationId`，显示的最终路径不会反向授权任意路径。取消原生选择保留此前有效选择；变更项目/检查点/账号/revision 或更新门禁会清空计划并取消选择请求，关闭页面也中止尚未完成的选择。已经接受的下载仍按原有 Host 异步任务规则继续，不混淆两者。
 
 计划与原生 provider、登录凭据、本机父目录身份及检查点绑定；重新校验链接、保护目录与 inode。15 分钟有效期只限制新任务准入，不中断已接受的长下载；同一请求重试返回已记录结果，不能重做文件写入。目录选择 SDK 契约已只读核实，测试仍是 mock 原生能力 + 真实 loopback 云服务，未验证真实系统对话框或实际 GUI 视觉。
+
+## 0.7.0 选择式下载管理与 Host 批次（历史固定模式）
+
+以下固定版本字段继续供旧客户端/高级接口兼容；当前图形界面已由下一节的 0.8.0 最新内容模式取代，不再提供版本选择。
+
+下载使用“选择要下载的项目”面板：上方仅列已选项目，逐项移除；下方是可搜索的添加下拉列表，已选项不再出现在候选中。最多 20 项，**选择表示下载，不是排除，也不更改上传白名单**。Input + 同一 Modal 内的 listbox 组合支持方向键、Enter、指针选择；Tab 不添加，Escape 先收起候选，中文输入法提交不误触发添加。没有借用原生 Menu 的菜单快捷键（其 Tab 会激活菜单项），也不把 listbox 放到 Modal 焦点范围之外。
+
+无冲突时显式标为“最新版本”，只取唯一 head；多个 head 必须展开选择。版本列表按需显示，显式历史选择在刷新后仍保留，消失时变为未解决，不偷偷切换最新。项目目录重新打开会刷新，不清空已选草稿。保存位置只选一次，Host 为同名/大小写近似项目规划不同的新子目录。
+
+界面只使用一个下载 Modal，内部切换选择、文件夹浏览、确认、进度和导入；正常页面没有整个目录/历史/结果的堆叠。最终确认包含每个确切版本与目标路径、文件/大小摘要；一次 `downloadstart` 接受完整批次，不由浏览器逐项目调用 `restore`。关闭页面只停止观察，Host 继续；重开读取当前登录下的批次结果，不自动重发。
+
+```js
+DownloadPlan = { parent, destinations: [{projectId, checkpointId, id, root, parent, label}] }
+DownloadStatus = {
+  id, state: 'running' | 'succeeded' | 'partial' | 'failed', completed, total,
+  warningCode?: 'DOWNLOAD_FINALIZATION_FAILED',
+  items: [{ projectId, checkpointId, restoreId, root, label,
+    state: 'pending' | 'running' | 'succeeded' | 'failed' | 'cancelled',
+    sessionCount?, errorCode?, canImport, importResult?: Recovery }]
+}
+```
+
+`status.download` 为可选公共状态；未接受任务时可以没有该字段。selection/plan/intent 是不可变的本次页面控制器状态，项目、版本、身份或运行时变化都会使旧计划/确认失效。所有批次目标在确认前验证，确认后逐个执行；单项独立失败继续其他项目，权限/账号/配置/取消失败停止剩余项。状态清理失败不会覆盖已经验证成功的文件结果，但会返回独立 warning。
+
+仅当前批次成功项可通过既有 `import` 动作单独确认导入，`canImport` 在导入准入时消费，`importResult` 保存安全计数与可能已落盘的新会话 ID。未确认回包不自动重试；不创建 agent，不默认同步新目录。批次在 Host 内存保留，不提供进程重启续传。旧单项目 API 与命令保持兼容，不是新界面的逐项派发实现。
+
+## 0.8.0 直接下载云端最新内容
+
+选择面板只保留项目名称和移除操作，添加时不请求检查点、不规划目录。删除了版本按钮、历史列表、分支选择、刷新版本和基于旧清单的日期/数量统计；项目只需保持已选状态，版本由 Host 在开始新批次时处理。
+
+四个批次动作显式发送 `latest:true`。`downloadpick` 仅提交项目 ID；规划结果为 `{latest:true,parent,destinations:[{projectId,id,root,parent,label}]}`，不含 checkpointId。browse/select 也必须保持最新模式标记，取消仍返回 `{cancelled:true}`。`downloadstart` 仅提交项目与目标句柄，禁止额外注入固定版本字段；新前端不降级接受旧模式计划或回包。
+
+Host 先检查重复 requestId：重试只返回原结果，不重新解析“最新”。新请求则在独占准入中重新读取每个项目已提交索引的最后一项，验证清单并固定实际 ID；按成功提交顺序，不按设备时钟或 heads 数量，因此多分支无需额外选择，但历史和其他分支不会删除或合并。读取后的新提交留给下一次下载，没有跨项目全局事务快照承诺。
+
+即使最新清单的源文件夹改名，实际目标仍是用户已经确认的计划路径。慢速读取之后再次验证 TTL、parent/provider、账号与 revision，确认前取消不会写文件；接受后沿用任务级取消与完整性检查，不能中途换成另一份内容。每项真正下载的清单摘要继续决定显式导入资格。
+
+公共 `DownloadStatus` 对最新任务增加 `latest:true`，内部仍带真实 checkpointId 用于校验/导入，但界面不展示或让用户选择。旧状态可只读展示；最新确认只能与同模式、同 requestId/项目/目标的实际状态匹配，不要求它等于浏览器曾缓存的旧检查点。旧无 latest 标志的固定接口及命令仍兼容，`latest:false` 或模式句柄交叉使用会被拒绝。
 
 ## 源码、安全与生命周期
 

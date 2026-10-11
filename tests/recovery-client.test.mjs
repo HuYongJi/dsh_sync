@@ -337,75 +337,83 @@ function pageSetup(t, handler) {
   t.after(() => { hooks.unmount(); cleanups.forEach(cleanup => cleanup?.()); });
   return { ...mock, ...hooks, controller: slot.props.controller, tree: () => hooks.render(slot.Component, slot.props) };
 }
-async function browsePage(page) { await page.controller.refresh(); page.tree(); page.mount(); await settle(); button(page.tree(), '浏览云端').props.onClick(); await settle(); return modal(page, '云端下载'); }
+const managerTitle = '选择要下载的项目';
+const reviewTitle = '确认下载所选项目';
+const guiPlan = { latest: true, parent: 'E:\\synthetic', destinations: [{ id: 'destination-one', projectId: checkpoint.projectId, root: destination, parent: 'E:\\synthetic', label: '本机已知名称' }] };
+const guiReads = call => call.action === 'downloadpick' ? ok(guiPlan) : readOnlyHandler(call);
+const guiDownload = id => ({ id, latest: true, state: 'succeeded', completed: 1, total: 1, items: [{ projectId: checkpoint.projectId, checkpointId: branch.id, restoreId: 'batch-restore-one', root: destination, label: '本机已知名称', state: 'succeeded', sessionCount: 2, canImport: true }] });
+async function browsePage(page) { await page.controller.refresh(); page.tree(); page.mount(); await settle(); button(page.tree(), '选择项目').props.onClick(); await settle(); return modal(page, managerTitle); }
+async function addPageProject(page) {
+  const search = nodes(modal(page, managerTitle)).find(node => node.props?.role === 'combobox'); search.props.onFocus();
+  nodes(modal(page, managerTitle)).find(node => node.props?.role === 'option').props.onClick(); await settle();
+}
 async function selectPage(page) {
-  await browsePage(page);
-  button(modal(page, '云端下载'), '本机已知名称').props.onClick(); await settle();
-  const chosen = nodes(modal(page, '云端下载')).filter(node => node.type === 'native:Checkbox')[1]; chosen.props.onChange(true);
-  button(modal(page, '云端下载'), '选择文件夹').props.onClick(); await settle();
+  await browsePage(page); await addPageProject(page);
+  button(modal(page, managerTitle), '完成').props.onClick();
+  button(page.tree(), '保存位置').props.onClick(); await settle();
 }
 
-test('recovery GUI stays compact/inert and uses folder labels, explicit branch choice and readonly Host destination', async t => {
-  const page = pageSetup(t, readOnlyHandler); await page.controller.refresh();
+test('recovery GUI stays compact/inert and uses positive latest-only chosen rows and readonly Host destination', async t => {
+  const page = pageSetup(t, guiReads); await page.controller.refresh();
   assert.equal(nodes(page.tree()).some(node => node.type === 'native:Input'), false);
   assert.equal(nodes(page.tree()).some(node => node.type === 'native:Checkbox'), false);
   assert.equal(page.calls.every(call => call.action === 'status'), true);
-  let browse = await browsePage(page);
+  await browsePage(page); assert.match(renderedText(modal(page, managerTitle)), /尚未选择项目/);
+  await addPageProject(page); const browse = modal(page, managerTitle);
   assert.match(renderedText(browse), /本机已知名称/);
-  assert.equal(nodes(browse).some(node => node.type === 'native:Input'), false);
-  assert.equal(button(browse, '选择文件夹').props.disabled, true);
-  button(browse, '本机已知名称').props.onClick(); await settle(); browse = modal(page, '云端下载');
-  assert.match(renderedText(browse), /2 个分支/);
-  assert.doesNotMatch(renderedText(browse), /project-one|手动输入|绝对路径|父目录|归档不等于|不自动/);
-  assert.match(renderedText(browse), /设备 device-two · 4 个文件 · 100 字节/);
-  const boxes = nodes(browse).filter(node => node.type === 'native:Checkbox'); assert.equal(boxes.every(node => !node.props.checked), true);
-  assert.equal(button(browse, '下载到新目录').props.disabled, true);
-  boxes[1].props.onChange(true); button(modal(page, '云端下载'), '选择文件夹').props.onClick(); await settle();
-  assert.equal(button(modal(page, '云端下载'), '下载到新目录').props.disabled, false);
-  button(modal(page, '云端下载'), '下载到新目录').props.onClick();
-  const confirm = modal(page, '确认云端下载？'); assert.equal(confirm.props.open, true);
+  assert.equal(nodes(browse).some(node => node.type === 'input' && node.props.type === 'radio'), false);
+  assert.equal(button(page.tree(), '保存位置').props.disabled, false);
+  assert.doesNotMatch(renderedText(browse), /版本|检查点|分支|设备|project-one|手动输入|绝对路径|字节/);
+  assert.equal(page.calls.some(call => call.action === 'checkpoints'), false);
+  button(modal(page, managerTitle), '完成').props.onClick();
+  button(page.tree(), '保存位置').props.onClick(); await settle(); assert.equal(button(page.tree(), '下载所选').props.disabled, false);
+  button(page.tree(), '下载所选').props.onClick(); const confirm = modal(page, reviewTitle); assert.equal(confirm.props.open, true);
   assert.ok(renderedText(confirm).includes('本机已知名称')); assert.ok(renderedText(confirm).includes(destination));
-  assert.equal(page.controller.getSnapshot().cloud.intent.checkpointId, branch.id);
-  assert.equal(page.calls.some(call => ['restore', 'import', 'sync', 'preferences'].includes(call.action)), false);
-  button(confirm, '取消').props.onClick(); assert.equal(modal(page, '确认云端下载？').props.open, false);
+  assert.equal(page.controller.getSnapshot().downloadIntent.latest, true);
+  assert.equal(Object.hasOwn(page.controller.getSnapshot().downloadIntent.items[0], 'checkpointId'), false);
+  assert.match(renderedText(confirm), /下载云端最新内容/); assert.doesNotMatch(renderedText(confirm), /版本|检查点|分支|个文件|字节|2026/);
+  assert.equal(page.calls.some(call => ['downloadstart', 'restore', 'import', 'sync', 'preferences'].includes(call.action)), false);
+  button(confirm, '关闭').props.onClick(); assert.equal(modal(page, reviewTitle).props.open, false);
 });
 
 test('recovery GUI old unsupported cloud gives concise upgrade error without a manual ID workflow', async t => {
-  const page = pageSetup(t, call => call.action === 'projects' ? failure('CLOUD_BROWSE_UNSUPPORTED') : readOnlyHandler(call));
+  const page = pageSetup(t, call => call.action === 'projects' ? failure('CLOUD_BROWSE_UNSUPPORTED') : guiReads(call));
   const browse = await browsePage(page); assert.match(renderedText(browse), /请更新同步服务器/);
   assert.doesNotMatch(renderedText(browse), /手动输入|项目 ID/);
-  assert.equal(nodes(browse).some(node => node.type === 'native:Input'), false);
-  assert.equal(button(browse, '下载到新目录').props.disabled, true);
-  assert.equal(page.calls.some(call => ['checkpoints', 'restore'].includes(call.action)), false);
+  assert.equal(nodes(browse).filter(node => node.type === 'native:Input').length, 1);
+  assert.equal(button(page.tree(), '下载所选').props.disabled, true);
+  assert.equal(page.calls.some(call => ['checkpoints', 'restore', 'downloadstart'].includes(call.action)), false);
 });
 
-test('recovery GUI confirmation survives no stale identity/path handler and only one explicit download then separate import', async t => {
+test('recovery GUI confirmation rejects stale selection handlers and submits one Host batch then separate per-item import', async t => {
   let current = status();
   const page = pageSetup(t, call => {
-    if (call.action === 'restore') { current = status({ recovery: recovery({ id: call.payload.requestId, checkpointId: call.payload.checkpointId }) }); return ok({ recovery: current.recovery }); }
-    if (call.action === 'import') { current = status({ recovery: recovery({ id: call.payload.requestId, kind: 'import', importedCount: 2, skippedCount: 0, failedCount: 0 }) }); return ok({ recovery: current.recovery }); }
-    return call.action === 'status' ? ok(current) : readOnlyHandler(call);
+    if (call.action === 'downloadstart') { current = status({ download: guiDownload(call.payload.requestId) }); return ok({ download: current.download }); }
+    if (call.action === 'import') {
+      const result = recovery({ id: call.payload.requestId, kind: 'import', importedCount: 2, skippedCount: 0, failedCount: 0 });
+      current = status({ recovery: result, download: { ...current.download, items: current.download.items.map(row => ({ ...row, canImport: false, importResult: result })) } });
+      return ok({ recovery: result });
+    }
+    return call.action === 'status' ? ok(current) : guiReads(call);
   });
-  await selectPage(page); button(modal(page, '云端下载'), '下载到新目录').props.onClick();
-  const old = button(modal(page, '确认云端下载？'), '确认下载').props.onClick;
-  nodes(modal(page, '云端下载')).find(node => node.type === 'native:Checkbox').props.onChange(true); old(); await settle();
-  assert.equal(page.calls.some(call => call.action === 'restore'), false);
-  button(modal(page, '云端下载'), '选择文件夹').props.onClick(); await settle();
-  button(modal(page, '云端下载'), '下载到新目录').props.onClick();
-  const confirm = button(modal(page, '确认云端下载？'), '确认下载').props.onClick; confirm(); confirm(); await settle();
-  assert.equal(page.calls.filter(call => call.action === 'restore').length, 1);
-  assert.equal(page.calls.some(call => ['import', 'preferences', 'sync'].includes(call.action)), false);
-  assert.match(renderedText(modal(page, '云端下载')), /下载完成/);
-  assert.equal(button(modal(page, '云端下载'), '导入安全会话').props.disabled, false);
-  button(modal(page, '云端下载'), '关闭').props.onClick();
-  assert.match(renderedText(page.tree()), /下载完成/); assert.match(renderedText(page.tree()), /会话归档 2/);
-  button(page.tree(), '导入安全会话').props.onClick();
-  const importConfirm = modal(page, '导入可恢复会话？'); assert.equal(importConfirm.props.open, true);
-  assert.ok(renderedText(importConfirm).includes(destination)); assert.match(renderedText(importConfirm), /会话归档 2 个/);
+  await selectPage(page); button(page.tree(), '下载所选').props.onClick();
+  const old = button(modal(page, reviewTitle), '确认下载').props.onClick;
+  page.controller.removeDownloadProject(checkpoint.projectId); await page.controller.addDownloadProject(checkpoint.projectId); old(); await settle();
+  assert.equal(page.calls.some(call => call.action === 'downloadstart'), false);
+  button(page.tree(), '保存位置').props.onClick(); await settle(); button(page.tree(), '下载所选').props.onClick();
+  const confirm = button(modal(page, reviewTitle), '确认下载').props.onClick; confirm(); confirm(); await settle();
+  assert.equal(page.calls.filter(call => call.action === 'downloadstart').length, 1);
+  assert.equal(page.calls.some(call => ['restore', 'import', 'preferences', 'sync'].includes(call.action)), false);
+  assert.match(renderedText(modal(page, '下载进度')), /下载完成/);
+  button(modal(page, '下载进度'), '关闭').props.onClick(); assert.match(renderedText(page.tree()), /下载完成/);
+  button(page.tree(), '查看下载进度').props.onClick(); await settle();
+  button(modal(page, '下载进度'), '导入安全会话').props.onClick();
+  const importConfirm = modal(page, '导入安全会话？'); assert.equal(importConfirm.props.open, true); assert.ok(renderedText(importConfirm).includes(destination));
   assert.equal(page.calls.some(call => call.action === 'import'), false);
   button(importConfirm, '确认导入').props.onClick(); await settle();
   assert.equal(page.calls.filter(call => call.action === 'import').length, 1);
-  assert.match(renderedText(page.tree()), /已导入 2 · 已跳过 0 · 失败 0/);
+  assert.equal(page.calls.find(call => call.action === 'import').payload.restoreId, 'batch-restore-one');
+  assert.match(renderedText(modal(page, '下载进度')), /已导入 2 · 已跳过 0 · 失败 0/);
 });
 
 test('recovery GUI displays running work on reopen and never fabricates missing import counts', async t => {
@@ -413,7 +421,7 @@ test('recovery GUI displays running work on reopen and never fabricates missing 
   await page.controller.refresh();
   assert.match(renderedText(page.tree()), /导入进行中…/);
   assert.match(renderedText(page.tree()), /已导入 未确认 · 已跳过 未确认 · 失败 未确认/);
-  assert.equal(button(page.tree(), '浏览云端').props.disabled, true);
+  assert.equal(button(page.tree(), '选择项目').props.disabled, true);
   assert.equal(button(page.tree(), '立即同步').props.disabled, true);
   assert.equal(button(page.tree(), '修改密码').props.disabled, true);
   assert.equal(button(page.tree(), '退出登录').props.disabled, false);
@@ -423,12 +431,12 @@ test('recovery GUI displays running work on reopen and never fabricates missing 
 
 test('recovery GUI clears an open confirmation on account change and renders partial durable IDs and safe failure guidance', async t => {
   let current = status();
-  const page = pageSetup(t, call => call.action === 'status' ? ok(current) : readOnlyHandler(call));
-  await selectPage(page); button(modal(page, '云端下载'), '下载到新目录').props.onClick();
-  const old = button(modal(page, '确认云端下载？'), '确认下载').props.onClick;
+  const page = pageSetup(t, call => call.action === 'status' ? ok(current) : guiReads(call));
+  await selectPage(page); button(page.tree(), '下载所选').props.onClick();
+  const old = button(modal(page, reviewTitle), '确认下载').props.onClick;
   current = status({ revision: 4, username: 'other' }); await page.controller.refresh(); old(); await settle();
-  assert.equal(modal(page, '确认云端下载？').props.open, false);
-  assert.equal(page.calls.some(call => call.action === 'restore'), false);
+  assert.equal(modal(page, reviewTitle).props.open, false);
+  assert.equal(page.calls.some(call => ['restore', 'downloadstart'].includes(call.action)), false);
   current = status({ recovery: recovery({ kind: 'import', state: 'failed', importedCount: 1, skippedCount: 1, failedCount: 1, errorCode: 'IMPORT_FAILED',
     sessions: [{ sourceId: 'old-a', sessionId: 'new-a', outcome: 'imported', workspaceAttached: false }, { sourceId: 'old-b', outcome: 'skipped' }, { sourceId: 'old-c', outcome: 'failed' }] }) });
   await page.controller.refresh();

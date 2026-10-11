@@ -1,6 +1,6 @@
 {
   "name": "dsh-personal-sync",
-  "version": "0.6.0",
+  "version": "0.8.0",
   "description": "Local-first checkpoint sync and personal authentication for DeepSeek Harness",
   "repository": { "type": "git", "url": "git+https://github.com/HuYongJi/dsh_sync.git" },
   "homepage": "https://github.com/HuYongJi/dsh_sync#readme",

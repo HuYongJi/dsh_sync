@@ -71,10 +71,10 @@ export function createDestinationPicker(ctx, { admitParent, admitDestination, no
     if (!unchanged(actual.identity, node.identity)) throw fail('DESTINATION_CHANGED');
     return actual;
   }
-  function ownedBrowser(input, identity) {
+  function ownedBrowser(input, identity, batch = false) {
     prune();
     const browser = browsers.get(input.browserId);
-    if (!browser || !sameBinding(input, browser.input) || !sameIdentity(identity, browser.identity)) throw fail('DIRECTORY_PICKER_EXPIRED');
+    if (!browser || browser.batch !== batch || browser.latest !== (input.latest === true) || !sameBinding(input, browser.input) || !sameIdentity(identity, browser.identity)) throw fail('DIRECTORY_PICKER_EXPIRED');
     provider(browser.service, browser.kind);
     const node = browser.nodes.get(input.nodeId);
     if (!node) throw fail('DIRECTORY_PICKER_EXPIRED');
@@ -127,65 +127,99 @@ export function createDestinationPicker(ctx, { admitParent, admitDestination, no
     await check(); provider(browser.service, browser.kind); await revalidate(current);
     return { id: browser.id, path: directory, currentId, crumbs, directories, selectable, truncated: listing.truncated };
   }
+  const reservationKey = value => path.resolve(value).normalize('NFC').toLowerCase();
   async function plan(owner, parent, identity, check) {
-    prune(); if (plans.size >= maxPlans) throw fail('DIRECTORY_PICKER_FAILED');
+    prune(); if (plans.size + owner.items.length > maxPlans) throw fail('DIRECTORY_PICKER_FAILED');
     const actual = await realDirectory(parent.path, { selecting: true });
     if (parent.identity && !unchanged(parent.identity, actual.identity)) throw fail('DESTINATION_CHANGED');
-    const name = proposedDirectoryName(owner.sourceRoot);
-    let root;
-    for (let attempt = 0; attempt < 10; attempt++) {
-      root = path.join(actual.path, attempt ? `${name}-${randomUUID().slice(0, 8)}` : name);
-      try { await admitDestination(root); break; }
-      catch (error) { if (!['DESTINATION_EXISTS', 'PROTECTED_DESTINATION'].includes(error.code) || attempt === 9) throw error; root = undefined; }
+    // Planned directories do not exist yet. Reserve names across this entire selection
+    // AND older live dialogs, case-insensitively on every platform, before publication.
+    const occupied = new Set([...plans.values()].map(item => reservationKey(item.root))), pending = [], selectionId = randomUUID();
+    for (const item of owner.items) {
+      const name = proposedDirectoryName(item.sourceRoot);
+      let root;
+      for (let attempt = 0; attempt < 32; attempt++) {
+        const candidate = path.join(actual.path, attempt ? `${name}-${randomUUID().slice(0, 8)}` : name);
+        if (occupied.has(reservationKey(candidate))) continue;
+        try { await admitDestination(candidate); root = candidate; break; }
+        catch (error) { if (!['DESTINATION_EXISTS', 'PROTECTED_DESTINATION'].includes(error.code)) throw error; }
+      }
+      if (!root) throw fail('DIRECTORY_PICKER_FAILED');
+      occupied.add(reservationKey(root));
+      pending.push({ id: randomUUID(), root, parent: actual, identity: { ...identity }, input: { revision: owner.input.revision, server: owner.input.server, username: owner.input.username, projectId: item.projectId, ...(!owner.latest ? { checkpointId: item.checkpointId } : {}) }, label: item.label, service: owner.service, kind: owner.kind, batch: owner.batch, latest: owner.latest, selectionId, selectionSize: owner.items.length });
     }
     await check(); provider(owner.service, owner.kind); await revalidate(actual, { selecting: true });
-    const id = randomUUID(), record = { id, root, parent: actual, identity: { ...identity }, input: { ...owner.input }, expires: now() + ttlMs };
-    plans.set(id, record);
-    return { id, root, parent: actual.path };
+    prune();
+    const currentRoots = new Set([...plans.values()].map(item => reservationKey(item.root)));
+    if (plans.size + pending.length > maxPlans || pending.some(item => currentRoots.has(reservationKey(item.root)))) throw fail('DIRECTORY_PICKER_FAILED');
+    // One synchronous commit: cancellation/failure above leaves every previous plan valid.
+    const expires = now() + ttlMs;
+    for (const record of pending) { record.expires = expires; plans.set(record.id, record); }
+    const destinations = pending.map(record => ({ projectId: record.input.projectId, ...(!record.latest ? { checkpointId: record.input.checkpointId } : {}), id: record.id, root: record.root, parent: actual.path, label: record.label }));
+    return owner.batch ? { ...(owner.latest ? { latest: true } : {}), parent: actual.path, destinations } : { destination: { id: destinations[0].id, root: destinations[0].root, parent: actual.path } };
+  }
+  async function pick(input, manifests, context, batch) {
+    const { identity, signal, check } = context;
+    prune();
+    const { service, capability } = provider();
+    const latest = batch && input.latest === true;
+    const owner = { service, kind: capability.kind, batch, latest, input: { revision: input.revision, server: input.server, username: input.username }, items: manifests.map(manifest => ({ projectId: manifest.projectId, ...(!latest ? { checkpointId: manifest.id } : {}), sourceRoot: manifest.sourceRoot, label: projectFolderMetadata(manifest.sourceRoot).label })) };
+    if (capability.kind === 'native') {
+      const selected = await call(owner, 'pick', [], signal, check);
+      if (selected === null) return { cancelled: true };
+      return plan(owner, { path: selected }, identity, check);
+    }
+    if (browsers.size >= maxBrowsers) throw fail('DIRECTORY_PICKER_FAILED');
+    const listing = await call(owner, 'list', [undefined], signal, check);
+    const browser = { ...owner, id: randomUUID(), identity: { ...identity }, expires: now() + ttlMs, nodes: new Map(), paths: new Map() };
+    const value = await projectListing(browser, listing, undefined, check);
+    browsers.set(browser.id, browser); return { ...(latest ? { latest: true } : {}), browser: value };
+  }
+  async function browse(input, context, batch) {
+    const { browser, node } = ownedBrowser(input, context.identity, batch);
+    await revalidate(node); await context.check();
+    const listing = await call(browser, 'list', [node.path], context.signal, context.check);
+    return { ...(browser.latest ? { latest: true } : {}), browser: await projectListing(browser, listing, node, context.check) };
+  }
+  async function select(input, context, batch) {
+    const { browser, node } = ownedBrowser(input, context.identity, batch);
+    await revalidate(node, { selecting: true });
+    return plan(browser, node, context.identity, context.check);
+  }
+  function ownedPlan(input, identity, batch) {
+    const record = plans.get(input.destinationId);
+    if (!record || record.batch !== batch || record.latest !== (input.latest === true) || !sameBinding(input, record.input) || !sameIdentity(identity, record.identity) || input.projectId !== record.input.projectId || input.checkpointId !== record.input.checkpointId) throw fail('DIRECTORY_PICKER_EXPIRED');
+    provider(record.service, record.kind);
+    return record;
+  }
+  function resolved(record) {
+    let targetIdentity;
+    return { projectId: record.input.projectId, checkpointId: record.input.checkpointId, root: record.root, label: record.label, async check({ reserved = false } = {}) {
+      provider(record.service, record.kind);
+      await revalidate(record.parent, { selecting: true });
+      await admitDestination(record.root, { reserved });
+      if (reserved) {
+        const current = await realDirectoryForReserved(record.root);
+        if (targetIdentity && !unchanged(current, targetIdentity)) throw fail('DESTINATION_CHANGED');
+        targetIdentity ??= current;
+      }
+    } };
   }
   return {
-    async pick(input, manifest, context) {
-      const { identity, signal, check } = context;
+    pick: (input, manifest, context) => pick(input, [manifest], context, false),
+    pickBatch: (input, manifests, context) => pick(input, manifests, context, true),
+    browse: (input, context) => browse(input, context, false),
+    browseBatch: (input, context) => browse(input, context, true),
+    select: (input, context) => select(input, context, false),
+    selectBatch: (input, context) => select(input, context, true),
+    // Synchronous admission runs AFTER idempotency lookup. TTL is new-admission
+    // only; accepted jobs retain their guards even when map entries are pruned.
+    resolve(input, identity) { prune(); const plan = resolved(ownedPlan(input, identity, false)); return { root: plan.root, check: plan.check }; },
+    resolveBatch(input, identity) {
       prune();
-      const { service, capability } = provider();
-      const owner = { service, kind: capability.kind, input: { ...input }, sourceRoot: manifest.sourceRoot };
-      if (capability.kind === 'native') {
-        const selected = await call(owner, 'pick', [], signal, check);
-        if (selected === null) return { cancelled: true };
-        return { destination: await plan(owner, { path: selected }, identity, check) };
-      }
-      if (browsers.size >= maxBrowsers) throw fail('DIRECTORY_PICKER_FAILED');
-      const listing = await call(owner, 'list', [undefined], signal, check);
-      const browser = { ...owner, id: randomUUID(), identity: { ...identity }, expires: now() + ttlMs, nodes: new Map(), paths: new Map() };
-      const value = await projectListing(browser, listing, undefined, check);
-      browsers.set(browser.id, browser); return { browser: value };
-    },
-    async browse(input, context) {
-      const { browser, node } = ownedBrowser(input, context.identity);
-      await revalidate(node); await context.check();
-      const listing = await call(browser, 'list', [node.path], context.signal, context.check);
-      return { browser: await projectListing(browser, listing, node, context.check) };
-    },
-    async select(input, context) {
-      const { browser, node } = ownedBrowser(input, context.identity);
-      await revalidate(node, { selecting: true });
-      return { destination: await plan(browser, node, context.identity, context.check) };
-    },
-    // Synchronous admission runs AFTER the controller's idempotency lookup. TTL is
-    // checked only here, never by an already accepted restore's write guard.
-    resolve(input, identity) {
-      prune(); const record = plans.get(input.destinationId);
-      if (!record || !sameBinding(input, record.input) || !sameIdentity(identity, record.identity) || input.projectId !== record.input.projectId || input.checkpointId !== record.input.checkpointId) throw fail('DIRECTORY_PICKER_EXPIRED');
-      let targetIdentity;
-      return { root: record.root, async check({ reserved = false } = {}) {
-        await revalidate(record.parent, { selecting: true });
-        await admitDestination(record.root, { reserved });
-        if (reserved) {
-          const current = await realDirectoryForReserved(record.root);
-          if (targetIdentity && !unchanged(current, targetIdentity)) throw fail('DESTINATION_CHANGED');
-          targetIdentity ??= current;
-        }
-      } };
+      const records = input.items.map(item => ownedPlan({ ...input, ...item }, identity, true));
+      if (!records.length || records.some(record => record.selectionId !== records[0].selectionId || record.selectionSize !== records.length) || new Set(records.map(record => record.id)).size !== records.length || new Set(records.map(record => reservationKey(record.root))).size !== records.length) throw fail('DIRECTORY_PICKER_EXPIRED');
+      return records.map(resolved);
     },
   };
 }

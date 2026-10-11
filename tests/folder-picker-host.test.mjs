@@ -163,7 +163,7 @@ test('picker caps fail explicitly; expired sessions are not reused, all RPCs are
   const child = path.join(f.parent, 'child'); await fs.mkdir(child); f.setCapability({ kind: 'browse', list: async () => listing(f.parent, [child]) });
   await assert.rejects(f.choose(), { code: 'DIRECTORY_PICKER_FAILED' });
   const routes = []; registerSettingsRoutes({ connection: { fetch: { register: value => routes.push(value) } } }, f.bridge);
-  assert.equal(routes.length, 17); assert.ok(routes.every(route => route.methods.length === 1 && route.methods[0] === 'POST' && route.requestBody === 'streaming'));
+  assert.equal(routes.length, 21); assert.ok(routes.every(route => route.methods.length === 1 && route.methods[0] === 'POST' && route.requestBody === 'streaming'));
   for (const action of ['destinationpick', 'destinationbrowse', 'destinationselect']) {
     assert.equal((await f.bridge.fetch(action, new Request(`http://dsh.internal${SETTINGS_API}${action}`))).status, 405);
     assert.equal((await f.rpc(action, { ...f.pickInput, path: f.parent })).error.code, 'BAD_REQUEST');

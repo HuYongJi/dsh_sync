@@ -1,6 +1,7 @@
 import path from 'node:path';
 import os from 'node:os';
 import fs from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { assert, validateId, validateManifest, sha256, MAX_FILES, MAX_MANIFEST_BYTES } from '../src/protocol.mjs';
 import { atomicWrite, assertNoSymlinks, readStableFile } from '../src/files.mjs';
 import { SyncClient, validateServerUrl, validatePasswordChange, projectFolderMetadata } from '../src/client.mjs';
@@ -45,6 +46,12 @@ export function createController(ctx, initialConfig, { exportSessions = exportPr
   assert(Number.isSafeInteger(maxRecoveryRequests) && maxRecoveryRequests > 0 && maxRecoveryRequests <= 10_000, 'Invalid recovery limit');
   const recoveryIds = new Map();
   let recoveryTask = null, recoveryAbort, latestRecovery, latestRestore;
+  let downloadTask = null, downloadAbort, latestDownload;
+  const batchRestores = new Map();
+  function clearBatchRestores() {
+    for (const restored of batchRestores.values()) restored.batchItem.canImport = false;
+    batchRestores.clear();
+  }
   let restoreAdmission = async () => {};
   let stopped = false, mutating = false, batchRunning = false, active = null, activeAbort, mutationTask = null, generation = 0, lastResult = null;
   let updateRunning = false, updateRestartRequired = false;
@@ -77,11 +84,11 @@ export function createController(ctx, initialConfig, { exportSessions = exportPr
   function clearScheduled() { for (const handle of scheduled) clearImmediate(handle); scheduled.clear(); }
   async function mutate(action, { cancelRecovery = false, requireIdle = false, allowAfterUpdate = false } = {}) {
     await ready(); updateAdmission(allowAfterUpdate);
-    if (mutating || (recoveryTask && !cancelRecovery) || (requireIdle && (active || batchRunning || scheduled.size))) throw failure('BUSY', '另一项操作尚未完成，请稍后重试');
+    if (mutating || ((recoveryTask || downloadTask) && !cancelRecovery) || (requireIdle && (active || batchRunning || scheduled.size))) throw failure('BUSY', '另一项操作尚未完成，请稍后重试');
     mutating = true; generation++; clearScheduled(); activeAbort?.abort();
-    if (cancelRecovery) recoveryAbort?.abort();
+    if (cancelRecovery) { recoveryAbort?.abort(); downloadAbort?.abort(); }
     const operation = (async () => {
-      await Promise.allSettled([active, cancelRecovery ? recoveryTask : null].filter(Boolean)); lifetime.signal.throwIfAborted();
+      await Promise.allSettled([active, cancelRecovery ? recoveryTask : null, cancelRecovery ? downloadTask : null].filter(Boolean)); lifetime.signal.throwIfAborted();
       return store.exclusive(async () => { lifetime.signal.throwIfAborted(); return action(); });
     })();
     mutationTask = operation;
@@ -189,7 +196,7 @@ export function createController(ctx, initialConfig, { exportSessions = exportPr
   }
   async function push(id) {
     await ready(); updateAdmission();
-    if (mutating || active || recoveryTask) throw failure('BUSY', '同步或设置操作正在进行');
+    if (mutating || active || recoveryTask || downloadTask) throw failure('BUSY', '同步或设置操作正在进行');
     const mapping = project(id), epoch = generation, abort = new AbortController(); activeAbort = abort;
     const operation = (async () => {
       try {
@@ -321,6 +328,123 @@ export function createController(ctx, initialConfig, { exportSessions = exportPr
     if (error?.code === 'EEXIST' && kind === 'restore') return 'DESTINATION_EXISTS';
     return kind === 'restore' ? 'RESTORE_FAILED' : 'IMPORT_FAILED';
   }
+  function publicDownload(job) {
+    const { id, state, completed, total } = job.value;
+    return { id, state, completed, total, ...(job.value.latest ? { latest: true } : {}), ...(job.value.warningCode ? { warningCode: job.value.warningCode } : {}), items: job.value.items.map(item => ({
+      projectId: item.projectId, checkpointId: item.checkpointId, restoreId: item.restoreId, root: item.root, label: item.label, state: item.state, canImport: item.canImport,
+      ...(item.sessionCount !== undefined ? { sessionCount: item.sessionCount } : {}), ...(item.errorCode ? { errorCode: item.errorCode } : {}),
+      ...(item.importResult ? { importResult: structuredClone(item.importResult) } : {}),
+    })) };
+  }
+  async function startDownload(input, { checkBinding, admitDestination, signal, resolveDestinations } = {}) {
+    await ready(); updateAdmission(); await checkBinding(); signal?.throwIfAborted();
+    const credentials = await account();
+    await checkBinding(); signal?.throwIfAborted(); lifetime.signal.throwIfAborted();
+    if (Date.parse(credentials.expiresAt) <= Date.now()) throw failure('NOT_LOGGED_IN', '请重新登录');
+    const fingerprint = JSON.stringify({ kind: 'download', ...input }), prior = recoveryIds.get(input.requestId);
+    if (prior) {
+      if (!sameAccount(prior.identity, credentials)) throw failure('RECOVERY_UNAVAILABLE', '下载请求不可用');
+      if (prior.fingerprint !== fingerprint) throw failure('BAD_REQUEST', '请求 ID 已使用');
+      return { download: publicDownload(prior) };
+    }
+    updateAdmission();
+    if (mutating || active || batchRunning || scheduled.size || recoveryTask || downloadTask) throw failure('BUSY', '另一项操作尚未完成');
+    if (recoveryIds.size >= maxRecoveryRequests) throw failure('RECOVERY_LIMIT', '恢复请求已达上限');
+    // Synchronous opaque-plan resolution and a task reservation precede any await.
+    // The shared filesystem lock then validates ALL roots before acknowledging ANY.
+    const destinations = resolveDestinations(credentials);
+    assert(destinations.length === input.items.length && destinations.length > 0 && destinations.length <= 20, 'Invalid download selection');
+    const abort = new AbortController(), epoch = generation;
+    downloadAbort = abort;
+    const taskSignal = AbortSignal.any([lifetime.signal, abort.signal]);
+    const admissionSignal = signal ? AbortSignal.any([taskSignal, signal]) : taskSignal;
+    let accept, refuse, accepted = false, job;
+    const admission = new Promise((resolve, reject) => { accept = resolve; refuse = reject; });
+    const check = async () => {
+      const guardSignal = accepted ? taskSignal : admissionSignal;
+      guardSignal.throwIfAborted(); await checkBinding();
+      if (!sameAccount(credentials, await account())) throw failure('ACCOUNT_MISMATCH', '账号已变更');
+      if (Date.parse(credentials.expiresAt) <= Date.now()) throw failure('NOT_LOGGED_IN', '请重新登录');
+      if (epoch !== generation) throw failure('CONFIG_CONFLICT', '设置已变更');
+      guardSignal.throwIfAborted();
+    };
+    const stopCode = error => {
+      if (taskSignal.aborted || stopped || error?.name === 'AbortError') return 'DOWNLOAD_CANCELLED';
+      if (error?.status === 401 || error?.httpStatus === 401) return 'NOT_LOGGED_IN';
+      if (error?.status === 403 || error?.httpStatus === 403) return 'ACCOUNT_MISMATCH';
+      return ['NOT_LOGGED_IN', 'ACCOUNT_MISMATCH', 'CONFIG_CONFLICT', 'SETTINGS_CORRUPT', 'DISPOSED'].includes(error?.code) ? error.code : undefined;
+    };
+    function cancelRemaining(code) {
+      for (const item of job.value.items) if (item.state === 'pending' || item.state === 'running') { item.state = 'cancelled'; item.errorCode = code; job.value.completed++; }
+    }
+    const operation = Promise.resolve().then(async () => {
+      try {
+        await store.exclusive(async () => {
+          await check(); signal?.throwIfAborted();
+          if (input.latest === true) {
+            // Plans authorize project + exact root, not a historical point. Resolve
+            // again at click admission under the shared job/account/operation lock.
+            const client = new SyncClient({ ...credentials, signal: admissionSignal });
+            for (const destination of destinations) {
+              await check();
+              const manifest = await client.latestCheckpoint(destination.projectId);
+              await check();
+              destination.checkpointId = manifest.id; // Retain IDs only, not twenty manifests.
+            }
+          }
+          // Recheck every parent/root after potentially slow latest reads, before ACK.
+          for (const destination of destinations) { await destination.check(); await admitDestination(destination.root); await check(); signal?.throwIfAborted(); }
+          await check(); signal?.throwIfAborted();
+          // A slow local admission is still a NEW request: expiry/provider checks
+          // apply until this synchronous acceptance point, never afterwards.
+          resolveDestinations(credentials);
+          job = { identity: credentials, fingerprint, value: { id: input.requestId, ...(input.latest === true ? { latest: true } : {}), state: 'running', completed: 0, total: destinations.length, items: destinations.map(item => ({ projectId: item.projectId, checkpointId: item.checkpointId, restoreId: randomUUID(), root: item.root, label: item.label, state: 'pending', canImport: false })) } };
+          clearBatchRestores(); recoveryIds.set(input.requestId, job); latestDownload = job;
+          accepted = true; accept({ download: publicDownload(job) });
+          // Page AbortSignal deliberately stops applying at this commit point.
+          const client = new SyncClient({ ...credentials, signal: taskSignal });
+          for (const [index, destination] of destinations.entries()) {
+            const item = job.value.items[index];
+            try {
+              await check(); item.state = 'running';
+              await destination.check(); await admitDestination(item.root);
+              let reserved = false;
+              const result = await store.restore(client, item.checkpointId, item.root, {
+                projectId: item.projectId, signal: taskSignal,
+                beforeWrite: async () => { await check(); await destination.check({ reserved }); await admitDestination(item.root, { reserved }); reserved = true; taskSignal.throwIfAborted(); },
+              });
+              const manifest = validateManifest(result.manifest), digest = sha256(JSON.stringify(manifest));
+              item.sessionCount = manifest.sessionIds.length; item.state = 'succeeded'; item.canImport = item.sessionCount > 0;
+              if (item.canImport) batchRestores.set(item.restoreId, { identity: credentials, projectId: item.projectId, digest, value: { id: item.restoreId, root: item.root, checkpointId: item.checkpointId, sessionCount: item.sessionCount }, batchItem: item });
+              job.value.completed++;
+            } catch (error) {
+              // Integrity/path failures are local to one destination. Permission,
+              // revision and cancellation failures stop every remaining selection.
+              let cancellation = stopCode(error);
+              if (!cancellation) { try { await check(); } catch (guardError) { cancellation = stopCode(guardError) || 'DOWNLOAD_CANCELLED'; } }
+              if (cancellation) { cancelRemaining(cancellation); break; }
+              item.state = 'failed'; item.errorCode = recoveryError(error, 'restore'); job.value.completed++;
+            }
+          }
+        });
+      } catch (error) {
+        if (!accepted) refuse(error);
+        else {
+          // A lock-release/finalization failure cannot erase verified file outcomes,
+          // nor claim clean completion. Report only a constant, never the raw error.
+          job.value.warningCode = 'DOWNLOAD_FINALIZATION_FAILED';
+          cancelRemaining(stopCode(error) || 'DOWNLOAD_CANCELLED');
+        }
+      } finally {
+        if (accepted) {
+          const successes = job.value.items.filter(item => item.state === 'succeeded').length;
+          job.value.state = successes === job.value.total ? 'succeeded' : successes > 0 ? 'partial' : 'failed';
+        }
+      }
+    }).finally(() => { if (downloadTask === operation) { downloadTask = null; downloadAbort = undefined; } });
+    downloadTask = operation;
+    return admission;
+  }
   async function startRecovery(kind, input, { checkBinding, admitDestination, signal, resolveDestination } = {}) {
     await ready(); updateAdmission(); await checkBinding(); signal?.throwIfAborted();
     const credentials = await account();
@@ -334,9 +458,9 @@ export function createController(ctx, initialConfig, { exportSessions = exportPr
       return { recovery: publicRecovery(prior) };
     }
     updateAdmission();
-    if (mutating || active || batchRunning || scheduled.size || recoveryTask) throw failure('BUSY', '另一项操作尚未完成');
+    if (mutating || active || batchRunning || scheduled.size || recoveryTask || downloadTask) throw failure('BUSY', '另一项操作尚未完成');
     if (recoveryIds.size >= maxRecoveryRequests) throw failure('RECOVERY_LIMIT', '恢复请求已达上限');
-    const restored = latestRestore;
+    const restored = kind === 'import' && batchRestores.has(input.restoreId) ? batchRestores.get(input.restoreId) : latestRestore;
     if (kind === 'import' && (!restored || restored.value.id !== input.restoreId || restored.consumed || !sameAccount(restored.identity, credentials))) throw failure('RECOVERY_UNAVAILABLE', '没有可导入的本次恢复');
     // Resolve opaque plans only AFTER duplicate requests have returned their original outcome.
     // Resolution is synchronous; do not open an admission race between the busy check and reservation.
@@ -344,6 +468,12 @@ export function createController(ctx, initialConfig, { exportSessions = exportPr
     const destination = destinationPlan?.root ?? input.destination;
     const job = { identity: credentials, fingerprint, value: { id: input.requestId, kind, state: 'running', root: kind === 'restore' ? destination : restored.value.root, checkpointId: kind === 'restore' ? input.checkpointId : restored.value.checkpointId, ...(kind === 'import' ? { sessionCount: restored.value.sessionCount } : {}) } };
     recoveryIds.set(input.requestId, job); latestRecovery = job;
+    if (kind === 'import') {
+      // Consume at admission, before any native write; fresh IDs cannot replay even
+      // an ambiguous or partially durable adapter failure. Duplicate IDs still poll.
+      restored.consumed = true;
+      if (restored.batchItem) { restored.batchItem.canImport = false; restored.batchItem.importResult = job.value; }
+    }
     const abort = new AbortController(); recoveryAbort = abort;
     const taskSignal = AbortSignal.any([lifetime.signal, abort.signal]);
     // Page-request cancellation is intentionally not linked after acceptance.
@@ -365,14 +495,14 @@ export function createController(ctx, initialConfig, { exportSessions = exportPr
               beforeWrite: async () => { await check(); await destinationPlan?.check({ reserved }); await admitDestination(destination, { reserved }); reserved = true; taskSignal.throwIfAborted(); },
             });
             job.value.sessionCount = result.sessionIds.length;
-            job.manifest = result.manifest; completedRestore = job;
+            job.digest = sha256(JSON.stringify(validateManifest(result.manifest))); job.projectId = input.projectId; completedRestore = job;
           } else {
             // Consume before invoking the native adapter: a partial/durable import must
             // not be replayed with a fresh request ID after an ambiguous failure.
             restored.consumed = true;
             const filename = await assertNoSymlinks(path.join(restored.value.root, '.dsh-sync', 'manifest.json'));
             const manifest = validateManifest(JSON.parse((await readStableFile(filename, MAX_MANIFEST_BYTES * 2)).bytes.toString('utf8')));
-            assert(JSON.stringify(manifest) === JSON.stringify(restored.manifest), 'Restored manifest changed');
+            assert(manifest.id === restored.value.checkpointId && manifest.projectId === restored.projectId && sha256(JSON.stringify(manifest)) === restored.digest, 'Restored manifest changed');
             await check();
             const result = await importSessions(ctx, { manifest, root: restored.value.root });
             Object.assign(job.value, importSummary(result, manifest));
@@ -382,12 +512,12 @@ export function createController(ctx, initialConfig, { exportSessions = exportPr
         });
         job.value.state = 'succeeded';
         if (completedRestore) {
-          if (latestRestore) delete latestRestore.manifest;
+          if (latestRestore) delete latestRestore.digest;
           latestRestore = completedRestore;
         }
       } catch (error) { job.value.state = 'failed'; job.value.errorCode = recoveryError(error, kind); }
     }).finally(() => {
-      if (kind === 'import' && restored.consumed) delete restored.manifest;
+      if (kind === 'import' && restored.consumed) delete restored.digest;
       if (recoveryTask === operation) { recoveryTask = null; recoveryAbort = undefined; }
     });
     recoveryTask = operation;
@@ -400,6 +530,7 @@ export function createController(ctx, initialConfig, { exportSessions = exportPr
     setCaptureExclusions(value) { captureExclusions = value; },
     setRestoreAdmission(value) { restoreAdmission = value; },
     startRecovery,
+    startDownload,
     readAccount,
     async browse(kind, projectId, { checkBinding, signal, knownProjects } = {}) {
       return readAccount(context => kind === 'projects' ? cloudProjects(context, knownProjects) : context.client.list(projectId), { checkBinding, signal });
@@ -448,7 +579,7 @@ export function createController(ctx, initialConfig, { exportSessions = exportPr
     },
     push,
     async tick() {
-      await ready(); if (updateRestartRequired || updateRunning || mutating || batchRunning || active || recoveryTask) return;
+      await ready(); if (updateRestartRequired || updateRunning || mutating || batchRunning || active || recoveryTask || downloadTask) return;
       batchRunning = true; const epoch = generation, results = [];
       try {
         for (const item of [...config.projects]) {
@@ -462,7 +593,7 @@ export function createController(ctx, initialConfig, { exportSessions = exportPr
     },
     schedulePush(id) {
       updateAdmission(); project(id); assert(!stopped, 'Plugin is stopped');
-      if (recoveryTask || mutating) throw failure('BUSY', '另一项操作尚未完成');
+      if (recoveryTask || downloadTask || mutating) throw failure('BUSY', '另一项操作尚未完成');
       const handle = setImmediate(() => {
         scheduled.delete(handle); if (!stopped) void push(id).catch(() => {});
       });
@@ -470,7 +601,7 @@ export function createController(ctx, initialConfig, { exportSessions = exportPr
     },
     async scheduleSelected(workspaceId) {
       await ready(); updateAdmission();
-      if (mutating || active || batchRunning || scheduled.size || recoveryTask) throw failure('BUSY', '同步或设置操作正在进行');
+      if (mutating || active || batchRunning || scheduled.size || recoveryTask || downloadTask) throw failure('BUSY', '同步或设置操作正在进行');
       const credentials = await account();
       if (Date.parse(credentials.expiresAt) <= Date.now()) throw failure('NOT_LOGGED_IN', '登录已过期，请重新登录');
       if (workspaceId !== undefined) {
@@ -488,7 +619,7 @@ export function createController(ctx, initialConfig, { exportSessions = exportPr
       let loggedIn = false, expiresAt, identity, reauthRequired = true;
       try { reauthRequired = await requiresReauthentication() || (await store.config())?.reauthRequired === true; } catch {}
       try { const record = await account(); identity = record; expiresAt = record.expiresAt; loggedIn = Number.isFinite(Date.parse(expiresAt)) && Date.parse(expiresAt) > Date.now(); } catch {}
-      return { server: config.server, username: config.username, loggedIn, reauthRequired, ...(expiresAt ? { expiresAt } : {}), autoSync: !reauthRequired && config.autoSync, intervalMs: config.intervalMs, projects: config.projects, pending, running: Boolean(updateRunning || active || batchRunning || scheduled.size || recoveryTask), lastResult, ...(latestRecovery && loggedIn && !mutating && epoch === generation && sameAccount(latestRecovery.identity, identity) ? { recovery: publicRecovery(latestRecovery) } : {}) };
+      return { server: config.server, username: config.username, loggedIn, reauthRequired, ...(expiresAt ? { expiresAt } : {}), autoSync: !reauthRequired && config.autoSync, intervalMs: config.intervalMs, projects: config.projects, pending, running: Boolean(updateRunning || active || batchRunning || scheduled.size || recoveryTask || downloadTask), lastResult, ...(latestRecovery && loggedIn && !mutating && epoch === generation && sameAccount(latestRecovery.identity, identity) ? { recovery: publicRecovery(latestRecovery) } : {}), ...(latestDownload && loggedIn && !mutating && epoch === generation && sameAccount(latestDownload.identity, identity) ? { download: publicDownload(latestDownload) } : {}) };
     },
     async list(id) { await ready(); validateId(id); return new SyncClient({ ...await account(), signal: lifetime.signal }).list(id); },
     async restore(id, destination) {
@@ -518,14 +649,14 @@ export function createController(ctx, initialConfig, { exportSessions = exportPr
         await ctx.credentials.deleteRecord(credentialKey);
         if (local) { delete local.token; delete local.expiresAt; await store.saveConfig(local); }
         config.autoSync = false; await persistLogout?.();
-        if (latestRestore) delete latestRestore.manifest;
-        latestRestore = undefined;
+        if (latestRestore) delete latestRestore.digest;
+        latestRestore = undefined; clearBatchRestores();
         const remoteRevoked = results.every(result => result.remoteRevoked);
         return { loggedOut: true, remoteRevoked, ...(remoteRevoked ? {} : { warning: '远端撤销未确认' }) };
       }, { cancelRecovery: true, allowAfterUpdate: true });
     },
-    stop() { stopped = true; generation++; lifetime.abort(); activeAbort?.abort(); recoveryAbort?.abort(); clearScheduled(); },
-    async drain() { await Promise.allSettled([active, mutationTask, recoveryTask].filter(Boolean)); },
+    stop() { stopped = true; generation++; lifetime.abort(); activeAbort?.abort(); recoveryAbort?.abort(); downloadAbort?.abort(); clearScheduled(); },
+    async drain() { await Promise.allSettled([active, mutationTask, recoveryTask, downloadTask].filter(Boolean)); },
   };
   return controller;
 }

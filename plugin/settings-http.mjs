@@ -4,6 +4,9 @@ export const SETTINGS_API = '/api/dsh-personal-sync/';
 export const MAX_SETTINGS_BODY = 64 * 1024;
 const messages = Object.freeze({
   BAD_REQUEST: '参数无效',
+  DOWNLOAD_CANCELLED: '已停止剩余下载',
+  DOWNLOAD_LIMIT: '最多选择20个项目',
+  DOWNLOAD_FINALIZATION_FAILED: '文件已下载，状态清理未完成',
   UPDATE_UNAVAILABLE: '当前宿主没有可用的原生插件管理器',
   UPDATE_UNMANAGED: '此插件不是可更新的当前配置依赖，请使用原生插件管理',
   UPDATE_CHECK_FAILED: '检查插件更新失败，请稍后重试',
@@ -17,6 +20,7 @@ const messages = Object.freeze({
   UPDATE_CANCEL_TOO_LATE: '原生管理器已开始应用更新，无法取消',
   UPDATE_RESTART_REQUIRED: '插件文件可能已变更，请先重启 DSH',
   CLOUD_BROWSE_UNSUPPORTED: '请更新同步服务器',
+  CLOUD_PROJECT_EMPTY: '云端项目尚无已提交内容',
   PROJECTS_PARTIAL: '部分云端项目未能加载，请重试',
   DIRECTORY_PICKER_UNAVAILABLE: '当前宿主没有可用的文件夹选择器',
   DIRECTORY_PICKER_FAILED: '文件夹选择失败，请重试',
@@ -107,7 +111,7 @@ async function readBody(request, timeoutMs) {
 export function createSettingsHttp(service, { bodyTimeoutMs = 10_000, maxActive = 16 } = {}) {
   let disposed = false, active = 0;
   const loginAttempts = [];
-  const actions = new Set(['status', 'login', 'password', 'preferences', 'sync', 'logout', 'projects', 'checkpoints', 'destinationpick', 'destinationbrowse', 'destinationselect', 'restore', 'import', 'updatestatus', 'checkupdate', 'installupdate', 'cancelupdate']);
+  const actions = new Set(['status', 'login', 'password', 'preferences', 'sync', 'logout', 'projects', 'checkpoints', 'destinationpick', 'destinationbrowse', 'destinationselect', 'downloadpick', 'downloadbrowse', 'downloadselect', 'downloadstart', 'restore', 'import', 'updatestatus', 'checkupdate', 'installupdate', 'cancelupdate']);
   return {
     async fetch(action, request) {
       let rpcId, payload;
@@ -138,7 +142,7 @@ export function createSettingsHttp(service, { bodyTimeoutMs = 10_000, maxActive 
           value = action === 'login' ? await service.login(payload, request.signal) : await service.password(payload, request.signal);
         } else if (action === 'preferences') value = await service.savePreferences(payload, request.signal);
         else if (action === 'sync') value = await service.sync(payload);
-        else if (['projects', 'checkpoints', 'destinationpick', 'destinationbrowse', 'destinationselect', 'restore', 'import', 'updatestatus', 'checkupdate', 'installupdate', 'cancelupdate'].includes(action)) value = await service[action](payload, request.signal);
+        else if (['projects', 'checkpoints', 'destinationpick', 'destinationbrowse', 'destinationselect', 'downloadpick', 'downloadbrowse', 'downloadselect', 'downloadstart', 'restore', 'import', 'updatestatus', 'checkupdate', 'installupdate', 'cancelupdate'].includes(action)) value = await service[action](payload, request.signal);
         else value = await service.logout(payload);
         return response(rpcId ? { type: 'server-response', rpcId, result: { ok: true, value } } : value);
       } catch (error) {
@@ -157,7 +161,7 @@ export function createSettingsHttp(service, { bodyTimeoutMs = 10_000, maxActive 
   };
 }
 export function registerSettingsRoutes(ctx, bridge) {
-  for (const action of ['status', 'login', 'password', 'preferences', 'sync', 'logout', 'projects', 'checkpoints', 'destinationpick', 'destinationbrowse', 'destinationselect', 'restore', 'import', 'updatestatus', 'checkupdate', 'installupdate', 'cancelupdate']) {
+  for (const action of ['status', 'login', 'password', 'preferences', 'sync', 'logout', 'projects', 'checkpoints', 'destinationpick', 'destinationbrowse', 'destinationselect', 'downloadpick', 'downloadbrowse', 'downloadselect', 'downloadstart', 'restore', 'import', 'updatestatus', 'checkupdate', 'installupdate', 'cancelupdate']) {
     ctx.connection.fetch.register({ path: SETTINGS_API + action, methods: ['POST'], requestBody: 'streaming', fetch: request => bridge.fetch(action, request) });
   }
 }

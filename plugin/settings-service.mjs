@@ -8,6 +8,7 @@ import { createDestinationPicker } from './destination-picker.mjs';
 import { validateRestoreDestination } from '../src/snapshot.mjs';
 
 export const MAX_PROJECTS = 200;
+export const MAX_DOWNLOAD_PROJECTS = 20;
 export const settingsFailure = (code, message) => Object.assign(new Error(message), { code });
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const rootKey = value => process.platform === 'win32' ? path.resolve(value).toLowerCase() : path.resolve(value);
@@ -152,6 +153,24 @@ export function createSettingsService(ctx, controller, { profileDir, dshHome, pi
       if (server !== preferences.server || input.username !== preferences.username) throw settingsFailure('ACCOUNT_MISMATCH', '账号已变更');
     };
   }
+  function latestMode(input) {
+    requireValue(object(input) && (!Object.hasOwn(input, 'latest') || input.latest === true));
+    return input.latest === true;
+  }
+  function downloadItems(items, planned = false, latest = false) {
+    requireValue(Array.isArray(items) && items.length > 0);
+    if (items.length > MAX_DOWNLOAD_PROJECTS) throw settingsFailure('DOWNLOAD_LIMIT', '最多选择20个项目');
+    const projects = new Set(), destinations = new Set();
+    return items.map(item => {
+      requireValue(exact(item, ['projectId', ...(!latest ? ['checkpointId'] : []), ...(planned ? ['destinationId'] : [])]));
+      const projectId = validateId(item.projectId), selection = { projectId, ...(!latest ? { checkpointId: validateId(item.checkpointId) } : {}) };
+      requireValue(!projects.has(projectId)); projects.add(projectId);
+      if (!planned) return selection;
+      const destinationId = validateId(item.destinationId);
+      requireValue(!destinations.has(destinationId)); destinations.add(destinationId);
+      return { ...selection, destinationId };
+    });
+  }
   async function admitDestination(destination, options) {
     // All registered roots are protected, not just the selected upload set.
     const roots = [...protectedRoots, ...listedWorkspaces().map(item => item.root), ...preferences.bindings.map(item => item.root)];
@@ -192,7 +211,7 @@ export function createSettingsService(ctx, controller, { profileDir, dshHome, pi
       await initialize();
       const snapshot = preferences, projects = await projectRows(), state = await controller.status();
       if (snapshot.revision !== preferences.revision || snapshot.server !== preferences.server || snapshot.username !== preferences.username) throw settingsFailure('CONFIG_CONFLICT', '设置已变更');
-      return { revision: snapshot.revision, server: snapshot.server || '', username: snapshot.username || '', loggedIn: state.loggedIn, ...(state.expiresAt ? { expiresAt: state.expiresAt } : {}), autoSync: state.reauthRequired ? false : snapshot.autoSync, intervalMs: snapshot.intervalMs, projects, pending: state.pending, running: state.running, ...(state.recovery ? { recovery: state.recovery } : {}), ...(state.lastResult ? { lastResult: summarizeLastResult(state.lastResult) } : {}) };
+      return { revision: snapshot.revision, server: snapshot.server || '', username: snapshot.username || '', loggedIn: state.loggedIn, ...(state.expiresAt ? { expiresAt: state.expiresAt } : {}), autoSync: state.reauthRequired ? false : snapshot.autoSync, intervalMs: snapshot.intervalMs, projects, pending: state.pending, running: state.running, ...(state.recovery ? { recovery: state.recovery } : {}), ...(state.download ? { download: state.download } : {}), ...(state.lastResult ? { lastResult: summarizeLastResult(state.lastResult) } : {}) };
     },
     async login(input, signal) {
       requireValue(exact(input, ['server', 'username', 'password']) && typeof input.server === 'string' && input.server.length <= 2048 && typeof input.username === 'string' && typeof input.password === 'string');
@@ -277,6 +296,38 @@ export function createSettingsService(ctx, controller, { profileDir, dshHome, pi
       const checkBinding = recoveryBinding(input, ['browserId', 'nodeId']);
       validateId(input.browserId); validateId(input.nodeId); await checkBinding();
       return controller.readAccount(context => picker.select(input, context), { checkBinding, signal });
+    },
+    async downloadpick(input, signal) {
+      const latest = latestMode(input), checkBinding = recoveryBinding(input, ['latest', 'items']), items = downloadItems(input.items, false, latest);
+      await checkBinding();
+      return controller.readAccount(async context => {
+        const manifests = [];
+        for (const item of items) {
+          await context.check();
+          const manifest = latest ? await context.client.latestCheckpoint(item.projectId) : await context.client.getCheckpoint(item.checkpointId); await context.check();
+          if ((!latest && manifest.id !== item.checkpointId) || manifest.projectId !== item.projectId) throw settingsFailure('CHECKPOINT_MISMATCH');
+          // Retain display identity only, never twenty maximum-size manifest bodies.
+          manifests.push({ id: manifest.id, projectId: manifest.projectId, sourceRoot: manifest.sourceRoot });
+        }
+        return picker.pickBatch(input, manifests, context);
+      }, { checkBinding, signal });
+    },
+    async downloadbrowse(input, signal) {
+      latestMode(input);
+      const checkBinding = recoveryBinding(input, ['latest', 'browserId', 'nodeId']);
+      validateId(input.browserId); validateId(input.nodeId); await checkBinding();
+      return controller.readAccount(context => picker.browseBatch(input, context), { checkBinding, signal });
+    },
+    async downloadselect(input, signal) {
+      latestMode(input);
+      const checkBinding = recoveryBinding(input, ['latest', 'browserId', 'nodeId']);
+      validateId(input.browserId); validateId(input.nodeId); await checkBinding();
+      return controller.readAccount(context => picker.selectBatch(input, context), { checkBinding, signal });
+    },
+    async downloadstart(input, signal) {
+      const latest = latestMode(input), checkBinding = recoveryBinding(input, ['latest', 'items', 'requestId', 'confirm']), items = downloadItems(input.items, true, latest);
+      validateId(input.requestId); requireValue(input.confirm === true); await checkBinding();
+      return controller.startDownload({ requestId: input.requestId, ...(latest ? { latest: true } : {}), items }, { checkBinding, admitDestination, signal, resolveDestinations: identity => picker.resolveBatch({ ...input, items }, identity) });
     },
     async restore(input, signal) {
       const checkBinding = recoveryBinding(input, ['projectId', 'checkpointId', 'destination', 'destinationId', 'confirm', 'requestId']);

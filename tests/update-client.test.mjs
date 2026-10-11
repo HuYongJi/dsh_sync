@@ -450,7 +450,7 @@ test('update native React failure/install/restart rendering locks controls, show
   const secretInput = nodes(page.tree()).find(node => node.type === 'native:Input' && node.props.type === 'password');
   secretInput.props.ref.current = { value: 'unsubmitted-synthetic-secret' };
   current = running(); await page.controller.refresh(); assert.equal(secretInput.props.ref.current.value, '');
-  for (const label of ['修改密码', '退出登录', '立即同步', '浏览云端', '管理']) assert.equal(button(page.tree(), label).props.disabled, true, label);
+  for (const label of ['修改密码', '退出登录', '立即同步', '选择项目', '保存位置', '下载所选', '管理']) assert.equal(button(page.tree(), label).props.disabled, true, label);
   assert.equal(nodes(page.tree()).find(node => node.type === 'native:Switch').props.disabled, true);
   current = running({ state: 'failed', installedVersion: '0.6.0', errorCode: 'UPDATE_BUILD_APPROVAL_REQUIRED' }); await page.controller.refresh();
   assert.match(text(page.tree()), /更新未完成/); assert.equal(page.controller.getSnapshot().update.installedVersion, '0.6.0');

@@ -1,7 +1,7 @@
 // Framework-free personal-sync state. Only the DSH Connection may carry requests.
 export const RPC_CHANNEL = '/api';
 export const RPC_PREFIX = 'dsh-personal-sync/';
-export const CLIENT_ACTIONS = Object.freeze(['status', 'login', 'password', 'preferences', 'sync', 'logout', 'projects', 'checkpoints', 'destinationpick', 'destinationbrowse', 'destinationselect', 'restore', 'import', 'updatestatus', 'checkupdate', 'installupdate', 'cancelupdate']);
+export const CLIENT_ACTIONS = Object.freeze(['status', 'login', 'password', 'preferences', 'sync', 'logout', 'projects', 'checkpoints', 'destinationpick', 'destinationbrowse', 'destinationselect', 'restore', 'import', 'updatestatus', 'checkupdate', 'installupdate', 'cancelupdate', 'downloadpick', 'downloadbrowse', 'downloadselect', 'downloadstart']);
 
 const MESSAGES = Object.freeze({
   BAD_SERVER: '服务器地址无效',
@@ -56,11 +56,15 @@ const MESSAGES = Object.freeze({
   BAD_DESTINATION: '请选择有效目标文件夹',
   DESTINATION_EXISTS: '目标目录已存在，请选择全新目录',
   PROTECTED_DESTINATION: '目标目录受保护，不能下载到此处',
-  CHECKPOINT_MISMATCH: '检查点与项目不匹配，请重新选择',
+  CHECKPOINT_MISMATCH: '云端内容与项目不匹配',
+  CLOUD_PROJECT_EMPTY: '云端暂无内容',
   RESTORE_FAILED: '下载未完成，目标目录可能不完整，请检查后使用新目录',
   IMPORT_FAILED: '导入未全部完成，请检查结果，勿重复导入',
   RECOVERY_UNAVAILABLE: '恢复功能或安全会话导入不可用',
   RECOVERY_LIMIT: '恢复记录达到限制，请检查已有结果',
+  DOWNLOAD_LIMIT: '一次最多下载20个项目',
+  DOWNLOAD_CANCELLED: '下载已停止，未完成的目录请另行检查',
+  DOWNLOAD_FINALIZATION_FAILED: '文件已下载，状态清理未完成',
   RECOVERY_UNCERTAIN: '请求结果未确认，请刷新状态；勿重复下载或导入',
   BAD_REQUEST_ID: '无法生成安全请求 ID，请升级浏览器',
   UPDATE_UNAVAILABLE: '此宿主不支持原生插件更新，请检查 DSH Plugins',
@@ -221,6 +225,47 @@ export function parseRecovery(value) {
   }
   return freeze(result);
 }
+/** Batch DTOs remain descriptive: only Host-issued destination IDs authorize writes. */
+const downloadPathKey = path => /^[a-z]:|^\\\\/i.test(path) ? path.replaceAll('\\', '/').replace(/\/+$/, '').toLowerCase() : path.replace(/\/+$/, '');
+const unpinnedDownload = value => isRecord(value) && !['checkpointId', 'checkpoint', 'checkpoints', 'heads', 'versionMode', 'versionId'].some(key => Object.hasOwn(value, key));
+const validDownloadSelection = rows => Array.isArray(rows) && rows.length > 0 && rows.length <= 20 && new Set(rows.map(row => row?.projectId)).size === rows.length && rows.every(row => unpinnedDownload(row) && validId(row.projectId));
+export function parseDownloadPlan(value, selected) {
+  if (!unpinnedDownload(value) || value.latest !== true || !absolutePath(value.parent) || !Array.isArray(value.destinations) || !validDownloadSelection(selected) || value.destinations.length !== selected.length) fail('INVALID_RESPONSE');
+  const projects = new Set(), ids = new Set(), roots = new Set();
+  const parentKey = downloadPathKey(value.parent);
+  const destinations = value.destinations.map(item => {
+    if (!unpinnedDownload(item) || !validId(item.projectId) || !text(item.label, 1024, false) || !selected.some(row => row.projectId === item.projectId)) fail('INVALID_RESPONSE');
+    const destination = parseDestination(item);
+    const rootKey = downloadPathKey(destination.root);
+    const child = rootKey.slice(parentKey.length + 1);
+    if (downloadPathKey(destination.parent) !== parentKey || !rootKey.startsWith(parentKey + '/') || !child || child.includes('/') || ['.', '..'].includes(child) || projects.has(item.projectId) || ids.has(item.id) || roots.has(rootKey)) fail('INVALID_RESPONSE');
+    projects.add(item.projectId); ids.add(item.id); roots.add(rootKey);
+    return freeze({ ...destination, projectId: item.projectId, label: item.label });
+  });
+  return freeze({ latest: true, parent: value.parent, destinations: freeze(destinations) });
+}
+export function parseDownloadStatus(value) {
+  if (!isRecord(value) || (Object.hasOwn(value, 'latest') && value.latest !== true) || !validId(value.id) || !['running', 'succeeded', 'partial', 'failed'].includes(value.state) || !integer(value.completed) || !integer(value.total) || !value.total || value.total > 20 || !Array.isArray(value.items) || value.items.length !== value.total) fail('INVALID_RESPONSE');
+  const projects = new Set(), restores = new Set(), roots = new Set();
+  const items = value.items.map(item => {
+    if (!isRecord(item) || !validId(item.projectId) || !validId(item.checkpointId) || !validId(item.restoreId) || !absolutePath(item.root) || !text(item.label, 1024, false) || !['pending', 'running', 'succeeded', 'failed', 'cancelled'].includes(item.state) || typeof item.canImport !== 'boolean' || projects.has(item.projectId) || restores.has(item.restoreId) || roots.has(downloadPathKey(item.root))) fail('INVALID_RESPONSE');
+    projects.add(item.projectId); restores.add(item.restoreId); roots.add(downloadPathKey(item.root));
+    const result = { projectId: item.projectId, checkpointId: item.checkpointId, restoreId: item.restoreId, root: item.root, label: item.label, state: item.state, canImport: item.canImport };
+    if (item.sessionCount !== undefined) { if (!integer(item.sessionCount)) fail('INVALID_RESPONSE'); result.sessionCount = item.sessionCount; }
+    if (item.errorCode !== undefined) { if (typeof item.errorCode !== 'string' || !Object.hasOwn(MESSAGES, item.errorCode)) fail('INVALID_RESPONSE'); result.errorCode = item.errorCode; }
+    if (item.importResult !== undefined) {
+      result.importResult = parseRecovery(item.importResult);
+      if (result.importResult.kind !== 'import' || result.importResult.root !== item.root || item.state !== 'succeeded' || item.canImport) fail('INVALID_RESPONSE');
+    }
+    if (item.canImport && (item.state !== 'succeeded' || item.sessionCount === 0)) fail('INVALID_RESPONSE');
+    return freeze(result);
+  });
+  const completed = items.filter(item => ['succeeded', 'failed', 'cancelled'].includes(item.state)).length;
+  const successes = items.filter(item => item.state === 'succeeded').length;
+  if (value.completed !== completed || (value.state !== 'running' && completed !== value.total) || (value.state === 'succeeded' && successes !== value.total) || (value.state === 'partial' && (!successes || successes === value.total)) || (value.state === 'failed' && successes)) fail('INVALID_RESPONSE');
+  if (value.warningCode !== undefined && value.warningCode !== 'DOWNLOAD_FINALIZATION_FAILED') fail('INVALID_RESPONSE');
+  return freeze({ id: value.id, ...(value.latest === true ? { latest: true } : {}), state: value.state, completed, total: value.total, items: freeze(items), ...(value.warningCode === undefined ? {} : { warningCode: value.warningCode }) });
+}
 const UPDATE_STATES = freeze(['idle', 'checking', 'available', 'up-to-date', 'installing', 'cancelling', 'restart-required', 'cancelled', 'failed', 'uncertain']);
 const UPDATE_ERRORS = freeze(['UPDATE_UNAVAILABLE', 'UPDATE_UNMANAGED', 'UPDATE_CHECK_FAILED', 'UPDATE_INVALID_METADATA', 'UPDATE_CHECK_REQUIRED', 'UPDATE_NOT_NEWER', 'UPDATE_BUILD_APPROVAL_REQUIRED', 'UPDATE_INCOMPATIBLE', 'UPDATE_FAILED', 'UPDATE_UNCERTAIN', 'UPDATE_CANCEL_TOO_LATE', 'UPDATE_RESTART_REQUIRED', 'BAD_REQUEST', 'BUSY', 'DISPOSED', 'RATE_LIMITED']);
 const validVersion = value => typeof value === 'string' && /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(value) && value.split('.').every(part => integer(Number(part)));
@@ -257,7 +302,10 @@ export function parseUpdateStatus(value) {
   return freeze(result);
 }
 
-const destinationAction = action => ['destinationpick', 'destinationbrowse', 'destinationselect'].includes(action);
+const downloadDestinationAction = action => ['downloadpick', 'downloadbrowse', 'downloadselect'].includes(action);
+const destinationAction = action => ['destinationpick', 'destinationbrowse', 'destinationselect'].includes(action) || downloadDestinationAction(action);
+const clearedDownloadPlan = () => ({ downloadPlan: null, downloadBrowser: null, downloadIntent: null });
+const newDownload = () => ({ downloadSelection: freeze([]), ...clearedDownloadPlan(), downloadPending: null, downloadUncertain: false, downloadError: null });
 const clearedDestination = cloud => freeze({ ...cloud, destination: '', destinationId: '', directoryBrowser: null, intent: null });
 function newCloud() {
   return clearedDestination({ binding: null, projects: freeze([]), projectsLoaded: false, partial: false, legacy: false, projectId: '', checkpoints: freeze([]), heads: freeze([]), checkpointId: '', loaded: false, browseUnsupported: false, error: null });
@@ -294,6 +342,7 @@ export function parseStatus(value) {
     ...(expiresAt === undefined ? {} : { expiresAt }), ...(warning === undefined ? {} : { warning }),
     ...(lastResult === undefined ? {} : { lastResult }),
     ...(value.recovery === undefined ? {} : { recovery: parseRecovery(value.recovery) }),
+    ...(value.download === undefined ? {} : { download: parseDownloadStatus(value.download) }),
     ...(value.update === undefined ? {} : { update: parseUpdateStatus(value.update) }) });
 }
 
@@ -355,9 +404,9 @@ export function filterProjects(projects, search = '') {
 
 export function deriveView(state) {
   const status = state.status;
-  const locked = !state.ready || state.loading || state.refreshing || Boolean(state.busy) || Boolean(state.cloud?.directoryBrowser);
+  const locked = !state.ready || state.loading || state.refreshing || Boolean(state.busy) || Boolean(state.cloud?.directoryBrowser) || Boolean(state.downloadBrowser);
   // Preferences/logout are safety controls: Host aborts and joins active work before committing them.
-  const recovering = status?.recovery?.state === 'running' || Boolean(state.recoveryPending);
+  const recovering = status?.recovery?.state === 'running' || Boolean(state.recoveryPending) || status?.download?.state === 'running' || Boolean(state.downloadPending) || state.downloadUncertain === true || status?.download?.items.some(item => item.importResult?.state === 'running');
   const updater = state.update ?? status?.update;
   // Host 'uncertain' with a known terminal request means installation settled, not that rollback occurred.
   const settledUncertain = updater?.state === 'uncertain' && updater.restartRequired === true && Boolean(updater.requestId) && !state.updatePendingId;
@@ -368,8 +417,14 @@ export function deriveView(state) {
   const canBrowse = !locked && !status?.running && !recovering && !updateBlocked && Boolean(status?.loggedIn && status.server && status.username);
   const canRecover = canBrowse && !status.running && !recovering && !state.scheduled && !state.conflict && !state.dirty;
   const selectedAvailable = status?.projects.filter(project => project.selected && project.available).length ?? 0;
+  const downloadCount = state.downloadSelection?.length ?? 0;
+  const downloadResolved = validDownloadSelection(state.downloadSelection);
   return freeze({ locked, editable, recovering, canBrowse, canRecover, updaterBusy, restartRequired, updateBlocked,
-    pickingDestination: destinationAction(state.busy) || Boolean(state.cloud?.directoryBrowser),
+    downloadCount, downloadResolved, canChooseDownloadDestination: canRecover && downloadResolved,
+    downloadWarning: status?.download?.warningCode ? MESSAGES[status.download.warningCode] : '',
+    downloadItemErrors: freeze(Object.fromEntries((status?.download?.items ?? []).filter(item => item.errorCode).map(item => [item.restoreId, MESSAGES[item.errorCode]]))),
+    canDownload: canRecover && downloadResolved && Boolean(state.downloadPlan),
+    pickingDestination: destinationAction(state.busy) || Boolean(state.cloud?.directoryBrowser) || Boolean(state.downloadBrowser),
     updateError: state.updateError?.message ?? (updater?.errorCode ? MESSAGES[updater.errorCode] : ''),
     canCheckUpdate: !locked && !updateBlocked && updater?.supported !== false && updater?.state !== 'checking',
     canUpdate: !locked && !updateBlocked && !state.updateError && !recovering && !status?.running && !state.scheduled && !state.dirty && !state.conflict && updater?.supported === true && updater.state === 'available' && Boolean(updater.candidate),
@@ -395,7 +450,7 @@ export function createController(connection, options = {}) {
   const timeoutMs = Math.max(1000, options.timeoutMs ?? 60000);
   let state = freeze({ status: null, draft: newDraft(), dirty: false, conflict: false, loading: true, refreshing: false,
     ready: false, busy: null, error: null, notice: '', scheduled: false, passwordUncertain: false,
-    cloud: newCloud(), recoveryPending: null, recoveryUncertain: false,
+    cloud: newCloud(), recoveryPending: null, recoveryUncertain: false, ...newDownload(),
     update: null, updateIntent: null, updatePendingId: null, updateUncertain: false, updateError: null });
   const listeners = new Set();
   let disposed = false;
@@ -409,6 +464,7 @@ export function createController(connection, options = {}) {
   let observedWork = false;
   let uncertainChecks = 0;
   let updateUncertainChecks = 0;
+  let downloadUncertainChecks = 0;
   let destinationAbort;
   let destinationGeneration = 0;
   const invalidateDestinationRequest = () => { ++destinationGeneration; destinationAbort?.abort(); destinationAbort = undefined; };
@@ -420,6 +476,8 @@ export function createController(connection, options = {}) {
     if (identityChanged || runtimeChanged || deriveView(state).updateBlocked !== deriveView(next).updateBlocked) {
       invalidateDestinationRequest();
       next.cloud = clearedDestination(next.cloud);
+      Object.assign(next, identityChanged ? newDownload() : clearedDownloadPlan());
+      if (identityChanged) downloadUncertainChecks = 0;
       if (destinationAction(next.busy)) next.busy = null;
     }
     state = freeze(next);
@@ -435,7 +493,9 @@ export function createController(connection, options = {}) {
       pollTimer = setTimer(() => { pollTimer = undefined; void refreshUpdate(); }, pollMs);
       return;
     }
-    const recoveryWork = (state.recoveryPending && (!state.recoveryUncertain || uncertainChecks < 10)) || state.status?.recovery?.state === 'running';
+    const downloadWork = state.status?.loggedIn && ((state.downloadPending && (!state.downloadUncertain || downloadUncertainChecks < 10)) || state.status.download?.state === 'running' || state.status.download?.items.some(item => item.importResult?.state === 'running'));
+    if (state.downloadUncertain && downloadUncertainChecks >= 10) return;
+    const recoveryWork = downloadWork || (state.recoveryPending && (!state.recoveryUncertain || uncertainChecks < 10)) || state.status?.recovery?.state === 'running';
     if (disposed || !watchers || state.busy || state.refreshing || (!recoveryWork && (state.error || !state.status?.loggedIn)) || !(recoveryWork || state.status?.running || state.status?.pending || state.scheduled)) return;
     const delay = recoveryWork || state.status.running || state.scheduled ? pollMs : Math.max(10000, pollMs);
     pollTimer = setTimer(() => { pollTimer = undefined; void refresh(); }, delay);
@@ -489,6 +549,23 @@ export function createController(connection, options = {}) {
       if (!status.loggedIn || status.lastResult?.at !== scheduledBaseline || (observedWork && !status.running) || scheduledChecks >= 10) scheduled = false;
     }
     const changed = state.status && (!sameBinding(status, state.status) || status.loggedIn !== state.status.loggedIn);
+    // The Host owns grant-scoped visibility. Never retain an old download through logout.
+    if (!status.loggedIn && status.download) { const { download: _hidden, ...visible } = status; status = freeze(visible); }
+    let downloadPending = changed ? null : state.downloadPending;
+    let downloadUncertain = changed ? false : state.downloadUncertain;
+    let downloadError = changed ? null : state.downloadError;
+    if (downloadPending) {
+      const result = downloadPending.kind === 'download' ? status.download : status.download?.items.find(item => item.restoreId === downloadPending.restoreId)?.importResult;
+      if (result?.id === downloadPending.requestId) {
+        if (downloadPending.kind === 'download') validateDownloadMatch(result, downloadPending);
+        else if (result.kind !== 'import' || result.root !== downloadPending.root) fail('INVALID_RESPONSE');
+        downloadUncertain = false; downloadUncertainChecks = 0;
+        if (downloadError?.code === 'RECOVERY_UNCERTAIN') downloadError = null;
+        if (result.state !== 'running') downloadPending = null;
+      }
+    }
+    let downloadIntent = state.downloadIntent;
+    if (downloadIntent?.kind === 'import' && !status.download?.items.some(item => item.restoreId === downloadIntent.restoreId && item.canImport && item.root === downloadIntent.root)) downloadIntent = null;
     let recoveryPending = changed ? null : state.recoveryPending;
     let recoveryUncertain = changed ? false : state.recoveryUncertain;
     if (recoveryPending && status.recovery?.id === recoveryPending.requestId) {
@@ -503,7 +580,7 @@ export function createController(connection, options = {}) {
     const latestUpdate = updater.update ?? state.update;
     if (latestUpdate) status = freeze({ ...status, update: latestUpdate });
     update({ status, draft, dirty: isDirty(status, draft), conflict, ready: true, loading: false, scheduled,
-      cloud, recoveryPending, recoveryUncertain, ...updater,
+      cloud, recoveryPending, recoveryUncertain, downloadPending, downloadUncertain, downloadError, downloadIntent, ...updater,
       error: conflict ? publicError(new SettingsClientError('CONFIG_CONFLICT')) : null });
   }
   async function withDeadline(action, body, abort) {
@@ -537,6 +614,7 @@ export function createController(connection, options = {}) {
     refreshAbort = abort;
     update({ refreshing: true });
     if (state.recoveryUncertain) ++uncertainChecks;
+    if (state.downloadUncertain) ++downloadUncertainChecks;
     try {
       const result = await withDeadline('status', {}, abort);
       if (disposed || current !== generation) return false;
@@ -555,11 +633,11 @@ export function createController(connection, options = {}) {
   }
   function report(error) { update({ error: publicError(error), notice: '' }); return false; }
   function guardAction(action) {
-    if (disposed || !state.ready || state.busy || state.loading || state.refreshing || state.cloud.directoryBrowser) return false;
+    if (disposed || !state.ready || state.busy || state.loading || state.refreshing || state.cloud.directoryBrowser || state.downloadBrowser) return false;
     const view = deriveView(state);
     if (view.updaterBusy) return report(new SettingsClientError('BUSY'));
     if (view.restartRequired && action !== 'logout') return report(new SettingsClientError('UPDATE_RESTART_REQUIRED'));
-    if ((state.status.recovery?.state === 'running' || state.recoveryPending) && ['login', 'password', 'preferences', 'sync'].includes(action)) return report(new SettingsClientError('BUSY'));
+    if (view.recovering && ['login', 'password', 'preferences', 'sync'].includes(action)) return report(new SettingsClientError('BUSY'));
     if (state.status.running && (action === 'login' || action === 'sync')) return report(new SettingsClientError('BUSY'));
     if (action === 'sync' && !state.status.loggedIn) return report(new SettingsClientError('NOT_LOGGED_IN'));
     return true;
@@ -816,6 +894,156 @@ export function createController(connection, options = {}) {
     }
     return accepted;
   }
+  const downloadReport = error => { update({ downloadError: publicError(error), downloadIntent: null }); return false; };
+  function changeDownloadSelection(rows) {
+    invalidateDestinationRequest();
+    update({ downloadSelection: freeze(rows), ...clearedDownloadPlan(), downloadError: null });
+  }
+  async function addDownloadProject(projectId) {
+    if (disposed || !deriveView(state).canBrowse || !validId(projectId) || state.downloadSelection.some(item => item.projectId === projectId)) return false;
+    const project = state.cloud.projects.find(item => item.projectId === projectId);
+    if (!project || !state.cloud.projectsLoaded || !sameBinding(state.status, state.cloud.binding)) return downloadReport(new SettingsClientError('UNKNOWN_PROJECT'));
+    if (state.downloadSelection.length >= 20) return downloadReport(new SettingsClientError('DOWNLOAD_LIMIT'));
+    const label = project.label ?? state.status.projects.find(item => item.projectId === projectId)?.label ?? '项目文件夹';
+    // Selection is descriptive only. The Host resolves its last successful commit at start.
+    changeDownloadSelection([...state.downloadSelection, freeze({ projectId, label, ...(project.sourceRoot ? { sourceRoot: project.sourceRoot } : {}) })]);
+    return true;
+  }
+  function removeDownloadProject(projectId) {
+    if (disposed || !deriveView(state).canBrowse || !state.downloadSelection.some(item => item.projectId === projectId)) return false;
+    changeDownloadSelection(state.downloadSelection.filter(item => item.projectId !== projectId)); return true;
+  }
+  function closeDownloadBrowser() {
+    invalidateDestinationRequest();
+    update({ ...(downloadDestinationAction(state.busy) ? { busy: null } : {}), downloadBrowser: null, downloadIntent: null });
+    queuePoll();
+  }
+  async function downloadDestinationRequest(action, nodeId) {
+    if (disposed) return false;
+    const browser = state.downloadBrowser;
+    const view = deriveView({ ...state, downloadBrowser: null });
+    if (!view.canChooseDownloadDestination || (action !== 'downloadpick' && !browser)) return false;
+    const selection = state.downloadSelection;
+    let binding, payload;
+    try {
+      binding = validateBinding(state.status, state.cloud.binding);
+      if (action === 'downloadpick') payload = { ...binding, latest: true, items: selection.map(({ projectId }) => ({ projectId })) };
+      else {
+        if (!validId(nodeId) || ![browser.currentId, ...browser.crumbs.map(item => item.id), ...browser.directories.map(item => item.id)].includes(nodeId)) fail('DIRECTORY_PICKER_EXPIRED');
+        if (action === 'downloadselect' && (!browser.selectable || nodeId !== browser.currentId)) fail('BAD_DESTINATION');
+        payload = { ...binding, latest: true, browserId: browser.id, nodeId };
+      }
+    } catch (error) { return downloadReport(error); }
+    invalidateRefresh(); clearPoll(); invalidateDestinationRequest();
+    const current = destinationGeneration, runtime = state.update?.currentVersion;
+    const abort = new AbortController(); destinationAbort = abort;
+    update({ busy: action, refreshing: false, downloadIntent: null, downloadError: null });
+    const live = () => !disposed && current === destinationGeneration && sameBinding(state.status, binding) && state.status.loggedIn && state.downloadSelection === selection && state.update?.currentVersion === runtime && !deriveView(state).updateBlocked;
+    let needsStatus = false;
+    try {
+      const result = await withDeadline(action, payload, abort);
+      if (!live()) return false;
+      if (!unpinnedDownload(result) || (Object.hasOwn(result, 'latest') && result.latest !== true) || ['cancelled', 'browser', 'destinations'].filter(key => Object.hasOwn(result, key)).length !== 1) fail('INVALID_RESPONSE');
+      if (result.cancelled === true && action === 'downloadpick') return false;
+      // Old Hosts must not silently turn a latest-only request into pinned consent.
+      if (result.latest !== true) fail('INVALID_RESPONSE');
+      if (result.browser !== undefined && action !== 'downloadselect') {
+        if (!unpinnedDownload(result.browser)) fail('INVALID_RESPONSE');
+        const next = parseDirectoryBrowser(result.browser);
+        if (action === 'downloadbrowse' && next.id !== browser.id) fail('INVALID_RESPONSE');
+        update({ downloadBrowser: next });
+      } else if (result.destinations !== undefined && action !== 'downloadbrowse') update({ downloadPlan: parseDownloadPlan(result, selection), downloadBrowser: null });
+      else fail('INVALID_RESPONSE');
+      return true;
+    } catch (error) {
+      if (live()) {
+        const safe = publicError(error);
+        if (['ACCOUNT_MISMATCH', 'CONFIG_CONFLICT', 'NOT_LOGGED_IN'].includes(safe.code)) { update({ ...newDownload(), cloud: newCloud() }); needsStatus = true; }
+        else if (['DIRECTORY_PICKER_EXPIRED', 'DESTINATION_CHANGED', 'CHECKPOINT_MISMATCH', 'INVALID_RESPONSE'].includes(safe.code)) update(clearedDownloadPlan());
+        update({ downloadError: safe, downloadIntent: null });
+      }
+      return false;
+    } finally {
+      if (!disposed && current === destinationGeneration) { destinationAbort = undefined; update({ busy: null }); if (needsStatus) await refresh(); else queuePoll(); }
+    }
+  }
+  function validateDownloadMatch(result, intent) {
+    if (intent.latest !== true || result.latest !== true || result.id !== intent.requestId || result.total !== intent.items.length || !intent.items.every(row => result.items.some(item => item.projectId === row.projectId && item.root === row.root))) fail('INVALID_RESPONSE');
+  }
+  function prepareDownload() {
+    if (disposed || !deriveView(state).canDownload) return null;
+    try {
+      const binding = validateBinding(state.status, state.cloud.binding);
+      const plan = state.downloadPlan;
+      parseDownloadPlan(plan, state.downloadSelection);
+      if (state.downloadIntent?.kind === 'download' && state.downloadIntent.plan === plan) return state.downloadIntent;
+      const items = freeze(state.downloadSelection.map(row => {
+        const destination = plan.destinations.find(item => item.projectId === row.projectId);
+        return freeze({ projectId: row.projectId, destinationId: destination.id, root: destination.root, label: row.label });
+      }));
+      const intent = freeze({ kind: 'download', latest: true, binding, items, plan, requestId: requestId() });
+      update({ downloadIntent: intent, downloadError: null }); return intent;
+    } catch (error) { downloadReport(error); return null; }
+  }
+  function prepareDownloadImport(restoreId) {
+    if (disposed || !deriveView(state).canRecover || state.status.download?.state === 'running') return null;
+    const row = state.status.download?.items.find(item => item.restoreId === restoreId && item.canImport && item.state === 'succeeded');
+    if (!row) return null;
+    try {
+      const binding = validateBinding(state.status, bindingOf(state.status));
+      if (state.downloadIntent?.kind === 'import' && state.downloadIntent.restoreId === restoreId) return state.downloadIntent;
+      const intent = freeze({ kind: 'import', ...binding, batchId: state.status.download.id, restoreId, root: row.root, label: row.label, requestId: requestId() });
+      update({ downloadIntent: intent, downloadError: null }); return intent;
+    } catch (error) { downloadReport(error); return null; }
+  }
+  async function confirmDownloadMutation(intent, kind) {
+    if (disposed || !intent || intent !== state.downloadIntent || intent.kind !== kind || !deriveView(state).canRecover) return false;
+    const intentBinding = kind === 'download' ? intent.binding : intent;
+    let payload;
+    try {
+      const binding = validateBinding(state.status, intentBinding);
+      if (!validRequestId(intent.requestId)) fail('BAD_REQUEST_ID');
+      if (kind === 'download') {
+        if (intent.latest !== true || !deriveView(state).canDownload || intent.plan !== state.downloadPlan) fail('DESTINATION_CHANGED');
+        parseDownloadPlan(intent.plan, state.downloadSelection);
+        payload = { ...binding, latest: true, items: intent.items.map(({ projectId, destinationId }) => ({ projectId, destinationId })), requestId: intent.requestId, confirm: true };
+      } else {
+        if (state.status.download?.id !== intent.batchId || !state.status.download.items.some(item => item.restoreId === intent.restoreId && item.root === intent.root && item.canImport && item.state === 'succeeded')) fail('RECOVERY_UNAVAILABLE');
+        payload = { ...binding, restoreId: intent.restoreId, requestId: intent.requestId, confirm: true };
+      }
+    } catch (error) { return downloadReport(error); }
+    invalidateRefresh(); clearPoll();
+    const abort = new AbortController(); active = abort;
+    const action = kind === 'download' ? 'downloadstart' : 'import';
+    downloadUncertainChecks = 0;
+    update({ busy: action, downloadIntent: null, downloadPending: intent, downloadUncertain: false, downloadError: null, ...(kind === 'download' ? { downloadPlan: null } : {}) });
+    let accepted = false;
+    try {
+      const reply = await withDeadline(action, payload, abort);
+      if (disposed || !sameBinding(state.status, intentBinding) || !state.status.loggedIn) return false;
+      if (kind === 'download') {
+        if (!isRecord(reply) || (Object.hasOwn(reply, 'latest') && reply.latest !== true)) fail('INVALID_RESPONSE');
+        const download = parseDownloadStatus(reply.download); validateDownloadMatch(download, intent);
+        update({ status: freeze({ ...state.status, download }), downloadPending: download.state === 'running' ? intent : null });
+      } else {
+        const result = parseRecovery(reply?.recovery);
+        if (result.id !== intent.requestId || result.kind !== 'import' || result.root !== intent.root) fail('INVALID_RESPONSE');
+        const download = freeze({ ...state.status.download, items: freeze(state.status.download.items.map(item => item.restoreId === intent.restoreId ? freeze({ ...item, canImport: false, importResult: result }) : item)) });
+        update({ status: freeze({ ...state.status, download, recovery: result }), downloadPending: result.state === 'running' ? intent : null });
+      }
+      accepted = true;
+    } catch (error) {
+      if (!disposed && sameBinding(state.status, intentBinding)) {
+        const safe = publicError(error);
+        const rejected = ['BAD_REQUEST', 'BAD_DESTINATION', 'DESTINATION_EXISTS', 'PROTECTED_DESTINATION', 'DIRECTORY_PICKER_EXPIRED', 'DESTINATION_CHANGED', 'CHECKPOINT_MISMATCH', 'CLOUD_PROJECT_EMPTY', 'RECOVERY_UNAVAILABLE', 'RECOVERY_LIMIT', 'DOWNLOAD_LIMIT', 'CONFIG_CONFLICT', 'ACCOUNT_MISMATCH', 'NOT_LOGGED_IN', 'BUSY', 'AUTH_REQUIRED', 'FORBIDDEN', 'NOT_DEPLOYED', 'RATE_LIMITED'].includes(safe.code);
+        update({ downloadPending: rejected ? null : intent, downloadUncertain: !rejected, downloadError: rejected ? safe : publicError(new SettingsClientError('RECOVERY_UNCERTAIN')) });
+      }
+    } finally {
+      if (active === abort) active = undefined;
+      if (!disposed) { update({ busy: null }); await refresh({ discardDraft: false }); }
+    }
+    return accepted;
+  }
   const updateReport = error => { update({ updateError: publicError(error), updateIntent: null }); return false; };
   async function refreshUpdate() {
     if (disposed || (state.busy && !destinationAction(state.busy))) return false;
@@ -912,6 +1140,14 @@ export function createController(connection, options = {}) {
   }
   return {
     getSnapshot: () => state,
+    addDownloadProject, removeDownloadProject,
+    chooseDownloadDestination: () => downloadDestinationRequest('downloadpick'),
+    browseDownloadDestination: nodeId => downloadDestinationRequest('downloadbrowse', nodeId),
+    selectDownloadDestination: (nodeId = state.downloadBrowser?.currentId) => downloadDestinationRequest('downloadselect', nodeId),
+    closeDownloadBrowser, prepareDownload, prepareDownloadImport,
+    confirmDownload: intent => confirmDownloadMutation(intent, 'download'),
+    confirmDownloadImport: intent => confirmDownloadMutation(intent, 'import'),
+    cancelDownloadIntent() { update({ downloadIntent: null }); },
     checkUpdate, prepareUpdate, confirmUpdate, cancelUpdate, refreshUpdate,
     cancelUpdateIntent() { update({ updateIntent: null }); },
     browseProjects: () => browse('projects'),
@@ -952,6 +1188,7 @@ export function createController(connection, options = {}) {
         ended = true;
         if (--watchers === 0) {
           closeDestinationBrowser();
+          closeDownloadBrowser();
           clearPoll();
           invalidateRefresh();
           update({ refreshing: false, loading: !state.status, updateIntent: null });

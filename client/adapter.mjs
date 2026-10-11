@@ -3,8 +3,9 @@ import { createController, deriveView, filterProjects } from './state.mjs';
 // DSH 0.2.0-rc.2 uses React slots; both React and controls come from its module loader.
 export function createClientPlugin(require) {
   const React = require('react');
-  const { Button, Input, Checkbox, Switch, Modal } = require('@deepseek-ai/dsh-client-ui-primitives');
+  const { Button, Input, Checkbox, Switch, Modal, IconFolderCloseRegular } = require('@deepseek-ai/dsh-client-ui-primitives');
   const h = React.createElement;
+  const folderIcon = IconFolderCloseRegular ? h('span', { 'aria-hidden': 'true', style: { display: 'inline-flex', flexShrink: 0 } }, h(IconFolderCloseRegular, { size: 16 })) : null;
   const styles = {
     page: { maxWidth: 820, minWidth: 0, display: 'flex', flexDirection: 'column', gap: 16, color: 'var(--dsw-alias-label-primary)' },
     card: { minWidth: 0, display: 'flex', flexDirection: 'column', gap: 12, padding: 16, borderRadius: 'var(--dsw-radius-xl, 12px)', border: '1px solid var(--dsw-alias-settings-card-stroke)', background: 'var(--dsw-alias-settings-card-fill)', boxSizing: 'border-box' },
@@ -41,6 +42,17 @@ export function createClientPlugin(require) {
     const [search, setSearch] = React.useState('');
     const [projectManagerOpen, setProjectManagerOpen] = React.useState(false);
     const [cloudOpen, setCloudOpen] = React.useState(false);
+    const [cloudStage, setCloudStage] = React.useState('select');
+    const [downloadSearch, setDownloadSearch] = React.useState('');
+    const [suggestionsOpen, setSuggestionsOpen] = React.useState(false);
+    const [activeSuggestion, setActiveSuggestion] = React.useState('');
+    const [downloadNotice, setDownloadNotice] = React.useState('');
+    const downloadInput = React.useRef(null);
+    const comboRoot = React.useRef(null);
+    const stageFocus = React.useRef(null);
+    const mainRefresh = React.useRef(null);
+    const composition = React.useRef({ active: false, ended: false });
+    const cloudLife = React.useRef(0);
     const [confirmLogout, setConfirmLogout] = React.useState(false);
     const [passwordIdentity, setPasswordIdentity] = React.useState(null);
     // Secrets live in uncontrolled native inputs, never React/controller state or storage.
@@ -64,7 +76,7 @@ export function createClientPlugin(require) {
       const unsubscribe = controller.subscribe(() => {
         const next = controller.getSnapshot();
         if (!sameIdentity(next.status, previous.status) || next.status?.loggedIn !== previous.status?.loggedIn || next.busy !== previous.busy || deriveView(next).updateBlocked !== deriveView(previous).updateBlocked) clearSecrets();
-        if (!sameIdentity(next.status, previous.status) || next.status?.loggedIn !== previous.status?.loggedIn || next.update?.currentVersion !== previous.update?.currentVersion || deriveView(next).updateBlocked !== deriveView(previous).updateBlocked) setCloudOpen(false);
+        if (!sameIdentity(next.status, previous.status) || next.status?.loggedIn !== previous.status?.loggedIn || next.update?.currentVersion !== previous.update?.currentVersion || deriveView(next).updateBlocked !== deriveView(previous).updateBlocked) { ++cloudLife.current; setCloudOpen(false); setSuggestionsOpen(false); setDownloadSearch(''); setDownloadNotice(''); }
         previous = next;
         if (passwordBinding.current && !sameIdentity(next.status, passwordBinding.current)) closePassword();
       });
@@ -72,6 +84,7 @@ export function createClientPlugin(require) {
       return () => {
         clearSecrets();
         passwordBinding.current = null;
+        ++cloudLife.current;
         unsubscribe();
         controller.cancelPasswordChange();
         stop();
@@ -126,11 +139,36 @@ export function createClientPlugin(require) {
     };
     const openCloud = () => {
       if (!deriveView(controller.getSnapshot()).canBrowse) return;
-      clearSecrets(); setCloudOpen(true); void controller.browseProjects();
+      clearSecrets(); ++cloudLife.current; composition.current = { active: false, ended: false }; setDownloadSearch(''); setSuggestionsOpen(false); setActiveSuggestion(''); setCloudStage('select'); setCloudOpen(true);
+      void controller.browseProjects();
     };
-    const closeCloud = () => { setCloudOpen(false); controller.closeDestinationBrowser(); controller.cancelRecoveryIntent(); };
+    const closeCloud = () => {
+      ++cloudLife.current; composition.current = { active: false, ended: false }; setCloudOpen(false); setSuggestionsOpen(false); controller.closeDownloadBrowser(); controller.cancelDownloadIntent();
+      // Native Modal restores its invoker; an accepted download disables that button.
+      queueMicrotask(() => { const target = mainRefresh.current; if (target?.isConnected && !target.disabled && target.ownerDocument.activeElement === target.ownerDocument.body) target.focus(); });
+    };
     const cloud = state.cloud;
-    const intent = cloud.intent;
+    const intent = state.downloadIntent;
+    const downloads = state.downloadSelection;
+    const download = status?.download;
+    const directoryBrowser = state.downloadBrowser;
+    const downloadTitle = ({ select: '选择要下载的项目', folders: '选择保存位置', review: '确认下载所选项目', progress: '下载进度', import: '导入安全会话？' })[cloudStage];
+    const showProgress = () => { clearSecrets(); setCloudStage('progress'); setCloudOpen(true); void controller.refresh(); };
+    const chooseDownloadFolder = () => {
+      clearSecrets(); const lifetime = cloudLife.current;
+      void controller.chooseDownloadDestination().then(() => { if (cloudLife.current === lifetime && controller.getSnapshot().downloadBrowser) { setCloudStage('folders'); setCloudOpen(true); } });
+    };
+    React.useEffect(() => {
+      if (!cloudOpen || cloudStage === 'select') return;
+      stageFocus.current?.focus();
+    }, [cloudOpen, cloudStage]);
+    React.useEffect(() => {
+      if (!cloudOpen || !suggestionsOpen || !comboRoot.current) return;
+      const doc = comboRoot.current.ownerDocument;
+      const outside = event => { if (!comboRoot.current?.contains(event.target)) setSuggestionsOpen(false); };
+      doc.addEventListener('pointerdown', outside);
+      return () => doc.removeEventListener('pointerdown', outside);
+    }, [cloudOpen, suggestionsOpen]);
     const recovery = status?.recovery;
     const updater = state.update;
     const updateIntent = state.updateIntent;
@@ -139,15 +177,54 @@ export function createClientPlugin(require) {
     const manualUpdate = updater?.state === 'available' && Boolean(updater.candidate) && !state.updateError;
     const updateAction = installing ? '更新中…' : view.restartRequired ? '待重启' : manualUpdate ? '手动更新' : '检查更新';
     const projectLabel = project => project?.label ?? status?.projects.find(item => item.projectId === project?.projectId)?.label ?? '项目文件夹';
-    const selectedCloudProject = cloud.projects.find(project => project.projectId === cloud.projectId) ?? { projectId: cloud.projectId };
-    const directoryBrowser = cloud.directoryBrowser;
+    const chosenIds = new Set(downloads.map(item => item.projectId));
+    const query = downloadSearch.trim().toLocaleLowerCase();
+    const unchosen = cloud.projects.filter(item => !chosenIds.has(item.projectId) && (!query || `${projectLabel(item)}\n${item.sourceRoot ?? ''}`.toLocaleLowerCase().includes(query)));
+    const suggestions = unchosen.slice(0, 100);
+    const activeOption = suggestions.find(item => item.projectId === activeSuggestion);
+    const dropdownOpen = cloudOpen && cloudStage === 'select' && suggestionsOpen;
+    const addSuggested = projectId => {
+      const project = suggestions.find(item => item.projectId === projectId);
+      if (!project || !deriveView(controller.getSnapshot()).canBrowse || controller.getSnapshot().downloadSelection.length >= 20) return;
+      const lifetime = cloudLife.current;
+      setSuggestionsOpen(false); setActiveSuggestion(''); setDownloadSearch('');
+      void controller.addDownloadProject(projectId).then(() => {
+        if (cloudLife.current !== lifetime) return;
+        if (controller.getSnapshot().downloadSelection.some(item => item.projectId === projectId)) setDownloadNotice(`已添加 ${projectLabel(project)}`);
+        // Only restore input after its own selection; never steal a later outside click.
+        const input = downloadInput.current;
+        if (input && (!input.ownerDocument.activeElement || input.ownerDocument.activeElement === input || input.ownerDocument.activeElement === input.ownerDocument.body)) input.focus();
+      });
+    };
+    const composingKey = event => composition.current.active || composition.current.ended || event.isComposing || event.nativeEvent?.isComposing || event.keyCode === 229 || event.nativeEvent?.keyCode === 229;
+    const comboEscape = event => {
+      if (event.key !== 'Escape' || !dropdownOpen || event.shiftKey || event.ctrlKey || event.altKey || event.metaKey) return;
+      event.preventDefault(); event.stopPropagation();
+      if (!composingKey(event)) { setSuggestionsOpen(false); setActiveSuggestion(''); }
+    };
+    const comboKey = event => {
+      if (composingKey(event) || event.ctrlKey || event.altKey || event.metaKey) return;
+      if (event.key === 'Escape') { comboEscape(event); return; }
+      if (event.key === 'Tab') { setSuggestionsOpen(false); setActiveSuggestion(''); return; }
+      if (['ArrowDown', 'ArrowUp'].includes(event.key)) {
+        event.preventDefault(); setSuggestionsOpen(true);
+        const current = suggestions.findIndex(item => item.projectId === activeSuggestion);
+        const index = current < 0 ? (event.key === 'ArrowDown' ? 0 : suggestions.length - 1) : (current + (event.key === 'ArrowDown' ? 1 : -1) + suggestions.length) % suggestions.length;
+        setActiveSuggestion(suggestions[index]?.projectId ?? '');
+      } else if (event.key === 'Enter' && dropdownOpen) {
+        event.preventDefault(); if (activeOption) addSuggested(activeOption.projectId);
+      }
+    };
+    React.useEffect(() => {
+      if (dropdownOpen && activeOption) comboRoot.current?.querySelector(`[id="${id}-download-option-${activeOption.projectId}"]`)?.scrollIntoView?.({ block: 'nearest' });
+    }, [dropdownOpen, activeOption?.projectId]);
     const projects = filterProjects(status?.projects ?? [], search);
     const checkedIds = new Set(state.draft.projectIds);
     const selectedProjects = (status?.projects ?? []).filter(project => checkedIds.has(project.id));
     const loginState = state.loading ? '读取中' : !state.ready ? '状态未确认' : status?.loggedIn ? '已登录' : '未登录';
     const passwordOpen = sameIdentity(status, passwordIdentity) && passwordBinding.current === passwordIdentity;
     const body = (content, extra = {}) => h('p', { style: styles.body, ...extra }, content);
-    const recoveryResult = recovery && h('div', { style: styles.form, role: 'status', 'aria-live': 'polite', 'data-personal-sync': 'recovery-result' },
+    const recoveryResult = !download && recovery && h('div', { style: styles.form, role: 'status', 'aria-live': 'polite', 'data-personal-sync': 'recovery-result' },
       body(`${recovery.kind === 'restore' ? '下载' : '导入'}${recovery.state === 'running' ? '进行中…' : recovery.state === 'succeeded' ? '完成' : '未完成'}`),
       body(recovery.root, { style: styles.root }),
       recovery.kind === 'restore' && recovery.sessionCount !== undefined && body(`会话归档 ${recovery.sessionCount} 个`),
@@ -160,7 +237,7 @@ export function createClientPlugin(require) {
     return h('section', { style: styles.page, 'aria-label': '个人云同步', 'aria-busy': state.loading || state.refreshing || Boolean(state.busy), 'data-personal-sync': 'settings' },
       h('div', { style: styles.between },
         h('h2', { style: { ...styles.heading, fontSize: 18 } }, '个人云同步'),
-        h(Button, { type: 'button', variant: 'ghost', disabled: Boolean(state.busy) || state.refreshing,
+        h(Button, { ref: mainRefresh, type: 'button', variant: 'ghost', disabled: Boolean(state.busy) || state.refreshing,
           onClick: () => { clearSecrets(); void controller.refresh(); } }, state.refreshing ? '刷新中…' : state.conflict ? '刷新并重新选择' : '刷新')),
       state.error && !passwordOpen && !projectManagerOpen && h('div', { role: 'alert', style: { ...styles.card, ...styles.error }, 'data-personal-sync': 'error' }, state.error.message),
       state.notice && body(state.notice, { role: 'status', 'aria-live': 'polite' }),
@@ -204,14 +281,22 @@ export function createClientPlugin(require) {
           h(Button, { type: 'button', variant: 'outline', disabled: !status || view.updateBlocked || view.pickingDestination, onClick: openProjects }, '管理'))),
       h('section', { style: styles.card, 'aria-labelledby': `${id}-cloud-title`, 'data-personal-sync': 'cloud-summary' },
         h('div', { style: styles.between },
-          h('h3', { id: `${id}-cloud-title`, style: styles.heading }, '云端下载'),
-          h('div', { style: styles.row },
-            h(Button, { type: 'button', variant: 'outline', disabled: !view.canBrowse, onClick: openCloud }, '浏览云端'),
-            recovery?.kind === 'restore' && recovery.state === 'succeeded' && h(Button, { type: 'button', variant: 'outline', disabled: !view.canImport,
-              onClick: () => { clearSecrets(); controller.prepareImport(); } }, '导入安全会话'))),
-        !cloudOpen && recoveryResult,
-        state.recoveryUncertain && !cloudOpen && body('结果未确认，请刷新；勿重复提交', { role: 'alert', style: { ...styles.body, ...styles.warning } }),
-        cloud.error && !cloudOpen && h('div', { role: 'alert', style: styles.error }, cloud.error.message)),
+          h('div', { style: styles.summary }, h('h3', { id: `${id}-cloud-title`, style: styles.heading }, '云端下载'),
+            body(`已选择 ${downloads.length} 个项目`),
+            downloads.length > 0 && h('ul', { style: styles.summaryList, 'aria-label': '所选下载项目' }, ...downloads.slice(0, 3).map(row => h('li', { key: row.projectId }, row.label))),
+            downloads.length > 3 && body(`另有 ${downloads.length - 3} 个项目`)),
+          h(Button, { type: 'button', variant: 'outline', 'aria-label': downloads.length ? '管理下载项目' : '选择下载项目', disabled: !view.canBrowse, onClick: openCloud }, downloads.length ? '管理' : '选择项目')),
+        h('div', { style: styles.between },
+          h('div', { style: styles.summary }, body('保存位置'), body(state.downloadPlan?.parent ?? '尚未选择', { style: styles.root, 'aria-label': '下载保存位置' })),
+          h(Button, { type: 'button', variant: 'outline', disabled: !view.canChooseDownloadDestination, onClick: chooseDownloadFolder }, state.busy === 'downloadpick' ? '选择中…' : '保存位置')),
+        h('div', { style: styles.row },
+          h(Button, { type: 'button', variant: 'primary', disabled: !view.canDownload, onClick: () => { clearSecrets(); if (controller.prepareDownload()) { setCloudStage('review'); setCloudOpen(true); } } }, '下载所选'),
+          download && h(Button, { type: 'button', variant: 'ghost', disabled: Boolean(state.busy) || state.refreshing, onClick: showProgress }, '查看下载进度')),
+        download && body(`下载${({ running: '进行中…', succeeded: '完成', partial: '部分完成', failed: '未完成' })[download.state]} · ${download.completed}/${download.total}`, { role: 'status', 'aria-live': 'polite' }),
+        view.downloadWarning && body(view.downloadWarning, { role: 'alert', style: styles.warning }),
+        !download && !cloudOpen && recoveryResult,
+        (state.downloadUncertain || state.recoveryUncertain) && !cloudOpen && body('结果未确认，请刷新；勿重复提交', { role: 'alert', style: { ...styles.body, ...styles.warning } }),
+        state.downloadError && !cloudOpen && h('div', { role: 'alert', style: styles.error }, state.downloadError.message)),
       h('section', { style: styles.card, 'aria-labelledby': `${id}-status-title` },
         h('div', { style: styles.between },
           h('h3', { id: `${id}-status-title`, style: styles.heading }, '同步状态'),
@@ -247,63 +332,95 @@ export function createClientPlugin(require) {
           h('div', { style: styles.row },
             h(Button, { type: 'button', variant: 'ghost', onClick: () => controller.cancelUpdateIntent() }, '取消'),
             h(Button, { type: 'button', variant: 'primary', disabled: !view.canUpdate, onClick: () => { void controller.confirmUpdate(updateIntent); } }, '确认更新')))),
-      h(Modal, { open: cloudOpen, onClose: closeCloud, title: '云端下载', closeLabel: '关闭' },
-        cloudOpen && h('div', { style: styles.form },
-          ['projects', 'checkpoints'].includes(state.busy) && body('读取中…', { role: 'status' }),
-          cloud.projectsLoaded && !cloud.projects.length && body('暂无云端项目'),
-          cloud.partial && body('部分项目读取失败', { role: 'alert', style: styles.warning }),
-          cloud.projects.length > 0 && h('div', { style: styles.list, 'aria-label': '云端项目文件夹' }, ...cloud.projects.map(project =>
-            h('div', { key: project.projectId, style: styles.project },
-              h(Button, { type: 'button', variant: cloud.projectId === project.projectId ? 'outline' : 'ghost', 'aria-pressed': cloud.projectId === project.projectId,
-                disabled: !view.canBrowse || Boolean(state.recoveryPending), onClick: () => {
-                  if (controller.setCloudProject(project.projectId)) void controller.loadCheckpoints();
-                } }, projectLabel(project)),
-              project.sourceRoot && body(project.sourceRoot, { style: styles.root }),
-              body(`${project.checkpointCount} 个检查点 · ${when(project.latestCreatedAt)}`)))),
-          cloud.heads.length > 1 && body(`${cloud.heads.length} 个分支`, { style: { ...styles.body, ...styles.warning } }),
-          cloud.loaded && !cloud.checkpoints.length && body('暂无检查点'),
-          cloud.checkpoints.length > 0 && h('div', { style: styles.list, role: 'group', 'aria-label': '检查点列表（单选）' }, ...cloud.checkpoints.map(checkpoint => h('div', { key: checkpoint.id, style: styles.project },
-            h(Checkbox, { checked: cloud.checkpointId === checkpoint.id, label: `${when(checkpoint.createdAt)}${cloud.heads.includes(checkpoint.id) ? ' · 分支' : ''}`,
-              disabled: !view.canBrowse || Boolean(state.recoveryPending), onChange: selected => controller.selectCheckpoint(selected ? checkpoint.id : '') }),
-            body(`设备 ${checkpoint.deviceId} · ${checkpoint.fileCount} 个文件 · ${checkpoint.totalBytes} 字节`)))),
-          h('div', { style: styles.between },
-            h('span', { style: styles.label }, '保存位置'),
-            h(Button, { type: 'button', variant: 'outline', disabled: !view.canChooseDestination, onClick: () => { void controller.chooseDestination(); } }, state.busy === 'destinationpick' ? '选择中…' : '选择文件夹')),
-          cloud.destination && body(cloud.destination, { style: styles.root, 'aria-label': '目标文件夹' }),
-          recoveryResult,
-          recovery?.kind === 'restore' && recovery.state === 'succeeded' && h(Button, { type: 'button', variant: 'outline', disabled: !view.canImport,
-            onClick: () => { clearSecrets(); controller.prepareImport(); } }, '导入安全会话'),
-          cloud.error && !directoryBrowser && h('div', { role: 'alert', style: styles.error }, cloud.error.message),
-          state.error && h('div', { role: 'alert', style: styles.error }, state.error.message),
-          (state.dirty || state.conflict) && body('请先保存或撤销本机同步设置更改。'),
-          state.recoveryUncertain && body('结果未确认，勿重复提交；请刷新状态。', { role: 'alert', style: styles.warning }),
+      h(Modal, { open: cloudOpen, onClose: closeCloud, title: downloadTitle, closeLabel: '关闭', onKeyDownCapture: comboEscape,
+        footer: cloudOpen && h('div', { style: styles.between },
+          h('span', { style: styles.body, role: 'status' }, cloudStage === 'select' ? `已选择 ${downloads.length} 个项目` : ''),
           h('div', { style: styles.row },
-            h(Button, { type: 'button', variant: 'ghost', onClick: closeCloud }, '关闭'),
-            h(Button, { type: 'button', variant: 'outline', disabled: Boolean(state.busy) || state.refreshing, onClick: () => { void controller.refresh(); } }, '核对状态'),
-            h(Button, { type: 'button', variant: 'primary', disabled: !view.canRestoreDestination, onClick: () => controller.prepareRestore() }, '下载到新目录')))),
-      h(Modal, { open: Boolean(directoryBrowser), onClose: () => controller.closeDestinationBrowser(), title: '选择文件夹', closeLabel: '取消' },
-        directoryBrowser && h('div', { style: styles.form },
-          h('div', { style: styles.row, 'aria-label': '文件夹导航' }, ...directoryBrowser.crumbs.map(crumb =>
-            h(Button, { key: crumb.id, type: 'button', variant: 'ghost', disabled: Boolean(state.busy) || state.refreshing,
-              onClick: () => { if (controller.getSnapshot().cloud.directoryBrowser === directoryBrowser) void controller.browseDestination(crumb.id); } }, crumb.label))),
-          body(directoryBrowser.path, { style: styles.root }),
-          h('div', { style: styles.list, 'aria-label': '文件夹列表' }, ...directoryBrowser.directories.map(folder =>
-            h(Button, { key: folder.id, type: 'button', variant: 'ghost', disabled: Boolean(state.busy) || state.refreshing,
-              onClick: () => { if (controller.getSnapshot().cloud.directoryBrowser === directoryBrowser) void controller.browseDestination(folder.id); } }, folder.label))),
-          !directoryBrowser.directories.length && body('暂无子文件夹'),
-          directoryBrowser.truncated && body('仅显示部分文件夹'),
-          cloud.error && h('div', { role: 'alert', style: styles.error }, cloud.error.message),
-          h(Button, { type: 'button', variant: 'primary', disabled: !directoryBrowser.selectable || Boolean(state.busy) || state.refreshing,
-            onClick: () => { if (controller.getSnapshot().cloud.directoryBrowser === directoryBrowser) void controller.selectDestination(directoryBrowser.currentId); } }, '选择此文件夹'))),
-      h(Modal, { open: Boolean(intent), onClose: () => controller.cancelRecoveryIntent(), title: intent?.kind === 'import' ? '导入可恢复会话？' : '确认云端下载？', closeLabel: '取消' },
-        intent && h('div', { style: styles.form },
-          intent.kind === 'restore' ? h('div', null,
-            body(projectLabel(selectedCloudProject)), body(intent.destination), body('下载到新目录，不覆盖现有文件'))
-            : h('div', null, body(intent.root), body(`会话归档 ${recovery?.sessionCount ?? '未确认'} 个`)),
-          h('div', { style: styles.row },
-            h(Button, { type: 'button', variant: 'ghost', onClick: () => controller.cancelRecoveryIntent() }, '取消'),
-            h(Button, { type: 'button', variant: 'primary', disabled: intent.kind === 'restore' ? !view.canRestoreDestination : !view.canImport,
-              onClick: () => { void controller.confirmRecovery(intent); } }, intent.kind === 'restore' ? '确认下载' : '确认导入')))),
+            h(Button, { type: 'button', variant: 'ghost', onClick: closeCloud }, cloudStage === 'select' ? '完成' : '关闭'),
+            cloudStage === 'review' && intent?.kind === 'download' && h(Button, { type: 'button', variant: 'primary', disabled: !view.canDownload, onClick: () => {
+              if (controller.getSnapshot().downloadIntent !== intent) return;
+              const lifetime = cloudLife.current;
+              void controller.confirmDownload(intent).then(() => { if (cloudLife.current === lifetime) setCloudStage('progress'); });
+            } }, '确认下载'),
+            cloudStage === 'import' && intent?.kind === 'import' && h(Button, { type: 'button', variant: 'primary', disabled: !view.canRecover, onClick: () => {
+              if (controller.getSnapshot().downloadIntent !== intent) return;
+              const lifetime = cloudLife.current;
+              void controller.confirmDownloadImport(intent).then(() => { if (cloudLife.current === lifetime) setCloudStage('progress'); });
+            } }, '确认导入'))) },
+        cloudOpen && h('div', { style: styles.form, ref: stageFocus, tabIndex: -1, ...(cloudStage !== 'select' ? { 'data-modal-autofocus': '' } : {}) },
+          cloudStage === 'select' && h('div', { style: styles.form },
+            !downloads.length && body('尚未选择项目，请在下方添加'),
+            downloads.length > 0 && h('ul', { style: { ...styles.list, listStyle: 'none', margin: 0, padding: 0 }, 'aria-label': '已选择的下载项目' }, ...downloads.map((row, index) => h('li', { key: row.projectId, style: styles.project },
+              h('div', { style: styles.between },
+                h('strong', { style: { ...styles.row, fontSize: 14 } }, folderIcon, row.label),
+                h('div', { style: styles.row },
+                  h(Button, { type: 'button', variant: 'ghost', disabled: !view.canBrowse, 'data-download-remove': '', 'aria-label': `移除 ${row.label}`, onClick: event => {
+                    const list = event.currentTarget?.closest?.('ul');
+                    if (controller.removeDownloadProject(row.projectId)) { setDownloadNotice(`已移除 ${row.label}`); queueMicrotask(() => { const buttons = list?.querySelectorAll?.('[data-download-remove]'); const target = buttons?.[Math.min(index, (buttons?.length ?? 0) - 1)]; (target?.isConnected ? target : downloadInput.current)?.focus(); }); }
+                  } }, '移除'))),
+              downloads.some(other => other !== row && other.label === row.label) && row.sourceRoot && body(row.sourceRoot, { style: styles.root })))),
+            h('div', { ref: comboRoot, style: { ...styles.form, paddingTop: 12, borderTop: '1px solid var(--dsw-alias-settings-card-stroke)' },
+              onBlur: event => { if (!event.currentTarget.contains(event.relatedTarget)) { setSuggestionsOpen(false); setActiveSuggestion(''); } } },
+              h('label', { style: styles.label, htmlFor: `${id}-download-add` }, '添加项目',
+                h(Input, { ref: downloadInput, id: `${id}-download-add`, type: 'text', role: 'combobox', value: downloadSearch, placeholder: '搜索云端项目…', autoComplete: 'off', spellCheck: false, maxLength: 1024,
+                  'data-modal-autofocus': '', 'aria-autocomplete': 'list', 'aria-expanded': dropdownOpen, 'aria-controls': dropdownOpen ? `${id}-download-options` : undefined,
+                  'aria-activedescendant': dropdownOpen && activeOption ? `${id}-download-option-${activeOption.projectId}` : undefined,
+                  'aria-describedby': downloads.length >= 20 ? `${id}-download-help` : undefined, readOnly: !view.canBrowse, 'aria-disabled': !view.canBrowse || downloads.length >= 20,
+                  onFocus: () => { if (deriveView(controller.getSnapshot()).canBrowse) setSuggestionsOpen(true); },
+                  onClick: () => { if (deriveView(controller.getSnapshot()).canBrowse) setSuggestionsOpen(true); },
+                  onChange: event => { setDownloadSearch(event.target.value); setActiveSuggestion(''); setSuggestionsOpen(true); }, onKeyDown: comboKey,
+                  onCompositionStart: () => { composition.current = { active: true, ended: false }; }, onCompositionEnd: () => { composition.current = { active: false, ended: true }; }, onKeyUp: () => { composition.current.ended = false; } })),
+              downloads.length >= 20 && body('最多选择20个项目', { id: `${id}-download-help` }),
+              dropdownOpen && h('div', { id: `${id}-download-options`, role: 'listbox', 'aria-label': '可添加的云端项目', style: { ...styles.card, maxHeight: 220, overflowY: 'auto', padding: 4, gap: 0 } },
+                ...suggestions.map(project => h('div', { key: project.projectId, id: `${id}-download-option-${project.projectId}`, role: 'option', 'aria-selected': activeOption?.projectId === project.projectId,
+                  'aria-disabled': !view.canBrowse || downloads.length >= 20, style: { padding: '9px 12px', borderRadius: 8, cursor: 'pointer', background: activeOption?.projectId === project.projectId ? 'var(--dsw-alias-settings-card-stroke)' : 'transparent' },
+                  onPointerDown: event => event.preventDefault(), onPointerMove: () => setActiveSuggestion(project.projectId), onClick: () => addSuggested(project.projectId) },
+                  h('span', { style: styles.row }, folderIcon, projectLabel(project)),
+                  cloud.projects.some(other => other.projectId !== project.projectId && projectLabel(other) === projectLabel(project)) && project.sourceRoot && body(project.sourceRoot, { style: styles.root })))),
+              dropdownOpen && !suggestions.length && !cloud.error && body(cloud.projectsLoaded ? (query ? '无匹配项目' : cloud.projects.length ? '所有项目已添加' : '暂无云端项目') : '读取中…', { role: 'status' }),
+              dropdownOpen && unchosen.length > 100 && body('仅显示前100项，请继续搜索'),
+              body(downloadNotice, { role: 'status', 'aria-live': 'polite' })),
+            state.busy === 'projects' && body('读取中…', { role: 'status' }),
+            cloud.projectsLoaded && !cloud.projects.length && body('暂无云端项目'),
+            cloud.partial && body('部分项目读取失败', { role: 'alert', style: styles.warning }),
+            cloud.error && body(cloud.error.message, { role: 'alert', style: styles.error })),
+          cloudStage === 'folders' && directoryBrowser && h('div', { style: styles.form },
+            h('div', { style: styles.row, 'aria-label': '文件夹导航' }, ...directoryBrowser.crumbs.map(crumb => h(Button, { key: crumb.id, type: 'button', variant: 'ghost', disabled: Boolean(state.busy) || state.refreshing,
+              onClick: () => { if (controller.getSnapshot().downloadBrowser === directoryBrowser) void controller.browseDownloadDestination(crumb.id); } }, crumb.label))),
+            body(directoryBrowser.path, { style: styles.root }),
+            h('div', { style: styles.list, 'aria-label': '文件夹列表' }, ...directoryBrowser.directories.map(folder => h(Button, { key: folder.id, type: 'button', variant: 'ghost', disabled: Boolean(state.busy) || state.refreshing,
+              onClick: () => { if (controller.getSnapshot().downloadBrowser === directoryBrowser) void controller.browseDownloadDestination(folder.id); } }, folder.label))),
+            !directoryBrowser.directories.length && body('暂无子文件夹'), directoryBrowser.truncated && body('仅显示部分文件夹'),
+            h(Button, { type: 'button', variant: 'primary', disabled: !directoryBrowser.selectable || Boolean(state.busy) || state.refreshing, onClick: () => {
+              const lifetime = cloudLife.current;
+              if (controller.getSnapshot().downloadBrowser === directoryBrowser) void controller.selectDownloadDestination(directoryBrowser.currentId).then(selected => { if (selected && cloudLife.current === lifetime) closeCloud(); });
+            } }, '选择此文件夹')),
+          cloudStage === 'review' && intent?.kind === 'download' && h('div', { style: styles.form },
+            body(`将下载 ${intent.items.length} 个项目`), body('下载云端最新内容'),
+            ...intent.items.map(item => h('div', { key: item.projectId, style: styles.project }, h('strong', null, item.label), body(item.root, { style: styles.root }))),
+            body('新建目录，不覆盖现有文件'), body('关闭窗口后继续下载')),
+          cloudStage === 'import' && intent?.kind === 'import' && h('div', { style: styles.form }, body(intent.label), body(intent.root, { style: styles.root }), body('仅导入安全会话，不启动代理。导入后请核对结果，勿重复提交。')),
+          cloudStage === 'progress' && h('div', { style: styles.form },
+            download && body(`下载${({ running: '进行中…', succeeded: '完成', partial: '部分完成', failed: '未完成' })[download.state]} · ${download.completed}/${download.total}`, { role: 'status', 'aria-live': 'polite' }),
+            view.downloadWarning && body(view.downloadWarning, { role: 'alert', style: styles.warning }),
+            download?.state === 'running' && body('可以关闭此窗口，下载在宿主中继续。'),
+            ...(download?.items ?? []).map(item => h('div', { key: item.restoreId, style: styles.project },
+              h('div', { style: styles.between }, h('strong', null, item.label), body(({ pending: '等待中', running: '下载中…', succeeded: '完成', failed: '失败', cancelled: '已停止' })[item.state])),
+              view.downloadItemErrors[item.restoreId] && body(view.downloadItemErrors[item.restoreId], { style: styles.warning }),
+              item.state === 'failed' && body('目录可能不完整，请重新选择新目录后重试', { style: styles.warning }),
+              h('details', null, h('summary', { style: styles.body }, '详情'), body(item.root, { style: styles.root }),
+                item.sessionCount !== undefined && body(`会话归档 ${item.sessionCount} 个`),
+                item.importResult && h('div', { style: styles.form },
+                  body(`已导入 ${item.importResult.importedCount ?? '未确认'} · 已跳过 ${item.importResult.skippedCount ?? '未确认'} · 失败 ${item.importResult.failedCount ?? '未确认'}`),
+                  item.importResult.state === 'failed' && body('部分会话可能已写入，勿重复导入', { style: styles.warning }),
+                  ...(item.importResult.sessions ?? []).map(session => h('div', { key: session.sourceId },
+                    body(`${session.sourceId} → ${session.sessionId ?? '无新会话 ID'} · ${{ imported: '已导入', skipped: '已跳过', failed: '失败' }[session.outcome]}`),
+                    session.workspaceAttached === false && body('未关联工作区，勿重复导入', { style: styles.warning }))))),
+              item.canImport && h(Button, { type: 'button', variant: 'outline', disabled: !view.canRecover, 'aria-label': `导入 ${item.label} 的安全会话`, onClick: () => { if (controller.prepareDownloadImport(item.restoreId)) setCloudStage('import'); } }, '导入安全会话'))),
+            h(Button, { type: 'button', variant: 'outline', disabled: Boolean(state.busy) || state.refreshing, onClick: () => { void controller.refresh(); } }, '核对状态')),
+          state.downloadError && body(state.downloadError.message, { role: 'alert', style: styles.error }),
+          state.downloadUncertain && body('结果未确认，请核对状态；勿重复提交。', { role: 'alert', style: styles.warning }),
+          (state.dirty || state.conflict) && body('请先保存或撤销本机同步设置更改。'))),
       h(Modal, { open: projectManagerOpen, onClose: closeProjects, title: '管理同步项目', closeLabel: '关闭',
         footer: projectManagerOpen && h('div', { style: styles.between },
           h('span', { style: styles.body, role: 'status' }, state.dirty ? '未保存' : `已选择 ${view.selectedCount} 项`),
