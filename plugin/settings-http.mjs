@@ -16,7 +16,12 @@ const messages = Object.freeze({
   UPDATE_UNCERTAIN: '更新结果未确认，请检查原生插件管理并重启 DSH',
   UPDATE_CANCEL_TOO_LATE: '原生管理器已开始应用更新，无法取消',
   UPDATE_RESTART_REQUIRED: '插件文件可能已变更，请先重启 DSH',
-  CLOUD_BROWSE_UNSUPPORTED: '请升级同步服务器，或填写云端项目 ID',
+  CLOUD_BROWSE_UNSUPPORTED: '请更新同步服务器',
+  PROJECTS_PARTIAL: '部分云端项目未能加载，请重试',
+  DIRECTORY_PICKER_UNAVAILABLE: '当前宿主没有可用的文件夹选择器',
+  DIRECTORY_PICKER_FAILED: '文件夹选择失败，请重试',
+  DIRECTORY_PICKER_EXPIRED: '文件夹选择已失效，请重新选择',
+  DESTINATION_CHANGED: '目标父目录已变更，请重新选择',
   BAD_DESTINATION: '恢复目录无效，父目录必须已存在且无链接',
   DESTINATION_EXISTS: '恢复目录已存在',
   PROTECTED_DESTINATION: '不能恢复到 DSH 或已有项目目录中',
@@ -102,7 +107,7 @@ async function readBody(request, timeoutMs) {
 export function createSettingsHttp(service, { bodyTimeoutMs = 10_000, maxActive = 16 } = {}) {
   let disposed = false, active = 0;
   const loginAttempts = [];
-  const actions = new Set(['status', 'login', 'password', 'preferences', 'sync', 'logout', 'projects', 'checkpoints', 'restore', 'import', 'updatestatus', 'checkupdate', 'installupdate', 'cancelupdate']);
+  const actions = new Set(['status', 'login', 'password', 'preferences', 'sync', 'logout', 'projects', 'checkpoints', 'destinationpick', 'destinationbrowse', 'destinationselect', 'restore', 'import', 'updatestatus', 'checkupdate', 'installupdate', 'cancelupdate']);
   return {
     async fetch(action, request) {
       let rpcId, payload;
@@ -133,7 +138,7 @@ export function createSettingsHttp(service, { bodyTimeoutMs = 10_000, maxActive 
           value = action === 'login' ? await service.login(payload, request.signal) : await service.password(payload, request.signal);
         } else if (action === 'preferences') value = await service.savePreferences(payload, request.signal);
         else if (action === 'sync') value = await service.sync(payload);
-        else if (['projects', 'checkpoints', 'restore', 'import', 'updatestatus', 'checkupdate', 'installupdate', 'cancelupdate'].includes(action)) value = await service[action](payload, request.signal);
+        else if (['projects', 'checkpoints', 'destinationpick', 'destinationbrowse', 'destinationselect', 'restore', 'import', 'updatestatus', 'checkupdate', 'installupdate', 'cancelupdate'].includes(action)) value = await service[action](payload, request.signal);
         else value = await service.logout(payload);
         return response(rpcId ? { type: 'server-response', rpcId, result: { ok: true, value } } : value);
       } catch (error) {
@@ -152,7 +157,7 @@ export function createSettingsHttp(service, { bodyTimeoutMs = 10_000, maxActive 
   };
 }
 export function registerSettingsRoutes(ctx, bridge) {
-  for (const action of ['status', 'login', 'password', 'preferences', 'sync', 'logout', 'projects', 'checkpoints', 'restore', 'import', 'updatestatus', 'checkupdate', 'installupdate', 'cancelupdate']) {
+  for (const action of ['status', 'login', 'password', 'preferences', 'sync', 'logout', 'projects', 'checkpoints', 'destinationpick', 'destinationbrowse', 'destinationselect', 'restore', 'import', 'updatestatus', 'checkupdate', 'installupdate', 'cancelupdate']) {
     ctx.connection.fetch.register({ path: SETTINGS_API + action, methods: ['POST'], requestBody: 'streaming', fetch: request => bridge.fetch(action, request) });
   }
 }

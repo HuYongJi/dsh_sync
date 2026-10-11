@@ -41,7 +41,7 @@ async function select(controller) {
   controller.selectCheckpoint(branch.id);
   controller.setDestination(destination);
 }
-const readOnlyHandler = call => ok(call.action === 'projects' ? cloudProjects : call.action === 'checkpoints' ? listing : status());
+const readOnlyHandler = call => ok(call.action === 'projects' ? cloudProjects : call.action === 'checkpoints' ? listing : call.action === 'destinationpick' ? { destination: { id: 'destination-one', root: destination, parent: 'E:\\synthetic' } } : status());
 
 test('recovery public parsers deeply allowlist, freeze and discard raw names, manifests and secret fields', () => {
   const projects = parseCloudProjects({ ...cloudProjects, token: 'secret', projects: [{ ...cloudProjects.projects[0], name: 'secret', root: 'secret' }] });
@@ -340,43 +340,43 @@ function pageSetup(t, handler) {
 async function browsePage(page) { await page.controller.refresh(); page.tree(); page.mount(); await settle(); button(page.tree(), '浏览云端').props.onClick(); await settle(); return modal(page, '云端下载'); }
 async function selectPage(page) {
   await browsePage(page);
-  input(modal(page, '云端下载'), 'cloud-project').props.onChange({ target: { value: checkpoint.projectId } });
-  button(modal(page, '云端下载'), '读取检查点').props.onClick(); await settle();
-  const chosen = nodes(modal(page, '云端下载')).find(node => node.type === 'native:Checkbox' && node.props.label.startsWith(branch.id)); chosen.props.onChange(true);
-  input(modal(page, '云端下载'), 'cloud-destination').props.onChange({ target: { value: destination } });
+  button(modal(page, '云端下载'), '本机已知名称').props.onClick(); await settle();
+  const chosen = nodes(modal(page, '云端下载')).filter(node => node.type === 'native:Checkbox')[1]; chosen.props.onChange(true);
+  button(modal(page, '云端下载'), '选择文件夹').props.onClick(); await settle();
 }
 
-test('recovery GUI stays compact/inert and explicit browse uses local labels, manual fallback, exact head choice and Host path guidance', async t => {
+test('recovery GUI stays compact/inert and uses folder labels, explicit branch choice and readonly Host destination', async t => {
   const page = pageSetup(t, readOnlyHandler); await page.controller.refresh();
   assert.equal(nodes(page.tree()).some(node => node.type === 'native:Input'), false);
   assert.equal(nodes(page.tree()).some(node => node.type === 'native:Checkbox'), false);
   assert.equal(page.calls.every(call => call.action === 'status'), true);
   let browse = await browsePage(page);
-  assert.match(renderedText(browse), /project-one · 本机已知名称/);
-  input(browse, 'cloud-project').props.onChange({ target: { value: checkpoint.projectId } });
-  button(modal(page, '云端下载'), '读取检查点').props.onClick(); await settle(); browse = modal(page, '云端下载');
-  assert.match(renderedText(browse), /2 个 head 冲突分支/);
-  assert.match(renderedText(browse), /DSH Host 机器上的绝对路径/);
-  assert.match(renderedText(browse), /父目录必须存在，目标目录必须不存在/);
+  assert.match(renderedText(browse), /本机已知名称/);
+  assert.equal(nodes(browse).some(node => node.type === 'native:Input'), false);
+  assert.equal(button(browse, '选择文件夹').props.disabled, true);
+  button(browse, '本机已知名称').props.onClick(); await settle(); browse = modal(page, '云端下载');
+  assert.match(renderedText(browse), /2 个分支/);
+  assert.doesNotMatch(renderedText(browse), /project-one|手动输入|绝对路径|父目录|归档不等于|不自动/);
   assert.match(renderedText(browse), /设备 device-two · 4 个文件 · 100 字节/);
-  assert.match(renderedText(browse), /归档不等于可续接/);
   const boxes = nodes(browse).filter(node => node.type === 'native:Checkbox'); assert.equal(boxes.every(node => !node.props.checked), true);
   assert.equal(button(browse, '下载到新目录').props.disabled, true);
-  boxes[1].props.onChange(true); input(modal(page, '云端下载'), 'cloud-destination').props.onChange({ target: { value: destination } });
+  boxes[1].props.onChange(true); button(modal(page, '云端下载'), '选择文件夹').props.onClick(); await settle();
   assert.equal(button(modal(page, '云端下载'), '下载到新目录').props.disabled, false);
   button(modal(page, '云端下载'), '下载到新目录').props.onClick();
   const confirm = modal(page, '确认云端下载？'); assert.equal(confirm.props.open, true);
-  assert.ok(renderedText(confirm).includes(branch.id)); assert.ok(renderedText(confirm).includes(destination));
+  assert.ok(renderedText(confirm).includes('本机已知名称')); assert.ok(renderedText(confirm).includes(destination));
+  assert.equal(page.controller.getSnapshot().cloud.intent.checkpointId, branch.id);
   assert.equal(page.calls.some(call => ['restore', 'import', 'sync', 'preferences'].includes(call.action)), false);
   button(confirm, '取消').props.onClick(); assert.equal(modal(page, '确认云端下载？').props.open, false);
 });
 
-test('recovery GUI old cloud allows manual checkpoints even after unsupported projects', async t => {
+test('recovery GUI old unsupported cloud gives concise upgrade error without a manual ID workflow', async t => {
   const page = pageSetup(t, call => call.action === 'projects' ? failure('CLOUD_BROWSE_UNSUPPORTED') : readOnlyHandler(call));
-  const browse = await browsePage(page); assert.match(renderedText(browse), /手动输入项目 ID/);
-  input(browse, 'cloud-project').props.onChange({ target: { value: checkpoint.projectId } });
-  button(modal(page, '云端下载'), '读取检查点').props.onClick(); await settle();
-  assert.equal(nodes(modal(page, '云端下载')).filter(node => node.type === 'native:Checkbox').length, 2);
+  const browse = await browsePage(page); assert.match(renderedText(browse), /请更新同步服务器/);
+  assert.doesNotMatch(renderedText(browse), /手动输入|项目 ID/);
+  assert.equal(nodes(browse).some(node => node.type === 'native:Input'), false);
+  assert.equal(button(browse, '下载到新目录').props.disabled, true);
+  assert.equal(page.calls.some(call => ['checkpoints', 'restore'].includes(call.action)), false);
 });
 
 test('recovery GUI confirmation survives no stale identity/path handler and only one explicit download then separate import', async t => {
@@ -388,9 +388,9 @@ test('recovery GUI confirmation survives no stale identity/path handler and only
   });
   await selectPage(page); button(modal(page, '云端下载'), '下载到新目录').props.onClick();
   const old = button(modal(page, '确认云端下载？'), '确认下载').props.onClick;
-  input(modal(page, '云端下载'), 'cloud-destination').props.onChange({ target: { value: '/srv/synthetic/other' } }); old(); await settle();
+  nodes(modal(page, '云端下载')).find(node => node.type === 'native:Checkbox').props.onChange(true); old(); await settle();
   assert.equal(page.calls.some(call => call.action === 'restore'), false);
-  input(modal(page, '云端下载'), 'cloud-destination').props.onChange({ target: { value: destination } });
+  button(modal(page, '云端下载'), '选择文件夹').props.onClick(); await settle();
   button(modal(page, '云端下载'), '下载到新目录').props.onClick();
   const confirm = button(modal(page, '确认云端下载？'), '确认下载').props.onClick; confirm(); confirm(); await settle();
   assert.equal(page.calls.filter(call => call.action === 'restore').length, 1);
@@ -400,8 +400,8 @@ test('recovery GUI confirmation survives no stale identity/path handler and only
   button(modal(page, '云端下载'), '关闭').props.onClick();
   assert.match(renderedText(page.tree()), /下载完成/); assert.match(renderedText(page.tree()), /会话归档 2/);
   button(page.tree(), '导入安全会话').props.onClick();
-  const importConfirm = modal(page, '确认导入安全会话？'); assert.equal(importConfirm.props.open, true);
-  assert.match(renderedText(importConfirm), /可能注册工作区/); assert.match(renderedText(importConfirm), /不会选择同步项目、开启上传或执行任务/);
+  const importConfirm = modal(page, '导入可恢复会话？'); assert.equal(importConfirm.props.open, true);
+  assert.ok(renderedText(importConfirm).includes(destination)); assert.match(renderedText(importConfirm), /会话归档 2 个/);
   assert.equal(page.calls.some(call => call.action === 'import'), false);
   button(importConfirm, '确认导入').props.onClick(); await settle();
   assert.equal(page.calls.filter(call => call.action === 'import').length, 1);
@@ -411,7 +411,7 @@ test('recovery GUI confirmation survives no stale identity/path handler and only
 test('recovery GUI displays running work on reopen and never fabricates missing import counts', async t => {
   const page = pageSetup(t, () => ok(status({ running: true, recovery: recovery({ kind: 'import', state: 'running' }) })));
   await page.controller.refresh();
-  assert.match(renderedText(page.tree()), /Host 后台运行，可关闭页面/);
+  assert.match(renderedText(page.tree()), /导入进行中…/);
   assert.match(renderedText(page.tree()), /已导入 未确认 · 已跳过 未确认 · 失败 未确认/);
   assert.equal(button(page.tree(), '浏览云端').props.disabled, true);
   assert.equal(button(page.tree(), '立即同步').props.disabled, true);

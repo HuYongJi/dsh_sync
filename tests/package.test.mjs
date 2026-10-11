@@ -83,17 +83,20 @@ test('installation check preserves the verified Cordis peer contract', async t =
   await assert.rejects(checkInstall(target), /verified Cordis peer range/);
 });
 
-test('installation check keeps native plugin updating version-pinned and optional', async t => {
+test('installation check keeps native updating and folder picking version-pinned and optional', async t => {
   const target = await installedFixture(t);
   const filename = path.join(target, 'package.json');
   const pkg = JSON.parse(await readFile(filename, 'utf8'));
-  pkg.peerDependenciesMeta['@deepseek-ai/dsh-plugin-manager'].optional = false;
-  await writeFile(filename, JSON.stringify(pkg));
-  await assert.rejects(checkInstall(target), /optional Host capability/);
-  pkg.peerDependenciesMeta['@deepseek-ai/dsh-plugin-manager'].optional = true;
-  pkg.peerDependencies['@deepseek-ai/dsh-plugin-manager'] = '*';
-  await writeFile(filename, JSON.stringify(pkg));
-  await assert.rejects(checkInstall(target), /verified native update contract/);
+  for (const name of ['@deepseek-ai/dsh-plugin-manager', '@deepseek-ai/dsh-host-directory-picker']) {
+    pkg.peerDependenciesMeta[name].optional = false;
+    await writeFile(filename, JSON.stringify(pkg));
+    await assert.rejects(checkInstall(target), /optional Host capability/);
+    pkg.peerDependenciesMeta[name].optional = true;
+    pkg.peerDependencies[name] = '*';
+    await writeFile(filename, JSON.stringify(pkg));
+    await assert.rejects(checkInstall(target), /verified .* contract/);
+    pkg.peerDependencies[name] = '0.2.0-rc.2';
+  }
 });
 
 test('installation check refuses automatic sync in the default bundle', async t => {

@@ -1,6 +1,6 @@
 {
   "name": "dsh-personal-sync",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Local-first checkpoint sync and personal authentication for DeepSeek Harness",
   "repository": { "type": "git", "url": "git+https://github.com/HuYongJi/dsh_sync.git" },
   "homepage": "https://github.com/HuYongJi/dsh_sync#readme",
@@ -24,10 +24,12 @@
     "@deepseek-ai/dsh-session-format-catalog": "0.2.0-rc.2",
     "@deepseek-ai/dsh-client-ui-settings": "0.2.0-rc.2",
     "@deepseek-ai/dsh-client-connection": "0.2.0-rc.2",
-    "@deepseek-ai/dsh-plugin-manager": "0.2.0-rc.2"
+    "@deepseek-ai/dsh-plugin-manager": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-host-directory-picker": "0.2.0-rc.2"
   },
   "peerDependenciesMeta": {
-    "@deepseek-ai/dsh-plugin-manager": { "optional": true }
+    "@deepseek-ai/dsh-plugin-manager": { "optional": true },
+    "@deepseek-ai/dsh-host-directory-picker": { "optional": true }
   },
   "scripts": {
     "test": "node --test --test-isolation=none tests/*.test.mjs",

@@ -6,13 +6,13 @@
 node --test --test-isolation=none tests/*.test.mjs
 ```
 
-当前开发验证环境为 **Windows / Node.js 25.8.1**。0.5.0 全套测试已经运行：**284 项通过，0 失败，0 跳过**。服务只监听测试进程动态分配的 loopback 端口，使用测试密码和合成数据；临时文件局限在本仓库 `.test-tmp` 的独立子目录。
+当前开发验证环境为 **Windows / Node.js 25.8.1**。0.6.0 全套测试已经运行：**322 项通过，0 失败，0 跳过**。服务只监听测试进程动态分配的 loopback 端口，使用测试密码和合成数据；临时文件局限在本仓库 `.test-tmp` 的独立子目录。
 
 `--test-isolation=none` 避免 Windows 受限环境中测试运行器为子进程建立捕获管道。未开启替代 Web GUI 服务器、未访问真实账号数据、未上传真实项目、未修改已安装 DSH 或日常 profile。
 
 | 测试集 | 项数 | 覆盖 |
 |---|---:|---|
-| [核心快照测试](../tests/core.test.mjs) | 10 | 路径穿越、Windows 保留名/大小写冲突、真实 junction、二进制/Unicode、秘密排除、恢复拒绝覆盖、损坏检查、离线队列、锁、CLI preview |
+| [核心快照测试](../tests/core.test.mjs) | 13 | 路径穿越、Windows 保留名/大小写冲突、真实 junction、二进制/Unicode、秘密排除、拒绝覆盖、父目录/根目录替换、取消标记、损坏检查、队列与锁 |
 | [真实 HTTP 集成](../tests/integration.test.mjs) | 2 | 两设备登录/上传/恢复、会话封套与资产字节、并发分支、幂等提交、服务重启后 token 持续、CLI 登录到登出 |
 | [安全与插件回归](../tests/regressions.test.mjs) | 8 | 含 glob 字符的 state 目录、旧队列授权边界、manifest 字节上限、原型字段 ID、失效 token 登出、原生账号切换、插件注册、controller + 真实 HTTP |
 | [云端服务测试](../tests/server.test.mjs) | 15 | 认证/撤销/期限、scrypt 持久化、独占锁、校验与限额、并发提交、冲突、设备绑定、速率/并发/超时、环境启动、目录跳转 |
@@ -23,12 +23,15 @@ node --test --test-isolation=none tests/*.test.mjs
 | [改密 Host 与链路](../tests/password-host.test.mjs) | 19（含 2 个子测试） | 真实云端改密、所有旧 token 撤销、旧服务能力探测、intent 持久化/恢复、损坏回包、清理失败、秘密不落盘、Client→Host→云端闭环 |
 | [改密云服务](../tests/password-server.test.mjs) | 14 | 当前密码而非 token 鉴权、Unicode/JSON 边界、原子撤销、并发 CAS、旧登录/写入竞态、重启兼容及失败原子性 |
 | [GitHub 安装包](../tests/package.test.mjs) | 10 | 包入口、预构建产物一致性、仅发布白名单的独立包、缺失 Client、安装 lifecycle、可选/捆绑依赖、Cordis peer、不安全默认配置、错误模块 ID |
-| [下载恢复 Client](<../tests/recovery-client.test.mjs>) | 21 | 云端浏览与旧服务手填 ID、检查点单选、绑定确认、异步轮询、超时不重放、部分结果、原生控件对象树 |
+| [下载恢复 Client](<../tests/recovery-client.test.mjs>) | 21 | 云端浏览与旧 API 兼容、检查点单选、绑定确认、异步轮询、超时不重放、部分结果、无手填 ID/路径的原生控件对象树 |
 | [下载恢复 Host](<../tests/recovery-host.test.mjs>) | 19 | 认证项目目录、真实 HTTP 下载、目录/哈希保护、重复 ID、部分导入、取消/等待、账号与并发边界 |
 | [下载恢复完整链路](<../tests/recovery-integration.test.mjs>) | 3 | 生产 Client→RPC→Host→真实云服务下载、独立导入确认、陈旧 revision 拒绝、部分持久化 ID 与秘密隔离 |
-| [插件更新 Client](<../tests/update-client.test.mjs>) | 28 | 显式检查/确认、固定提交与严格字段、未登录可用、轮询/取消、陈旧回调、未知结果不重放、重启屏障和原生控件对象树 |
+| [插件更新 Client](<../tests/update-client.test.mjs>) | 30 | 置底单按钮、检查/手动更新切换、全局刷新、固定提交/确认、陈旧回调、未知结果不重放、重启屏障和原生控件对象树 |
 | [插件更新 Host](<../tests/update-host.test.mjs>) | 22 | 固定匿名元数据、压缩与字节限额、可选原生 manager、提交固定、候选过期、并发锁、批准拒绝、取消/终态与 HMR dispose 互等回归 |
 | [插件更新联合链路](<../tests/update-integration.test.mjs>) | 2 | 生产 Client→RPC→Host→模拟原生安装器，版本/提交固定、无秘密、重启门禁与构建批准失败 |
+| [文件夹选择 Client](<../tests/folder-picker-client.test.mjs>) | 14 | 具名项目、readonly 目标、native 取消、browse 导航、严谨 DTO、过期/陈旧请求、关闭中止、destinationId-only 下载 |
+| [文件夹选择 Host](<../tests/folder-picker-host.test.mjs>) | 16 | 绑定计划、真实路径/inode/链接保护、无预创建、目录碰撞、旧服务回查、NFD/扩展年时间、不可变清单校验 |
+| [文件夹选择完整链路](<../tests/folder-picker-integration.test.mjs>) | 3 | 生产 UI→RPC→Host→真实 HTTP 云服务，模拟 native/browse 选择后恢复字节，旧服务已知绑定兼容 |
 
 ## GitHub 地址安装的验证边界
 
@@ -104,6 +107,14 @@ Client 对象树回归覆盖：登录后整个登录表单不挂载、只显示�
 联合测试覆盖未登录个人云账号时检查/确认固定提交安装、仅原生 manager 调用、不转发任何 token/密码、运行版与已安装版分开显示、脚本批准拒绝不自动重试，以及安装后其他写操作被锁定。安装包检查额外验证 native manager peer 精确且可选。
 
 这些是契约/状态测试，不宣称验证了当前桌面 GUI 的一键安装、真实 GitHub 网络、代理配置、pnpm 缓存行为或完整重启。实际验收仍需用户批准的独立 profile；此次未发布仓库提交，也未执行客户端更新。
+
+## 0.6.0 精简界面与文件夹选择
+
+对象树测试验证更新卡确实为最后一个主设置卡，仅一个检查/手动更新按钮，其他说明和独立核对/取消按钮未挂载。已有新版本但存在未保存设置时，仍显示禁用的“手动更新”，不会变回检查并再次联网。下载页没有手填 ID/目标路径控件；项目名称、只读最终路径和必要条件错误保留。
+
+真实 loopback 服务覆盖已提交目录名称与原始清单 SHA/索引一致性，保留旧索引、源路径 NFD 和扩展 ISO 年的兼容。legacy 路径仅使用已知绑定，不按名字猜项目，部分失败明确报告。联合链路验证选 native 父目录/浏览目录句柄后才得到计划，目录尚不存在，最终仅提交 destinationId，确认后才下载字节，取消保留原选择、不自动导入。
+
+原生目录能力只依据提取的 rc.2 WorkspaceController/生成契约只读核实；具体 picker 后端与系统对话框未实际启动，使用合成能力替身，不把对象树或 HTTP 测试冒称实机视觉验收。恢复补充根目录/父目录替换测试：即使处于元数据标记阶段也不能向替换后的目录写入；位置不变时取消仍保留常量安全标记。
 
 ## 注意测试层次
 

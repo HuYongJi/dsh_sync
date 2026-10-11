@@ -3,7 +3,7 @@ import os from 'node:os';
 import fs from 'node:fs/promises';
 import { assert, validateId, validateManifest, sha256, MAX_FILES, MAX_MANIFEST_BYTES } from '../src/protocol.mjs';
 import { atomicWrite, assertNoSymlinks, readStableFile } from '../src/files.mjs';
-import { SyncClient, validateServerUrl, validatePasswordChange } from '../src/client.mjs';
+import { SyncClient, validateServerUrl, validatePasswordChange, projectFolderMetadata } from '../src/client.mjs';
 import { LocalStore, newDeviceId } from '../src/local-store.mjs';
 import { isExcluded } from '../src/snapshot.mjs';
 import { exportProjectSessions, importProjectSessions } from './dsh-adapter.mjs';
@@ -237,6 +237,65 @@ export function createController(ctx, initialConfig, { exportSessions = exportPr
   }
   const sameAccount = (a, b) => a && b && ['server', 'username', 'deviceId', 'token'].every(key => a[key] === b[key]);
   const publicRecovery = job => structuredClone(job.value);
+  // One trusted read boundary for cloud browsing and Host chooser calls. Never nest mutate.
+  function readAccount(action, { checkBinding, signal } = {}) {
+    return mutate(async () => {
+      const requestSignal = signal ? AbortSignal.any([signal, lifetime.signal]) : lifetime.signal;
+      requestSignal.throwIfAborted(); await checkBinding();
+      const identity = await account();
+      const check = async () => {
+        requestSignal.throwIfAborted(); await checkBinding();
+        if (!sameAccount(identity, await account())) throw failure('ACCOUNT_MISMATCH', '账号已变更');
+        if (Date.parse(identity.expiresAt) <= Date.now()) throw failure('NOT_LOGGED_IN', '请重新登录');
+        requestSignal.throwIfAborted();
+      };
+      await check();
+      const value = await action({ identity, client: new SyncClient({ ...identity, signal: requestSignal }), signal: requestSignal, check });
+      await check(); return value;
+    }, { requireIdle: true });
+  }
+  async function cloudProjects({ client, check }, knownProjects) {
+    const known = await knownProjects?.() || [], byId = new Map();
+    for (const item of known) { validateId(item.projectId); if (!byId.has(item.projectId)) byId.set(item.projectId, item); }
+    let result, legacy = false, partial = false;
+    try { result = await client.projects(); }
+    catch (error) {
+      await check();
+      if (error.code !== 'CLOUD_BROWSE_UNSUPPORTED') throw error;
+      if (!byId.size) throw failure('CLOUD_BROWSE_UNSUPPORTED', '请更新同步服务器');
+      legacy = true; partial = byId.size > 200;
+      result = { projects: [...byId.values()].slice(0, 200).map(item => ({ projectId: item.projectId })) };
+    }
+    const projects = [];
+    for (const item of result.projects) {
+      await check();
+      let row = item;
+      try {
+        if (!item.label || !item.checkpointCount) {
+          legacy = true;
+          const catalog = await client.list(item.projectId); await check();
+          if (!catalog.checkpoints.length) continue;
+          const last = catalog.checkpoints.at(-1);
+          row = { projectId: item.projectId, checkpointCount: catalog.checkpoints.length, latestCreatedAt: catalog.checkpoints.reduce((value, entry) => Date.parse(entry.createdAt) > Date.parse(value) ? entry.createdAt : value, catalog.checkpoints[0].createdAt) };
+          try {
+            const manifest = await client.getCheckpoint(last.id); await check();
+            if (manifest.projectId !== item.projectId) throw failure('CHECKPOINT_MISMATCH');
+            Object.assign(row, projectFolderMetadata(manifest.sourceRoot));
+          } catch (error) {
+            await check(); if (error.status === 401) throw error;
+            const knownLabel = byId.get(item.projectId)?.label;
+            if (!knownLabel) throw error;
+            row.label = knownLabel; partial = true;
+          }
+        }
+        projects.push({ projectId: row.projectId, label: row.label, ...(row.sourceRoot !== undefined ? { sourceRoot: row.sourceRoot } : {}), checkpointCount: row.checkpointCount, latestCreatedAt: row.latestCreatedAt });
+      } catch (error) {
+        await check(); if (error.status === 401) throw error;
+        partial = true;
+      }
+    }
+    return { projects, ...(legacy ? { legacy: true } : {}), ...(partial ? { partial: true } : {}) };
+  }
   function importSummary(result, manifest) {
     const sessions = [], known = new Set(manifest.sessionIds), seen = new Set(), reported = new Set();
     for (const [field, outcome] of [['imported', 'imported'], ['skipped', 'skipped'], ['failed', 'failed']]) {
@@ -255,14 +314,14 @@ export function createController(ctx, initialConfig, { exportSessions = exportPr
     return { importedCount: sessions.filter(item => item.outcome === 'imported').length, skippedCount: sessions.filter(item => item.outcome === 'skipped').length, failedCount: sessions.filter(item => item.outcome === 'failed').length, sessions };
   }
   function recoveryError(error, kind) {
-    const safe = new Set(['NOT_LOGGED_IN', 'ACCOUNT_MISMATCH', 'CONFIG_CONFLICT', 'BAD_DESTINATION', 'DESTINATION_EXISTS', 'PROTECTED_DESTINATION', 'CHECKPOINT_MISMATCH', 'RECOVERY_UNAVAILABLE', 'BUSY']);
+    const safe = new Set(['NOT_LOGGED_IN', 'ACCOUNT_MISMATCH', 'CONFIG_CONFLICT', 'BAD_DESTINATION', 'DESTINATION_EXISTS', 'DESTINATION_CHANGED', 'DIRECTORY_PICKER_EXPIRED', 'PROTECTED_DESTINATION', 'CHECKPOINT_MISMATCH', 'RECOVERY_UNAVAILABLE', 'BUSY']);
     if (stopped) return 'DISPOSED';
     if (safe.has(error?.code)) return error.code;
     if (error?.status === 401) return 'NOT_LOGGED_IN';
     if (error?.code === 'EEXIST' && kind === 'restore') return 'DESTINATION_EXISTS';
     return kind === 'restore' ? 'RESTORE_FAILED' : 'IMPORT_FAILED';
   }
-  async function startRecovery(kind, input, { checkBinding, admitDestination, signal } = {}) {
+  async function startRecovery(kind, input, { checkBinding, admitDestination, signal, resolveDestination } = {}) {
     await ready(); updateAdmission(); await checkBinding(); signal?.throwIfAborted();
     const credentials = await account();
     await checkBinding(); signal?.throwIfAborted(); lifetime.signal.throwIfAborted();
@@ -279,7 +338,11 @@ export function createController(ctx, initialConfig, { exportSessions = exportPr
     if (recoveryIds.size >= maxRecoveryRequests) throw failure('RECOVERY_LIMIT', '恢复请求已达上限');
     const restored = latestRestore;
     if (kind === 'import' && (!restored || restored.value.id !== input.restoreId || restored.consumed || !sameAccount(restored.identity, credentials))) throw failure('RECOVERY_UNAVAILABLE', '没有可导入的本次恢复');
-    const job = { identity: credentials, fingerprint, value: { id: input.requestId, kind, state: 'running', root: kind === 'restore' ? input.destination : restored.value.root, checkpointId: kind === 'restore' ? input.checkpointId : restored.value.checkpointId, ...(kind === 'import' ? { sessionCount: restored.value.sessionCount } : {}) } };
+    // Resolve opaque plans only AFTER duplicate requests have returned their original outcome.
+    // Resolution is synchronous; do not open an admission race between the busy check and reservation.
+    const destinationPlan = kind === 'restore' ? resolveDestination?.(credentials) : undefined;
+    const destination = destinationPlan?.root ?? input.destination;
+    const job = { identity: credentials, fingerprint, value: { id: input.requestId, kind, state: 'running', root: kind === 'restore' ? destination : restored.value.root, checkpointId: kind === 'restore' ? input.checkpointId : restored.value.checkpointId, ...(kind === 'import' ? { sessionCount: restored.value.sessionCount } : {}) } };
     recoveryIds.set(input.requestId, job); latestRecovery = job;
     const abort = new AbortController(); recoveryAbort = abort;
     const taskSignal = AbortSignal.any([lifetime.signal, abort.signal]);
@@ -295,11 +358,11 @@ export function createController(ctx, initialConfig, { exportSessions = exportPr
           };
           await check();
           if (kind === 'restore') {
-            await admitDestination(input.destination);
+            await destinationPlan?.check(); await admitDestination(destination);
             let reserved = false;
-            const result = await store.restore(new SyncClient({ ...credentials, signal: taskSignal }), input.checkpointId, input.destination, {
+            const result = await store.restore(new SyncClient({ ...credentials, signal: taskSignal }), input.checkpointId, destination, {
               projectId: input.projectId, signal: taskSignal,
-              beforeWrite: async () => { await check(); await admitDestination(input.destination, { reserved }); reserved = true; taskSignal.throwIfAborted(); },
+              beforeWrite: async () => { await check(); await destinationPlan?.check({ reserved }); await admitDestination(destination, { reserved }); reserved = true; taskSignal.throwIfAborted(); },
             });
             job.value.sessionCount = result.sessionIds.length;
             job.manifest = result.manifest; completedRestore = job;
@@ -337,16 +400,9 @@ export function createController(ctx, initialConfig, { exportSessions = exportPr
     setCaptureExclusions(value) { captureExclusions = value; },
     setRestoreAdmission(value) { restoreAdmission = value; },
     startRecovery,
-    async browse(kind, projectId, { checkBinding, signal } = {}) {
-      return mutate(async () => {
-        const requestSignal = signal ? AbortSignal.any([signal, lifetime.signal]) : lifetime.signal;
-        requestSignal.throwIfAborted(); await checkBinding();
-        const identity = await account(), client = new SyncClient({ ...identity, signal: requestSignal });
-        const result = kind === 'projects' ? await client.projects() : await client.list(projectId);
-        await checkBinding(); requestSignal.throwIfAborted();
-        if (!sameAccount(identity, await account())) throw failure('ACCOUNT_MISMATCH', '账号已变更');
-        return result;
-      }, { requireIdle: true });
+    readAccount,
+    async browse(kind, projectId, { checkBinding, signal, knownProjects } = {}) {
+      return readAccount(context => kind === 'projects' ? cloudProjects(context, knownProjects) : context.client.list(projectId), { checkBinding, signal });
     },
     setIdentityPersister(value) { identityPersister = value; },
     replaceConfiguration,

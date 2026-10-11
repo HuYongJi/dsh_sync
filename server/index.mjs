@@ -10,7 +10,20 @@ import {
   MAX_BLOB_BYTES, MAX_CHECKPOINT_BYTES, MAX_FILES, MAX_MANIFEST_BYTES,
 } from '../src/protocol.mjs';
 
+import { readStableFile } from '../src/files.mjs';
+import { projectFolderMetadata } from '../src/client.mjs';
+
 const scrypt = promisify(scryptCallback);
+async function committedManifest(store, entry) {
+  try {
+    const filename = path.join(store.checkpointDir, `${sha256(Buffer.from(entry.id))}.json`);
+    const { bytes } = await readStableFile(filename, MAX_MANIFEST_BYTES);
+    if (sha256(bytes) !== entry.manifestSha256) throw new Error('Checkpoint integrity error');
+    const manifest = validateManifest(JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)));
+    if (manifest.id !== entry.id || manifest.projectId !== entry.projectId || manifest.deviceId !== entry.deviceId || manifest.parentId !== entry.parentId || manifest.createdAt !== entry.createdAt || manifest.files.length !== entry.fileCount || manifest.files.reduce((sum, file) => sum + file.size, 0) !== entry.totalBytes) throw new Error('Checkpoint index mismatch');
+    return manifest;
+  } catch { throw new Error('Checkpoint integrity error'); } // Corrupt storage is 500, not a reflected local-path validation error.
+}
 const SCRYPT = Object.freeze({ N: 32768, r: 8, p: 1, maxmem: 64 * 1024 * 1024 });
 const TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 const HASH_PATTERN = /^[a-f0-9]{64}$/;
@@ -465,12 +478,19 @@ export async function createSyncServer(options = {}) {
     }
     if (pathname === '/v1/projects' && req.method === 'GET') {
       // Only the committed index is authoritative; never enumerate orphan manifests.
-      const projects = new Map();
-      for (const entry of store.state.checkpoints) {
+      const projects = new Map(), latest = new Map();
+      const committed = store.state.checkpoints;
+      for (const entry of committed) {
         const prior = projects.get(entry.projectId);
         if (prior) { prior.checkpointCount++; if (Date.parse(entry.createdAt) > Date.parse(prior.latestCreatedAt)) prior.latestCreatedAt = entry.createdAt; }
         else projects.set(entry.projectId, { projectId: entry.projectId, checkpointCount: 1, latestCreatedAt: entry.createdAt });
+        latest.set(entry.projectId, entry); // Append order is commit order; timestamps do not choose a branch.
       }
+      for (const [projectId, entry] of latest) {
+        const manifest = await committedManifest(store, entry);
+        Object.assign(projects.get(projectId), projectFolderMetadata(manifest.sourceRoot), { latestCheckpointId: manifest.id });
+      }
+      assertTokenStillValid(token, store.state);
       sendJson(req, res, 200, { projects: [...projects.values()].sort((a, b) => a.projectId.localeCompare(b.projectId, 'en')) }); return;
     }
     if (pathname === '/v1/checkpoints' && req.method === 'GET') {
@@ -522,11 +542,9 @@ export async function createSyncServer(options = {}) {
       const id = routeId(checkpointMatch[1], validateId);
       const entry = store.state.checkpoints.find(item => item.id === id);
       if (!entry) throw problem(404, 'Not found');
-      const filename = path.join(store.checkpointDir, `${sha256(Buffer.from(id))}.json`);
-      await regularFile(filename);
-      const text = await fs.readFile(filename, 'utf8');
-      if (sha256(Buffer.from(text)) !== entry.manifestSha256) throw new Error('Checkpoint integrity error');
-      sendJson(req, res, 200, validateManifest(JSON.parse(text))); return;
+      const manifest = await committedManifest(store, entry);
+      assertTokenStillValid(token, store.state);
+      sendJson(req, res, 200, manifest); return;
     }
     const blobMatch = /^\/v1\/blobs\/([^/]+)$/.exec(pathname);
     if (blobMatch && (req.method === 'PUT' || req.method === 'GET')) {

@@ -1,4 +1,14 @@
+import path from 'node:path';
 import { assert, validateManifest, validateId, validateBlobHash, sha256, MAX_MANIFEST_BYTES, MAX_BLOB_BYTES, MAX_FILES, MAX_CHECKPOINT_BYTES } from './protocol.mjs';
+
+/** Display metadata only: a remote sourceRoot never authorizes a local path. */
+export function projectFolderMetadata(sourceRoot) {
+  assert(typeof sourceRoot === 'string' && sourceRoot.length > 0 && sourceRoot.length <= 4096 && sourceRoot.isWellFormed() && !/[\x00-\x1f\x7f]/.test(sourceRoot) && (path.posix.isAbsolute(sourceRoot) || /^[A-Za-z]:[\\/]/.test(sourceRoot) || /^\\\\[^\\]+\\[^\\]+/.test(sourceRoot)), 'Invalid project source root');
+  const paths = /^[A-Za-z]:[\\/]/.test(sourceRoot) || sourceRoot.startsWith('\\\\') ? path.win32 : path.posix;
+  const label = (paths.basename(sourceRoot) || 'project').normalize('NFC').slice(0, 200).replace(/[\uD800-\uDBFF]$/u, '');
+  assert(label.trim().length > 0, 'Invalid project folder label');
+  return { label, sourceRoot };
+}
 
 export function validateServerUrl(value) {
   const url = new URL(value);
@@ -110,7 +120,15 @@ export class SyncClient {
       assert(!seen.has(projectId), 'Duplicate cloud project'); seen.add(projectId);
       assert(Number.isSafeInteger(item.checkpointCount) && item.checkpointCount > 0 && item.checkpointCount <= 1_000_000, 'Invalid checkpoint count');
       validateTimestamp(item.latestCreatedAt);
-      return { projectId, checkpointCount: item.checkpointCount, latestCreatedAt: item.latestCreatedAt };
+      const metadata = {};
+      if (Object.hasOwn(item, 'label')) {
+        assert(typeof item.label === 'string' && item.label.trim().length > 0 && item.label.length <= 200 && item.label === item.label.normalize('NFC') && !/[\x00-\x1f\x7f]/.test(item.label), 'Invalid project label');
+        metadata.label = item.label;
+      }
+      if (Object.hasOwn(item, 'sourceRoot')) Object.assign(metadata, projectFolderMetadata(item.sourceRoot));
+      if (Object.hasOwn(item, 'label') && metadata.sourceRoot !== undefined) assert(metadata.label === item.label, 'Project label does not match its source folder');
+      if (Object.hasOwn(item, 'latestCheckpointId')) metadata.latestCheckpointId = validateId(item.latestCheckpointId);
+      return { projectId, checkpointCount: item.checkpointCount, latestCreatedAt: item.latestCreatedAt, ...metadata };
     }) };
   }
   async list(projectId) {

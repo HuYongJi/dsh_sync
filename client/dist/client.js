@@ -7,7 +7,7 @@ window.__ModuleLoader__.load({
 // Framework-free personal-sync state. Only the DSH Connection may carry requests.
 const RPC_CHANNEL = '/api';
 const RPC_PREFIX = 'dsh-personal-sync/';
-const CLIENT_ACTIONS = Object.freeze(['status', 'login', 'password', 'preferences', 'sync', 'logout', 'projects', 'checkpoints', 'restore', 'import', 'updatestatus', 'checkupdate', 'installupdate', 'cancelupdate']);
+const CLIENT_ACTIONS = Object.freeze(['status', 'login', 'password', 'preferences', 'sync', 'logout', 'projects', 'checkpoints', 'destinationpick', 'destinationbrowse', 'destinationselect', 'restore', 'import', 'updatestatus', 'checkupdate', 'installupdate', 'cancelupdate']);
 
 const MESSAGES = Object.freeze({
   BAD_SERVER: '服务器地址无效',
@@ -53,8 +53,13 @@ const MESSAGES = Object.freeze({
   UNSAVED_CHANGES: '请先保存或撤销更改',
   TIMEOUT: '请求超时，请刷新状态',
   REQUEST_FAILED: '请求失败，请刷新状态',
-  CLOUD_BROWSE_UNSUPPORTED: '云端不支持项目浏览，请手动输入项目 ID',
-  BAD_DESTINATION: '请输入 DSH Host 机器上的绝对路径',
+  CLOUD_BROWSE_UNSUPPORTED: '请更新同步服务器',
+  PROJECTS_PARTIAL: '部分项目读取失败',
+  DIRECTORY_PICKER_UNAVAILABLE: '此宿主不支持选择文件夹',
+  DIRECTORY_PICKER_FAILED: '文件夹选择失败',
+  DIRECTORY_PICKER_EXPIRED: '请重新选择文件夹',
+  DESTINATION_CHANGED: '目标目录已变更，请重新选择',
+  BAD_DESTINATION: '请选择有效目标文件夹',
   DESTINATION_EXISTS: '目标目录已存在，请选择全新目录',
   PROTECTED_DESTINATION: '目标目录受保护，不能下载到此处',
   CHECKPOINT_MISMATCH: '检查点与项目不匹配，请重新选择',
@@ -153,16 +158,41 @@ function requiredDate(value) {
   return value;
 }
 
-/** New remote surfaces retain no names, manifests, credentials or arbitrary error text. */
+/** Only validated folder labels and public metadata survive the Host boundary. */
 function parseCloudProjects(value) {
-  if (!isRecord(value) || !Array.isArray(value.projects) || value.projects.length > 20000) fail('INVALID_RESPONSE');
+  if (!isRecord(value) || !Array.isArray(value.projects) || value.projects.length > 20000 || ['partial', 'legacy'].some(key => value[key] !== undefined && typeof value[key] !== 'boolean')) fail('INVALID_RESPONSE');
   const ids = new Set();
   return freeze(value.projects.map(item => {
     if (!isRecord(item) || !validId(item.projectId) || ids.has(item.projectId) || !integer(item.checkpointCount)) fail('INVALID_RESPONSE');
     ids.add(item.projectId);
     const latestCreatedAt = item.latestCreatedAt === null && item.checkpointCount === 0 ? null : requiredDate(item.latestCreatedAt);
-    return freeze({ projectId: item.projectId, checkpointCount: item.checkpointCount, latestCreatedAt });
+    if ((item.label !== undefined && !text(item.label, 1024, false)) || (item.sourceRoot !== undefined && !absolutePath(item.sourceRoot))) fail('INVALID_RESPONSE');
+    return freeze({ projectId: item.projectId, checkpointCount: item.checkpointCount, latestCreatedAt,
+      ...(item.label === undefined ? {} : { label: item.label }), ...(item.sourceRoot === undefined ? {} : { sourceRoot: item.sourceRoot }) });
   }));
+}
+function parseDestination(value) {
+  if (!isRecord(value) || !validId(value.id) || !absolutePath(value.root) || !absolutePath(value.parent) || value.root === value.parent) fail('INVALID_RESPONSE');
+  return freeze({ id: value.id, root: value.root, parent: value.parent });
+}
+function parseDirectoryBrowser(value) {
+  if (!isRecord(value) || !validId(value.id) || !absolutePath(value.path) || !validId(value.currentId) || typeof value.selectable !== 'boolean' || typeof value.truncated !== 'boolean') fail('INVALID_RESPONSE');
+  const rows = (items, cap) => {
+    if (!Array.isArray(items) || items.length > cap) fail('INVALID_RESPONSE');
+    const ids = new Set();
+    return freeze(items.map(item => {
+      if (!isRecord(item) || !validId(item.id) || ids.has(item.id) || !text(item.label, 1024, false)) fail('INVALID_RESPONSE');
+      ids.add(item.id); return freeze({ id: item.id, label: item.label });
+    }));
+  };
+  return freeze({ id: value.id, path: value.path, currentId: value.currentId, crumbs: rows(value.crumbs, 256), directories: rows(value.directories, 2000), selectable: value.selectable, truncated: value.truncated });
+}
+function parseDestinationReply(value, action) {
+  if (!isRecord(value) || (value.cancelled !== undefined && value.cancelled !== true) || ['cancelled', 'destination', 'browser'].filter(key => Object.hasOwn(value, key)).length !== 1) fail('INVALID_RESPONSE');
+  if (value.cancelled === true && action === 'destinationpick') return freeze({ cancelled: true });
+  if (value.destination !== undefined && action !== 'destinationbrowse') return freeze({ destination: parseDestination(value.destination) });
+  if (value.browser !== undefined && action !== 'destinationselect') return freeze({ browser: parseDirectoryBrowser(value.browser) });
+  fail('INVALID_RESPONSE');
 }
 function parseCheckpoints(value, projectId) {
   if (!validId(projectId) || !isRecord(value) || !Array.isArray(value.checkpoints) || value.checkpoints.length > 20000 || !Array.isArray(value.heads)) fail('INVALID_RESPONSE');
@@ -233,8 +263,10 @@ function parseUpdateStatus(value) {
   return freeze(result);
 }
 
+const destinationAction = action => ['destinationpick', 'destinationbrowse', 'destinationselect'].includes(action);
+const clearedDestination = cloud => freeze({ ...cloud, destination: '', destinationId: '', directoryBrowser: null, intent: null });
 function newCloud() {
-  return freeze({ binding: null, projects: freeze([]), projectId: '', checkpoints: freeze([]), heads: freeze([]), checkpointId: '', destination: '', loaded: false, browseUnsupported: false, error: null, intent: null });
+  return clearedDestination({ binding: null, projects: freeze([]), projectsLoaded: false, partial: false, legacy: false, projectId: '', checkpoints: freeze([]), heads: freeze([]), checkpointId: '', loaded: false, browseUnsupported: false, error: null });
 }
 
 /** Allowlist the public contract. Extra fields (including credentials) are discarded. */
@@ -329,7 +361,7 @@ function filterProjects(projects, search = '') {
 
 function deriveView(state) {
   const status = state.status;
-  const locked = !state.ready || state.loading || state.refreshing || Boolean(state.busy);
+  const locked = !state.ready || state.loading || state.refreshing || Boolean(state.busy) || Boolean(state.cloud?.directoryBrowser);
   // Preferences/logout are safety controls: Host aborts and joins active work before committing them.
   const recovering = status?.recovery?.state === 'running' || Boolean(state.recoveryPending);
   const updater = state.update ?? status?.update;
@@ -343,12 +375,15 @@ function deriveView(state) {
   const canRecover = canBrowse && !status.running && !recovering && !state.scheduled && !state.conflict && !state.dirty;
   const selectedAvailable = status?.projects.filter(project => project.selected && project.available).length ?? 0;
   return freeze({ locked, editable, recovering, canBrowse, canRecover, updaterBusy, restartRequired, updateBlocked,
+    pickingDestination: destinationAction(state.busy) || Boolean(state.cloud?.directoryBrowser),
     updateError: state.updateError?.message ?? (updater?.errorCode ? MESSAGES[updater.errorCode] : ''),
     canCheckUpdate: !locked && !updateBlocked && updater?.supported !== false && updater?.state !== 'checking',
     canUpdate: !locked && !updateBlocked && !state.updateError && !recovering && !status?.running && !state.scheduled && !state.dirty && !state.conflict && updater?.supported === true && updater.state === 'available' && Boolean(updater.candidate),
     // A local read must not hide cancellation; cancellation invalidates the read before writing.
     canCancelUpdate: !state.busy && updateRunning(updater) && updater.state !== 'cancelling' && updater.errorCode !== 'UPDATE_CANCEL_TOO_LATE' && state.updateError?.code !== 'UPDATE_CANCEL_TOO_LATE' && Boolean(state.updatePendingId && state.updatePendingId === updater.requestId),
+    canChooseDestination: canRecover && Boolean(state.cloud?.checkpointId),
     canRestore: canRecover && Boolean(state.cloud?.checkpointId && absolutePath(state.cloud.destination)),
+    canRestoreDestination: canRecover && Boolean(state.cloud?.checkpointId && validId(state.cloud.destinationId) && absolutePath(state.cloud.destination)),
     canImport: canRecover && status?.recovery?.kind === 'restore' && status.recovery.state === 'succeeded' && status.recovery.sessionCount !== 0,
     recoveryError: status?.recovery?.errorCode ? MESSAGES[status.recovery.errorCode] : '',
     canLogin: !locked && !status?.running && !recovering && !updateBlocked, canLogout: !locked && !updaterBusy && Boolean(status?.loggedIn),
@@ -380,9 +415,20 @@ function createController(connection, options = {}) {
   let observedWork = false;
   let uncertainChecks = 0;
   let updateUncertainChecks = 0;
+  let destinationAbort;
+  let destinationGeneration = 0;
+  const invalidateDestinationRequest = () => { ++destinationGeneration; destinationAbort?.abort(); destinationAbort = undefined; };
   const update = patch => {
     if (disposed) return;
-    state = freeze({ ...state, ...patch });
+    const next = { ...state, ...patch };
+    const identityChanged = state.status && (!sameBinding(state.status, next.status) || state.status.loggedIn !== next.status?.loggedIn);
+    const runtimeChanged = state.update && next.update && state.update.currentVersion !== next.update.currentVersion;
+    if (identityChanged || runtimeChanged || deriveView(state).updateBlocked !== deriveView(next).updateBlocked) {
+      invalidateDestinationRequest();
+      next.cloud = clearedDestination(next.cloud);
+      if (destinationAction(next.busy)) next.busy = null;
+    }
+    state = freeze(next);
     for (const listener of listeners) listener();
   };
   const clearPoll = () => { if (pollTimer !== undefined) clearTimer(pollTimer); pollTimer = undefined; };
@@ -489,7 +535,7 @@ function createController(connection, options = {}) {
     }
   }
   async function refresh({ discardDraft = state.conflict } = {}) {
-    if (disposed || state.busy) return false;
+    if (disposed || (state.busy && !destinationAction(state.busy))) return false;
     clearPoll();
     invalidateRefresh();
     const current = generation;
@@ -515,7 +561,7 @@ function createController(connection, options = {}) {
   }
   function report(error) { update({ error: publicError(error), notice: '' }); return false; }
   function guardAction(action) {
-    if (disposed || !state.ready || state.busy || state.loading || state.refreshing) return false;
+    if (disposed || !state.ready || state.busy || state.loading || state.refreshing || state.cloud.directoryBrowser) return false;
     const view = deriveView(state);
     if (view.updaterBusy) return report(new SettingsClientError('BUSY'));
     if (view.restartRequired && action !== 'logout') return report(new SettingsClientError('UPDATE_RESTART_REQUIRED'));
@@ -611,13 +657,13 @@ function createController(connection, options = {}) {
     invalidateRefresh(); clearPoll();
     const abort = new AbortController(); active = abort;
     if (action === 'projects') update({ cloud: freeze({ ...newCloud(), binding }) });
-    else cloudUpdate({ binding, checkpoints: freeze([]), heads: freeze([]), checkpointId: '', loaded: false, intent: null, error: null });
+    else cloudUpdate({ ...clearedDestination(state.cloud), binding, checkpoints: freeze([]), heads: freeze([]), checkpointId: '', loaded: false, error: null });
     update({ busy: action });
     let needsStatus = false;
     try {
       const result = await withDeadline(action, action === 'projects' ? binding : { ...binding, projectId }, abort);
       if (disposed || !sameBinding(state.status, binding)) return false;
-      if (action === 'projects') cloudUpdate({ projects: parseCloudProjects(result) });
+      if (action === 'projects') cloudUpdate({ projects: parseCloudProjects(result), projectsLoaded: true, partial: result.partial === true, legacy: result.legacy === true });
       else cloudUpdate({ ...parseCheckpoints(result, projectId), loaded: true });
       return true;
     } catch (error) {
@@ -632,6 +678,62 @@ function createController(connection, options = {}) {
     } finally {
       active = undefined;
       if (!disposed) { update({ busy: null }); if (needsStatus) await refresh(); else queuePoll(); }
+    }
+  }
+  function closeDestinationBrowser() {
+    invalidateDestinationRequest();
+    update({ ...(destinationAction(state.busy) ? { busy: null } : {}), cloud: freeze({ ...state.cloud, directoryBrowser: null, intent: null }) });
+    queuePoll();
+  }
+  async function destinationRequest(action, nodeId) {
+    if (disposed) return false;
+    const browser = state.cloud.directoryBrowser;
+    const view = deriveView({ ...state, cloud: { ...state.cloud, directoryBrowser: null } });
+    if (!view.canChooseDestination || (action !== 'destinationpick' && !browser)) return false;
+    let binding, payload;
+    const { projectId, checkpointId } = state.cloud;
+    try {
+      binding = validateBinding(state.status, state.cloud.binding);
+      if (!state.cloud.checkpoints.some(item => item.id === checkpointId && item.projectId === projectId)) fail('CHECKPOINT_MISMATCH');
+      if (action === 'destinationpick') payload = { ...binding, projectId, checkpointId };
+      else {
+        if (!validId(nodeId) || ![browser.currentId, ...browser.crumbs.map(item => item.id), ...browser.directories.map(item => item.id)].includes(nodeId)) fail('DIRECTORY_PICKER_EXPIRED');
+        if (action === 'destinationselect' && (!browser.selectable || nodeId !== browser.currentId)) fail('BAD_DESTINATION');
+        payload = { ...binding, browserId: browser.id, nodeId };
+      }
+    } catch (error) { return cloudReport(error); }
+    invalidateRefresh(); clearPoll(); invalidateDestinationRequest();
+    const current = destinationGeneration;
+    const runtime = state.update?.currentVersion;
+    const abort = new AbortController(); destinationAbort = abort;
+    update({ busy: action, refreshing: false, cloud: freeze({ ...state.cloud, intent: null, error: null }) });
+    const live = () => !disposed && current === destinationGeneration && sameBinding(state.status, binding) && state.status.loggedIn && state.cloud.projectId === projectId && state.cloud.checkpointId === checkpointId && state.update?.currentVersion === runtime && !deriveView(state).updateBlocked;
+    let needsStatus = false;
+    try {
+      const reply = await withDeadline(action, payload, abort);
+      if (!live()) return false;
+      const result = parseDestinationReply(reply, action);
+      if (result.cancelled) return false;
+      if (result.browser) {
+        if (action === 'destinationbrowse' && result.browser.id !== browser.id) fail('INVALID_RESPONSE');
+        cloudUpdate({ directoryBrowser: result.browser });
+      } else cloudUpdate({ destinationId: result.destination.id, destination: result.destination.root, directoryBrowser: null });
+      return true;
+    } catch (error) {
+      if (live()) {
+        const safe = publicError(error);
+        if (['ACCOUNT_MISMATCH', 'CONFIG_CONFLICT', 'NOT_LOGGED_IN'].includes(safe.code)) {
+          update({ cloud: newCloud() }); needsStatus = true;
+        } else if (['DIRECTORY_PICKER_EXPIRED', 'DESTINATION_CHANGED', 'CHECKPOINT_MISMATCH', 'INVALID_RESPONSE'].includes(safe.code)) cloudUpdate(clearedDestination(state.cloud));
+        cloudUpdate({ error: safe, intent: null });
+      }
+      return false;
+    } finally {
+      if (!disposed && current === destinationGeneration) {
+        destinationAbort = undefined;
+        update({ busy: null });
+        if (needsStatus) await refresh(); else queuePoll();
+      }
     }
   }
   function requestId() {
@@ -658,7 +760,8 @@ function createController(connection, options = {}) {
         const cloud = state.cloud;
         if (!cloud.checkpoints.some(item => item.id === cloud.checkpointId && item.projectId === cloud.projectId)) fail('CHECKPOINT_MISMATCH');
         if (!absolutePath(cloud.destination)) fail('BAD_DESTINATION');
-        fields = { projectId: cloud.projectId, checkpointId: cloud.checkpointId, destination: cloud.destination };
+        fields = { projectId: cloud.projectId, checkpointId: cloud.checkpointId, destination: cloud.destination,
+          ...(cloud.destinationId ? { destinationId: cloud.destinationId } : {}) };
       } else {
         if (!deriveView(state).canImport) fail('RECOVERY_UNAVAILABLE');
         fields = { restoreId: state.status.recovery.id, root: state.status.recovery.root };
@@ -678,8 +781,9 @@ function createController(connection, options = {}) {
       const binding = validateBinding(state.status, intent);
       if (!validRequestId(intent.requestId)) fail('BAD_REQUEST_ID');
       if (intent.kind === 'restore') {
-        if (intent.projectId !== state.cloud.projectId || intent.checkpointId !== state.cloud.checkpointId || intent.destination !== state.cloud.destination || !state.cloud.checkpoints.some(item => item.id === intent.checkpointId)) fail('CHECKPOINT_MISMATCH');
-        payload = { ...binding, projectId: intent.projectId, checkpointId: intent.checkpointId, destination: intent.destination, confirm: true, requestId: intent.requestId };
+        if (intent.projectId !== state.cloud.projectId || intent.checkpointId !== state.cloud.checkpointId || intent.destination !== state.cloud.destination || (intent.destinationId ?? '') !== state.cloud.destinationId || !state.cloud.checkpoints.some(item => item.id === intent.checkpointId)) fail('CHECKPOINT_MISMATCH');
+        payload = { ...binding, projectId: intent.projectId, checkpointId: intent.checkpointId,
+          ...(intent.destinationId ? { destinationId: intent.destinationId } : { destination: intent.destination }), confirm: true, requestId: intent.requestId };
       } else {
         if (!deriveView(state).canImport || intent.restoreId !== state.status.recovery.id || intent.root !== state.status.recovery.root) fail('RECOVERY_UNAVAILABLE');
         payload = { ...binding, restoreId: intent.restoreId, confirm: true, requestId: intent.requestId };
@@ -702,9 +806,9 @@ function createController(connection, options = {}) {
     } catch (error) {
       if (!disposed) {
         const safe = publicError(error);
-        const rejected = ['BAD_REQUEST', 'BAD_DESTINATION', 'DESTINATION_EXISTS', 'PROTECTED_DESTINATION', 'CHECKPOINT_MISMATCH', 'RECOVERY_UNAVAILABLE', 'RECOVERY_LIMIT', 'CONFIG_CONFLICT', 'ACCOUNT_MISMATCH', 'NOT_LOGGED_IN', 'BUSY', 'AUTH_REQUIRED', 'FORBIDDEN', 'NOT_DEPLOYED', 'RATE_LIMITED'].includes(safe.code);
+        const rejected = ['BAD_REQUEST', 'BAD_DESTINATION', 'DESTINATION_EXISTS', 'PROTECTED_DESTINATION', 'DIRECTORY_PICKER_EXPIRED', 'DESTINATION_CHANGED', 'CHECKPOINT_MISMATCH', 'RECOVERY_UNAVAILABLE', 'RECOVERY_LIMIT', 'CONFIG_CONFLICT', 'ACCOUNT_MISMATCH', 'NOT_LOGGED_IN', 'BUSY', 'AUTH_REQUIRED', 'FORBIDDEN', 'NOT_DEPLOYED', 'RATE_LIMITED'].includes(safe.code);
         update({ recoveryPending: rejected ? null : intent, recoveryUncertain: !rejected });
-        cloudUpdate({ error: rejected ? safe : publicError(new SettingsClientError('RECOVERY_UNCERTAIN')) });
+        cloudUpdate({ ...(['DIRECTORY_PICKER_EXPIRED', 'DESTINATION_CHANGED'].includes(safe.code) ? clearedDestination(state.cloud) : {}), error: rejected ? safe : publicError(new SettingsClientError('RECOVERY_UNCERTAIN')) });
         if (['CONFIG_CONFLICT', 'ACCOUNT_MISMATCH', 'NOT_LOGGED_IN'].includes(safe.code)) update({ cloud: newCloud() });
       }
     } finally {
@@ -720,7 +824,7 @@ function createController(connection, options = {}) {
   }
   const updateReport = error => { update({ updateError: publicError(error), updateIntent: null }); return false; };
   async function refreshUpdate() {
-    if (disposed || state.busy) return false;
+    if (disposed || (state.busy && !destinationAction(state.busy))) return false;
     clearPoll(); invalidateRefresh();
     const current = generation;
     const abort = new AbortController(); refreshAbort = abort;
@@ -818,18 +922,24 @@ function createController(connection, options = {}) {
     cancelUpdateIntent() { update({ updateIntent: null }); },
     browseProjects: () => browse('projects'),
     loadCheckpoints: () => browse('checkpoints'),
+    chooseDestination: () => destinationRequest('destinationpick'),
+    browseDestination: nodeId => destinationRequest('destinationbrowse', nodeId),
+    selectDestination: (nodeId = state.cloud.directoryBrowser?.currentId) => destinationRequest('destinationselect', nodeId),
+    closeDestinationBrowser,
     setCloudProject(projectId) {
       if (!cloudEditable() || !text(projectId, 100)) return false;
-      cloudUpdate({ binding: bindingOf(state.status), projectId, checkpoints: freeze([]), heads: freeze([]), checkpointId: '', loaded: false, intent: null, error: null });
+      invalidateDestinationRequest();
+      cloudUpdate({ ...clearedDestination(state.cloud), binding: bindingOf(state.status), projectId, checkpoints: freeze([]), heads: freeze([]), checkpointId: '', loaded: false, error: null });
       return true;
     },
     selectCheckpoint(id) {
       if (!cloudEditable() || (id !== '' && !state.cloud.checkpoints.some(item => item.id === id))) return false;
-      cloudUpdate({ checkpointId: id, intent: null, error: null }); return true;
+      invalidateDestinationRequest();
+      cloudUpdate({ ...clearedDestination(state.cloud), checkpointId: id, error: null }); return true;
     },
     setDestination(destination) {
       if (!cloudEditable() || !text(destination, 4096)) return false;
-      cloudUpdate({ destination, intent: null, error: null }); return true;
+      cloudUpdate({ destination, destinationId: '', directoryBrowser: null, intent: null, error: null }); return true;
     },
     prepareRestore: () => prepareRecovery('restore'),
     prepareImport: () => prepareRecovery('import'),
@@ -847,6 +957,7 @@ function createController(connection, options = {}) {
         if (ended) return;
         ended = true;
         if (--watchers === 0) {
+          closeDestinationBrowser();
           clearPoll();
           invalidateRefresh();
           update({ refreshing: false, loading: !state.status, updateIntent: null });
@@ -920,6 +1031,7 @@ function createController(connection, options = {}) {
       clearPoll();
       invalidateRefresh();
       active?.abort();
+      invalidateDestinationRequest();
       listeners.clear();
       state = freeze({ ...state, busy: null, refreshing: false });
     },
@@ -991,6 +1103,7 @@ function createClientPlugin(require) {
       const unsubscribe = controller.subscribe(() => {
         const next = controller.getSnapshot();
         if (!sameIdentity(next.status, previous.status) || next.status?.loggedIn !== previous.status?.loggedIn || next.busy !== previous.busy || deriveView(next).updateBlocked !== deriveView(previous).updateBlocked) clearSecrets();
+        if (!sameIdentity(next.status, previous.status) || next.status?.loggedIn !== previous.status?.loggedIn || next.update?.currentVersion !== previous.update?.currentVersion || deriveView(next).updateBlocked !== deriveView(previous).updateBlocked) setCloudOpen(false);
         previous = next;
         if (passwordBinding.current && !sameIdentity(next.status, passwordBinding.current)) closePassword();
       });
@@ -1034,7 +1147,7 @@ function createClientPlugin(require) {
     };
     const blurSecrets = event => { if (!event.currentTarget.contains(event.relatedTarget)) clearSecrets(); };
     const openProjects = () => {
-      if (!controller.getSnapshot().status || deriveView(controller.getSnapshot()).updateBlocked) return;
+      if (!controller.getSnapshot().status || deriveView(controller.getSnapshot()).updateBlocked || deriveView(controller.getSnapshot()).pickingDestination) return;
       clearSecrets();
       setSearch('');
       setProjectManagerOpen(true);
@@ -1054,13 +1167,19 @@ function createClientPlugin(require) {
       if (!deriveView(controller.getSnapshot()).canBrowse) return;
       clearSecrets(); setCloudOpen(true); void controller.browseProjects();
     };
-    const closeCloud = () => { setCloudOpen(false); controller.cancelRecoveryIntent(); };
+    const closeCloud = () => { setCloudOpen(false); controller.closeDestinationBrowser(); controller.cancelRecoveryIntent(); };
     const cloud = state.cloud;
     const intent = cloud.intent;
     const recovery = status?.recovery;
     const updater = state.update;
     const updateIntent = state.updateIntent;
-    const updateLabel = state.updateUncertain ? '结果未确认' : state.busy === 'checkupdate' ? '检查中…' : ({ idle: '尚未检查', checking: '检查中…', available: '有新版本', 'up-to-date': '已是最新版本', installing: '原生安装中…', cancelling: '正在请求取消…', 'restart-required': '待重启 DSH', cancelled: '已取消（非回滚）', failed: '更新未完成', uncertain: '结果未确认' }[updater?.state] ?? '尚未检查');
+    const installing = ['installing', 'cancelling'].includes(updater?.state) || ['installupdate', 'cancelupdate'].includes(state.busy);
+    const updateLabel = state.updateUncertain ? '结果未确认' : state.busy === 'checkupdate' ? '检查中…' : ({ idle: '尚未检查', checking: '检查中…', available: '有新版本', 'up-to-date': '已是最新版本', installing: '更新中…', cancelling: '更新中…', 'restart-required': '待重启', cancelled: '已取消', failed: '更新未完成', uncertain: '结果未确认' }[updater?.state] ?? '尚未检查');
+    const manualUpdate = updater?.state === 'available' && Boolean(updater.candidate) && !state.updateError;
+    const updateAction = installing ? '更新中…' : view.restartRequired ? '待重启' : manualUpdate ? '手动更新' : '检查更新';
+    const projectLabel = project => project?.label ?? status?.projects.find(item => item.projectId === project?.projectId)?.label ?? '项目文件夹';
+    const selectedCloudProject = cloud.projects.find(project => project.projectId === cloud.projectId) ?? { projectId: cloud.projectId };
+    const directoryBrowser = cloud.directoryBrowser;
     const projects = filterProjects(status?.projects ?? [], search);
     const checkedIds = new Set(state.draft.projectIds);
     const selectedProjects = (status?.projects ?? []).filter(project => checkedIds.has(project.id));
@@ -1068,15 +1187,15 @@ function createClientPlugin(require) {
     const passwordOpen = sameIdentity(status, passwordIdentity) && passwordBinding.current === passwordIdentity;
     const body = (content, extra = {}) => h('p', { style: styles.body, ...extra }, content);
     const recoveryResult = recovery && h('div', { style: styles.form, role: 'status', 'aria-live': 'polite', 'data-personal-sync': 'recovery-result' },
-      body(`${recovery.kind === 'restore' ? '下载' : '导入'}${recovery.state === 'running' ? '进行中…（Host 后台运行，可关闭页面）' : recovery.state === 'succeeded' ? '完成' : '未完成'}`),
+      body(`${recovery.kind === 'restore' ? '下载' : '导入'}${recovery.state === 'running' ? '进行中…' : recovery.state === 'succeeded' ? '完成' : '未完成'}`),
       body(recovery.root, { style: styles.root }),
-      recovery.kind === 'restore' && recovery.sessionCount !== undefined && body(`会话归档 ${recovery.sessionCount} 个；归档不等于可续接会话`),
+      recovery.kind === 'restore' && recovery.sessionCount !== undefined && body(`会话归档 ${recovery.sessionCount} 个`),
       recovery.kind === 'import' && body(`已导入 ${recovery.importedCount ?? '未确认'} · 已跳过 ${recovery.skippedCount ?? '未确认'} · 失败 ${recovery.failedCount ?? '未确认'}`),
       view.recoveryError && body(view.recoveryError, { role: 'alert', style: { ...styles.body, ...styles.warning } }),
-      recovery.state === 'failed' && body(recovery.kind === 'restore' ? '目录可能不完整，勿作为完整副本使用；请检查后使用新目录。' : '部分会话可能已写入，请检查下方结果，勿重复导入。', { style: { ...styles.body, ...styles.warning } }),
+      recovery.state === 'failed' && body(recovery.kind === 'restore' ? '目录可能不完整，请使用新目录重试' : '部分会话可能已写入，勿重复导入', { style: { ...styles.body, ...styles.warning } }),
       recovery.sessions?.length > 0 && h('div', { style: styles.list, 'aria-label': '会话导入结果' }, ...recovery.sessions.map(item => h('div', { key: item.sourceId, style: styles.project },
         body(`${item.sourceId} → ${item.sessionId ?? '无新会话 ID'} · ${{ imported: '已导入', skipped: '已跳过', failed: '失败' }[item.outcome]}`),
-        item.workspaceAttached === false && body('未关联工作区；请按会话 ID 手动检查，勿重复导入。', { style: { ...styles.body, ...styles.warning } })) )));
+        item.workspaceAttached === false && body('未关联工作区，勿重复导入', { style: { ...styles.body, ...styles.warning } })) )));
     return h('section', { style: styles.page, 'aria-label': '个人云同步', 'aria-busy': state.loading || state.refreshing || Boolean(state.busy), 'data-personal-sync': 'settings' },
       h('div', { style: styles.between },
         h('h2', { style: { ...styles.heading, fontSize: 18 } }, '个人云同步'),
@@ -1084,25 +1203,6 @@ function createClientPlugin(require) {
           onClick: () => { clearSecrets(); void controller.refresh(); } }, state.refreshing ? '刷新中…' : state.conflict ? '刷新并重新选择' : '刷新')),
       state.error && !passwordOpen && !projectManagerOpen && h('div', { role: 'alert', style: { ...styles.card, ...styles.error }, 'data-personal-sync': 'error' }, state.error.message),
       state.notice && body(state.notice, { role: 'status', 'aria-live': 'polite' }),
-      h('section', { style: styles.card, 'aria-labelledby': `${id}-update-title`, 'data-personal-sync': 'update-summary' },
-        h('div', { style: styles.between },
-          h('h3', { id: `${id}-update-title`, style: styles.heading }, '插件更新'),
-          h('span', { style: styles.badge, role: 'status', 'aria-live': 'polite' }, updater?.supported === false ? '此宿主不可用' : updateLabel)),
-        body(`运行版本 ${updater?.currentVersion ?? '未确认'}`),
-        updater?.installedVersion && updater.installedVersion !== updater.currentVersion && body(`已安装 ${updater.installedVersion} · 待重启`),
-        body('固定来源：GitHub HuYongJi/dsh_sync（仓库发布版本）；仅点击检查时访问 GitHub，无需云账号登录。'),
-        updater?.candidate && body(`目标版本 ${updater.candidate.version} · 提交 ${updater.candidate.commit}`, { style: styles.root }),
-        view.updaterBusy && body('更新器忙碌；其他设置、登录、密码、上传和恢复操作已锁定。Host 后台运行，可关闭页面。', { role: 'status' }),
-        (view.restartRequired || state.updateUncertain) && body('插件文件可能已变更；确认安装结束后，必须重启 DSH 再刷新页面（仅刷新无效）。不会自动重启；重启前禁止同步、恢复、导入和修改设置。', { style: { ...styles.body, ...styles.warning } }),
-        state.updateUncertain && body('更新结果未确认，不会自动重装；自动核对次数有限，之后请手动核对更新状态并检查 DSH Plugins。', { role: 'alert', style: { ...styles.body, ...styles.warning } }),
-        view.updateError && body(view.updateError, { role: 'alert', style: { ...styles.body, ...styles.warning } }),
-        body('使用 DSH 原生插件管理器；脚本可能需要在 DSH Plugins 手动审批，兼容性与安全检查不会绕过。'),
-        (state.dirty || state.conflict) && body('更新前请先保存或撤销同步设置更改。'),
-        h('div', { style: styles.row },
-          h(Button, { type: 'button', variant: 'outline', disabled: !view.canCheckUpdate, onClick: () => { clearSecrets(); void controller.checkUpdate(); } }, '检查更新'),
-          h(Button, { type: 'button', variant: 'primary', disabled: !view.canUpdate, onClick: () => { clearSecrets(); controller.prepareUpdate(); } }, '一键更新'),
-          h(Button, { type: 'button', variant: 'ghost', disabled: Boolean(state.busy) || state.refreshing, onClick: () => { void controller.refreshUpdate(); } }, '核对更新状态'),
-          (view.updaterBusy || state.busy === 'installupdate' || state.busy === 'cancelupdate') && h(Button, { type: 'button', variant: 'outline', disabled: !view.canCancelUpdate, onClick: () => { void controller.cancelUpdate(); } }, '取消更新'))),
       h('section', { style: styles.card, 'aria-labelledby': `${id}-account-title` },
         h('div', { style: styles.between },
           h('h3', { id: `${id}-account-title`, style: styles.heading }, '账号'),
@@ -1140,7 +1240,7 @@ function createClientPlugin(require) {
               : status && body(status.projects.length ? '暂未选择项目' : '暂无项目'),
             selectedProjects.length > 3 && body(`另有 ${selectedProjects.length - 3} 个项目`),
             state.dirty && h('span', { style: styles.body, role: 'status' }, '未保存')),
-          h(Button, { type: 'button', variant: 'outline', disabled: !status || view.updateBlocked, onClick: openProjects }, '管理'))),
+          h(Button, { type: 'button', variant: 'outline', disabled: !status || view.updateBlocked || view.pickingDestination, onClick: openProjects }, '管理'))),
       h('section', { style: styles.card, 'aria-labelledby': `${id}-cloud-title`, 'data-personal-sync': 'cloud-summary' },
         h('div', { style: styles.between },
           h('h3', { id: `${id}-cloud-title`, style: styles.heading }, '云端下载'),
@@ -1148,9 +1248,8 @@ function createClientPlugin(require) {
             h(Button, { type: 'button', variant: 'outline', disabled: !view.canBrowse, onClick: openCloud }, '浏览云端'),
             recovery?.kind === 'restore' && recovery.state === 'succeeded' && h(Button, { type: 'button', variant: 'outline', disabled: !view.canImport,
               onClick: () => { clearSecrets(); controller.prepareImport(); } }, '导入安全会话'))),
-        !recovery && body('下载到 Host 全新目录，不会自动加入同步项目。'),
-        recoveryResult,
-        state.recoveryUncertain && body('请求结果未确认，请刷新状态；先检查目标目录和会话 ID，勿重复下载或导入，也勿通过重新登录或重启来重试。', { role: 'alert', style: { ...styles.body, ...styles.warning } }),
+        !cloudOpen && recoveryResult,
+        state.recoveryUncertain && !cloudOpen && body('结果未确认，请刷新；勿重复提交', { role: 'alert', style: { ...styles.body, ...styles.warning } }),
         cloud.error && !cloudOpen && h('div', { role: 'alert', style: styles.error }, cloud.error.message)),
       h('section', { style: styles.card, 'aria-labelledby': `${id}-status-title` },
         h('div', { style: styles.between },
@@ -1170,67 +1269,79 @@ function createClientPlugin(require) {
           h(Button, { type: 'button', variant: 'ghost', disabled: !view.editable || !state.dirty, onClick: () => controller.discardChanges() }, '撤销更改'),
           h(Button, { type: 'button', variant: 'outline', disabled: !view.canSync, 'aria-busy': state.busy === 'sync',
             onClick: () => { clearSecrets(); void controller.sync(); } }, state.busy === 'sync' ? '提交中…' : '立即同步'))),
+      h('section', { style: styles.card, 'aria-labelledby': `${id}-update-title`, 'data-personal-sync': 'update-summary' },
+        h('div', { style: styles.between },
+          h('div', { style: styles.summary },
+            h('h3', { id: `${id}-update-title`, style: styles.heading }, '插件更新'),
+            h('span', { style: styles.body, role: 'status', 'aria-live': 'polite' }, `当前版本 ${updater?.currentVersion ?? '未确认'} · ${updater?.supported === false ? '此宿主不可用' : updateLabel}`)),
+          h(Button, { type: 'button', variant: 'primary', disabled: installing || view.restartRequired || (manualUpdate ? !view.canUpdate : !view.canCheckUpdate),
+            onClick: () => { clearSecrets(); if (manualUpdate) controller.prepareUpdate(); else void controller.checkUpdate(); } }, updateAction)),
+        view.restartRequired && !installing && body('请重启 DSH', { role: 'status' }),
+        view.updateError && body(view.updateError, { role: 'alert', style: { ...styles.body, ...styles.warning } }),
+        (state.dirty || state.conflict) && body('请先保存或撤销更改')),
       h(Modal, { open: Boolean(updateIntent), onClose: () => controller.cancelUpdateIntent(), title: '确认更新插件？', closeLabel: '取消' },
         updateIntent && h('div', { style: styles.form },
-          body(`运行版本 ${updateIntent.currentVersion} → 目标版本 ${updateIntent.version}`),
-          body('来源：GitHub HuYongJi/dsh_sync；仅安装本次检查确认的精确提交。'),
-          body(`提交 ${updateIntent.commit}`, { style: styles.root }),
-          body('由 DSH 原生插件管理器安装，不更新云同步服务器，不自动重启，也不会自动启用同步。'),
-          body('原生安装可能需要脚本审批，请在 DSH Plugins 中手动检查。保留兼容性、安全检查和原生审批，不会自动授权或添加版本豁免。'),
-          body('安装开始后即使失败或取消，文件也可能已变更；结束后必须重启 DSH 再刷新页面（仅刷新无效）。取消不保证回滚。', { style: { ...styles.body, ...styles.warning } }),
+          body(`${updateIntent.currentVersion} → ${updateIntent.version}`),
+          body('更新后需重启 DSH'),
           h('div', { style: styles.row },
             h(Button, { type: 'button', variant: 'ghost', onClick: () => controller.cancelUpdateIntent() }, '取消'),
             h(Button, { type: 'button', variant: 'primary', disabled: !view.canUpdate, onClick: () => { void controller.confirmUpdate(updateIntent); } }, '确认更新')))),
       h(Modal, { open: cloudOpen, onClose: closeCloud, title: '云端下载', closeLabel: '关闭' },
         cloudOpen && h('div', { style: styles.form },
-          body('云端仅提供项目 ID；名称来自本机已知项目。请选择明确检查点，不会自动选择分支。'),
-          cloud.projects.length > 0 && h('div', { style: styles.list, 'aria-label': '云端项目' }, ...cloud.projects.map(project => {
-            const local = status?.projects.find(item => item.projectId === project.projectId);
-            return h('div', { key: project.projectId, style: styles.project },
-              h(Button, { type: 'button', variant: 'ghost', disabled: !view.canBrowse || Boolean(state.recoveryPending), onClick: () => {
-                if (controller.setCloudProject(project.projectId)) void controller.loadCheckpoints();
-              } }, `${project.projectId}${local ? ` · ${local.label}` : ''}`),
-              body(`${project.checkpointCount} 个检查点 · ${when(project.latestCreatedAt)}`));
-          })),
-          h('label', { style: styles.label, htmlFor: `${id}-cloud-project` }, '项目 ID（可手动输入，无需项目浏览支持）',
-            h(Input, { id: `${id}-cloud-project`, value: cloud.projectId, onChange: event => controller.setCloudProject(event.target.value),
-              disabled: !view.canBrowse || Boolean(state.recoveryPending), maxLength: 100, autoComplete: 'off', spellCheck: false, 'data-modal-autofocus': '' })),
-          h(Button, { type: 'button', variant: 'outline', disabled: !view.canBrowse || !cloud.projectId || Boolean(state.recoveryPending),
-            onClick: () => { void controller.loadCheckpoints(); } }, state.busy === 'checkpoints' ? '读取中…' : '读取检查点'),
-          cloud.heads.length > 1 && body(`存在 ${cloud.heads.length} 个 head 冲突分支，请逐项核对后只选择一个检查点。`, { style: { ...styles.body, ...styles.warning } }),
+          ['projects', 'checkpoints'].includes(state.busy) && body('读取中…', { role: 'status' }),
+          cloud.projectsLoaded && !cloud.projects.length && body('暂无云端项目'),
+          cloud.partial && body('部分项目读取失败', { role: 'alert', style: styles.warning }),
+          cloud.projects.length > 0 && h('div', { style: styles.list, 'aria-label': '云端项目文件夹' }, ...cloud.projects.map(project =>
+            h('div', { key: project.projectId, style: styles.project },
+              h(Button, { type: 'button', variant: cloud.projectId === project.projectId ? 'outline' : 'ghost', 'aria-pressed': cloud.projectId === project.projectId,
+                disabled: !view.canBrowse || Boolean(state.recoveryPending), onClick: () => {
+                  if (controller.setCloudProject(project.projectId)) void controller.loadCheckpoints();
+                } }, projectLabel(project)),
+              project.sourceRoot && body(project.sourceRoot, { style: styles.root }),
+              body(`${project.checkpointCount} 个检查点 · ${when(project.latestCreatedAt)}`)))),
+          cloud.heads.length > 1 && body(`${cloud.heads.length} 个分支`, { style: { ...styles.body, ...styles.warning } }),
           cloud.loaded && !cloud.checkpoints.length && body('暂无检查点'),
           cloud.checkpoints.length > 0 && h('div', { style: styles.list, role: 'group', 'aria-label': '检查点列表（单选）' }, ...cloud.checkpoints.map(checkpoint => h('div', { key: checkpoint.id, style: styles.project },
-            h(Checkbox, { checked: cloud.checkpointId === checkpoint.id, label: `${checkpoint.id}${cloud.heads.includes(checkpoint.id) ? ' · head' : ''}`,
+            h(Checkbox, { checked: cloud.checkpointId === checkpoint.id, label: `${when(checkpoint.createdAt)}${cloud.heads.includes(checkpoint.id) ? ' · 分支' : ''}`,
               disabled: !view.canBrowse || Boolean(state.recoveryPending), onChange: selected => controller.selectCheckpoint(selected ? checkpoint.id : '') }),
-            body(`${when(checkpoint.createdAt)} · 设备 ${checkpoint.deviceId} · ${checkpoint.fileCount} 个文件 · ${checkpoint.totalBytes} 字节`),
-            body(`父检查点 ${checkpoint.parentId ?? '无'}`)))),
-          h('label', { style: styles.label, htmlFor: `${id}-cloud-destination` }, '目标：DSH Host 机器上的绝对路径（非浏览器机器）',
-            h(Input, { id: `${id}-cloud-destination`, value: cloud.destination, onChange: event => controller.setDestination(event.target.value),
-              disabled: !view.canBrowse || Boolean(state.recoveryPending), maxLength: 4096, autoComplete: 'off', spellCheck: false, placeholder: 'E:\\restored\\new-project 或 /srv/restored/new-project' })),
-          body('父目录必须存在，目标目录必须不存在；不会合并或覆盖，不自动注册项目、启用上传或执行任务。'),
-          body('会话归档不等于可续接会话；下载后可另行确认导入安全子集。'),
+            body(`设备 ${checkpoint.deviceId} · ${checkpoint.fileCount} 个文件 · ${checkpoint.totalBytes} 字节`)))),
+          h('div', { style: styles.between },
+            h('span', { style: styles.label }, '保存位置'),
+            h(Button, { type: 'button', variant: 'outline', disabled: !view.canChooseDestination, onClick: () => { void controller.chooseDestination(); } }, state.busy === 'destinationpick' ? '选择中…' : '选择文件夹')),
+          cloud.destination && body(cloud.destination, { style: styles.root, 'aria-label': '目标文件夹' }),
           recoveryResult,
           recovery?.kind === 'restore' && recovery.state === 'succeeded' && h(Button, { type: 'button', variant: 'outline', disabled: !view.canImport,
             onClick: () => { clearSecrets(); controller.prepareImport(); } }, '导入安全会话'),
-          cloud.error && h('div', { role: 'alert', style: styles.error }, cloud.error.message),
+          cloud.error && !directoryBrowser && h('div', { role: 'alert', style: styles.error }, cloud.error.message),
           state.error && h('div', { role: 'alert', style: styles.error }, state.error.message),
           (state.dirty || state.conflict) && body('请先保存或撤销本机同步设置更改。'),
           state.recoveryUncertain && body('结果未确认，勿重复提交；请刷新状态。', { role: 'alert', style: styles.warning }),
           h('div', { style: styles.row },
             h(Button, { type: 'button', variant: 'ghost', onClick: closeCloud }, '关闭'),
             h(Button, { type: 'button', variant: 'outline', disabled: Boolean(state.busy) || state.refreshing, onClick: () => { void controller.refresh(); } }, '核对状态'),
-            h(Button, { type: 'button', variant: 'primary', disabled: !view.canRestore, onClick: () => controller.prepareRestore() }, '下载到新目录')))),
-      h(Modal, { open: Boolean(intent), onClose: () => controller.cancelRecoveryIntent(), title: intent?.kind === 'import' ? '确认导入安全会话？' : '确认云端下载？', closeLabel: '取消' },
+            h(Button, { type: 'button', variant: 'primary', disabled: !view.canRestoreDestination, onClick: () => controller.prepareRestore() }, '下载到新目录')))),
+      h(Modal, { open: Boolean(directoryBrowser), onClose: () => controller.closeDestinationBrowser(), title: '选择文件夹', closeLabel: '取消' },
+        directoryBrowser && h('div', { style: styles.form },
+          h('div', { style: styles.row, 'aria-label': '文件夹导航' }, ...directoryBrowser.crumbs.map(crumb =>
+            h(Button, { key: crumb.id, type: 'button', variant: 'ghost', disabled: Boolean(state.busy) || state.refreshing,
+              onClick: () => { if (controller.getSnapshot().cloud.directoryBrowser === directoryBrowser) void controller.browseDestination(crumb.id); } }, crumb.label))),
+          body(directoryBrowser.path, { style: styles.root }),
+          h('div', { style: styles.list, 'aria-label': '文件夹列表' }, ...directoryBrowser.directories.map(folder =>
+            h(Button, { key: folder.id, type: 'button', variant: 'ghost', disabled: Boolean(state.busy) || state.refreshing,
+              onClick: () => { if (controller.getSnapshot().cloud.directoryBrowser === directoryBrowser) void controller.browseDestination(folder.id); } }, folder.label))),
+          !directoryBrowser.directories.length && body('暂无子文件夹'),
+          directoryBrowser.truncated && body('仅显示部分文件夹'),
+          cloud.error && h('div', { role: 'alert', style: styles.error }, cloud.error.message),
+          h(Button, { type: 'button', variant: 'primary', disabled: !directoryBrowser.selectable || Boolean(state.busy) || state.refreshing,
+            onClick: () => { if (controller.getSnapshot().cloud.directoryBrowser === directoryBrowser) void controller.selectDestination(directoryBrowser.currentId); } }, '选择此文件夹'))),
+      h(Modal, { open: Boolean(intent), onClose: () => controller.cancelRecoveryIntent(), title: intent?.kind === 'import' ? '导入可恢复会话？' : '确认云端下载？', closeLabel: '取消' },
         intent && h('div', { style: styles.form },
-          body(`${intent.server} · ${intent.username}`),
           intent.kind === 'restore' ? h('div', null,
-            body(`项目 ${intent.projectId} · 检查点 ${intent.checkpointId}`), body(`DSH Host 目标：${intent.destination}`),
-            body('确认父目录已存在、目标目录不存在。下载不注册或选择项目，不开启自动上传，不执行任务。'))
-            : h('div', null, body(`最近成功下载：${intent.root}`),
-              body('仅导入该目录的安全会话子集，可能注册工作区，但不会选择同步项目、开启上传或执行任务。归档不等于可续接；跳过、失败或未关联工作区时请检查结果，勿重复导入。')),
+            body(projectLabel(selectedCloudProject)), body(intent.destination), body('下载到新目录，不覆盖现有文件'))
+            : h('div', null, body(intent.root), body(`会话归档 ${recovery?.sessionCount ?? '未确认'} 个`)),
           h('div', { style: styles.row },
             h(Button, { type: 'button', variant: 'ghost', onClick: () => controller.cancelRecoveryIntent() }, '取消'),
-            h(Button, { type: 'button', variant: 'primary', disabled: intent.kind === 'restore' ? !view.canRestore : !view.canImport,
+            h(Button, { type: 'button', variant: 'primary', disabled: intent.kind === 'restore' ? !view.canRestoreDestination : !view.canImport,
               onClick: () => { void controller.confirmRecovery(intent); } }, intent.kind === 'restore' ? '确认下载' : '确认导入')))),
       h(Modal, { open: projectManagerOpen, onClose: closeProjects, title: '管理同步项目', closeLabel: '关闭',
         footer: projectManagerOpen && h('div', { style: styles.between },

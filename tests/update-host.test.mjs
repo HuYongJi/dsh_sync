@@ -311,12 +311,13 @@ test('non-native teardown drain skips applying work but default drain still join
 
 test('actual plugin dispose returns while native applying and cancellation need the same HMR queue', async t => {
   const f = await fixture(t), routes = [], hooks = [], releaseHmr = deferred();
+  const [major, minor, patch] = own.version.split('.'), nextVersion = `${major}.${minor}.${Number(patch) + 1}`;
   f.row.version = own.version; f.ctx.profileContext.home = path.join(f.root, 'private');
   let nativeTask, cancelTask;
   f.manager.installBundle = (...args) => {
     f.calls.push(args);
     nativeTask = releaseHmr.promise.then(() => {
-      f.row.version = '0.6.0';
+      f.row.version = nextVersion;
       return { application: 'restart-required', target: f.row.name, bundle: f.row.name, packageResult: { exitCode: 0 } };
     });
     return nativeTask;
@@ -324,7 +325,7 @@ test('actual plugin dispose returns while native applying and cancellation need 
   f.manager.cancelInstall = id => {
     f.calls.push(['cancel', id]); cancelTask = releaseHmr.promise.then(() => ({ status: 'too-late' })); return cancelTask;
   };
-  t.mock.method(globalThis, 'fetch', async url => Response.json(url === UPDATE_COMMITS_URL ? [{ sha }] : manifest()));
+  t.mock.method(globalThis, 'fetch', async url => Response.json(url === UPDATE_COMMITS_URL ? [{ sha }] : manifest(nextVersion)));
   Object.assign(f.ctx, { connection: { fetch: { register: route => routes.push(route) } }, authorization: { registerFlow() {} }, commands: { register() {} }, on: (name, fn) => hooks.push([name, fn]) });
   applyPlugin(f.ctx);
   const dispose = hooks.find(([name]) => name === 'dispose')[1];
@@ -350,7 +351,7 @@ test('actual plugin dispose returns while native applying and cancellation need 
 test('all updater routes use exact admitted POST RPC, sanitize errors, and ordinary status includes optional update', async t => {
   const f = await fixture(t), routes = [];
   registerSettingsRoutes({ connection: { fetch: { register: value => routes.push(value) } } }, f.bridge);
-  assert.equal(routes.length, 14); assert.ok(routes.every(route => route.methods.length === 1 && route.methods[0] === 'POST' && route.requestBody === 'streaming'));
+  assert.equal(routes.length, 17); assert.ok(routes.every(route => route.methods.length === 1 && route.methods[0] === 'POST' && route.requestBody === 'streaming'));
   for (const action of ['updatestatus', 'checkupdate', 'installupdate', 'cancelupdate']) {
     assert.equal((await f.bridge.fetch(action, new Request(`http://dsh.internal${SETTINGS_API}${action}`))).status, 405);
     const result = await rpc(f, action, { password: 'never-reflect-this' }); assert.equal(result.ok, false); assert.equal(result.error.code, 'BAD_REQUEST'); assert.ok(!JSON.stringify(result).includes('never-reflect'));

@@ -73,6 +73,50 @@ test('corrupt restore leaves an explicit incomplete marker and cannot escape des
   await assert.rejects(restoreCheckpoint({ manifest: invalid, destination: path.join(temp, 'never-created'), getBlob: async () => Buffer.from('x') }));
   await assert.rejects(fs.stat(path.join(temp, 'never-created')), { code: 'ENOENT' });
 });
+test('cancellation after directory reservation still writes only an incomplete safety marker', async t => {
+  const temp = await temporary(t), target = path.join(temp, 'cancelled'), abort = new AbortController();
+  const mkdir = fs.mkdir;
+  t.mock.method(fs, 'mkdir', async (directory, ...args) => {
+    const result = await mkdir(directory, ...args);
+    if (directory === target) abort.abort();
+    return result;
+  });
+  await assert.rejects(restoreCheckpoint({ manifest: manifest(), destination: target, signal: abort.signal, getBlob: async () => assert.fail('cancelled before data') }), { name: 'AbortError' });
+  assert.ok(await fs.stat(path.join(target, '.dsh-sync', 'INCOMPLETE')));
+  await assert.rejects(fs.stat(path.join(target, '.dsh-sync', 'manifest.json')), { code: 'ENOENT' });
+});
+test('a replaced parent cannot receive metadata after restore reserved its original directory', async t => {
+  const temp = await temporary(t), parent = path.join(temp, 'parent'), parked = path.join(temp, 'parent-original');
+  await fs.mkdir(parent);
+  const target = path.join(parent, 'restore'), meta = path.join(target, '.dsh-sync'), mkdir = fs.mkdir;
+  let replaced = false;
+  t.mock.method(fs, 'mkdir', async (directory, ...args) => {
+    const result = await mkdir(directory, ...args);
+    if (directory === meta && !replaced) {
+      replaced = true;
+      assert.equal(await fs.realpath(parent), parent);
+      assert.equal(path.dirname(parent), temp); assert.equal(path.dirname(parked), temp);
+      await fs.rename(parent, parked);
+      await mkdir(parent); await mkdir(target);
+    }
+    return result;
+  });
+  await assert.rejects(restoreCheckpoint({ manifest: manifest(), destination: target, getBlob: async () => assert.fail('no data read') }), { code: 'DESTINATION_CHANGED' });
+  assert.deepEqual(await fs.readdir(target), []);
+});
+test('a replaced reserved root cannot receive project bytes or a completion manifest', async t => {
+  const temp = await temporary(t), target = path.join(temp, 'restore'), parked = path.join(temp, 'restore-original');
+  const bytes = Buffer.from('safe bytes');
+  await assert.rejects(restoreCheckpoint({ manifest: manifest([{ path: 'project/data.bin', sha256: sha256(bytes), size: bytes.length }]), destination: target,
+    getBlob: async () => {
+      assert.equal(await fs.realpath(target), target);
+      assert.equal(path.dirname(target), temp); assert.equal(path.dirname(parked), temp);
+      await fs.rename(target, parked); await fs.mkdir(target); return bytes;
+    },
+  }), { code: 'DESTINATION_CHANGED' });
+  assert.deepEqual(await fs.readdir(target), []);
+  assert.ok(await fs.stat(path.join(parked, '.dsh-sync', 'INCOMPLETE')));
+});
 test('symlink/junction project entries excluded; destination parents cannot be links', async t => {
   const temp = await temporary(t), root = path.join(temp, 'root'), outside = path.join(temp, 'outside');
   await fs.mkdir(root); await fs.mkdir(outside); await fs.writeFile(path.join(outside, 'private.txt'), 'not selected');

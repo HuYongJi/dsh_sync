@@ -3,7 +3,8 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { atomicWrite, readStableFile, assertNoSymlinks } from '../src/files.mjs';
 import { sha256, validateId, validateManifest, MAX_MANIFEST_BYTES } from '../src/protocol.mjs';
-import { validateServerUrl, validatePasswordChange } from '../src/client.mjs';
+import { validateServerUrl, validatePasswordChange, projectFolderMetadata } from '../src/client.mjs';
+import { createDestinationPicker } from './destination-picker.mjs';
 import { validateRestoreDestination } from '../src/snapshot.mjs';
 
 export const MAX_PROJECTS = 200;
@@ -57,7 +58,7 @@ function summarizeLastResult(value) {
 }
 
 /** Settings are plugin-owned, non-secret and profile-scoped; never edit the Host's profile patch. */
-export function createSettingsService(ctx, controller, { profileDir, dshHome } = {}) {
+export function createSettingsService(ctx, controller, { profileDir, dshHome, pickerOptions } = {}) {
   requireValue(typeof profileDir === 'string' && path.isAbsolute(profileDir), '缺少当前 profile 目录');
   const filename = path.join(controller.store.directory, `preferences-${sha256(rootKey(profileDir)).slice(0, 24)}.json`);
   const base = { ...controller.config, projects: controller.config.projects.map(item => ({ ...item })) };
@@ -156,6 +157,26 @@ export function createSettingsService(ctx, controller, { profileDir, dshHome } =
     const roots = [...protectedRoots, ...listedWorkspaces().map(item => item.root), ...preferences.bindings.map(item => item.root)];
     return validateRestoreDestination(destination, roots, options);
   }
+  async function admitParent(parent, { selecting = false } = {}) {
+    const candidate = rootKey(parent);
+    const sensitive = new Set(['.dsh', '.dsh-sync', '.ssh', '.aws', '.azure', '.gnupg', '.credentials', 'node_modules']);
+    if (parent.split(/[\\/]/).some(part => sensitive.has(part.toLowerCase())) || path.basename(parent).startsWith('.')) throw settingsFailure('PROTECTED_DESTINATION');
+    const roots = [...protectedRoots, ...listedWorkspaces().map(item => item.root), ...preferences.bindings.map(item => item.root)];
+    for (const value of roots) {
+      if (isInside(candidate, rootKey(value))) throw settingsFailure('PROTECTED_DESTINATION');
+      try { if (isInside(candidate, rootKey(await fs.realpath(value)))) throw settingsFailure('PROTECTED_DESTINATION'); }
+      catch (error) { if (error.code !== 'ENOENT') throw error; }
+    }
+  }
+  function knownProjects() {
+    const current = new Map(listedWorkspaces().map(item => [item.id, item]));
+    return preferences.bindings.map(item => {
+      const workspace = current.get(item.workspaceId);
+      const label = workspace && rootKey(workspace.root) === rootKey(item.root) ? workspace.label.normalize('NFC') : projectFolderMetadata(item.root).label;
+      return { projectId: item.projectId, label };
+    });
+  }
+  const picker = createDestinationPicker(ctx, { ...pickerOptions, admitParent, admitDestination });
   const service = {
     filename,
     initialize,
@@ -232,18 +253,40 @@ export function createSettingsService(ctx, controller, { profileDir, dshHome } =
     },
     async projects(input, signal) {
       const checkBinding = recoveryBinding(input, []); await checkBinding();
-      return controller.browse('projects', undefined, { checkBinding, signal });
+      return controller.browse('projects', undefined, { checkBinding, signal, knownProjects });
     },
     async checkpoints(input, signal) {
       const checkBinding = recoveryBinding(input, ['projectId']); validateId(input.projectId); await checkBinding();
       return controller.browse('checkpoints', input.projectId, { checkBinding, signal });
     },
+    async destinationpick(input, signal) {
+      const checkBinding = recoveryBinding(input, ['projectId', 'checkpointId']);
+      validateId(input.projectId); validateId(input.checkpointId); await checkBinding();
+      return controller.readAccount(async context => {
+        const manifest = await context.client.getCheckpoint(input.checkpointId); await context.check();
+        if (manifest.projectId !== input.projectId) throw settingsFailure('CHECKPOINT_MISMATCH');
+        return picker.pick(input, manifest, context);
+      }, { checkBinding, signal });
+    },
+    async destinationbrowse(input, signal) {
+      const checkBinding = recoveryBinding(input, ['browserId', 'nodeId']);
+      validateId(input.browserId); validateId(input.nodeId); await checkBinding();
+      return controller.readAccount(context => picker.browse(input, context), { checkBinding, signal });
+    },
+    async destinationselect(input, signal) {
+      const checkBinding = recoveryBinding(input, ['browserId', 'nodeId']);
+      validateId(input.browserId); validateId(input.nodeId); await checkBinding();
+      return controller.readAccount(context => picker.select(input, context), { checkBinding, signal });
+    },
     async restore(input, signal) {
-      const checkBinding = recoveryBinding(input, ['projectId', 'checkpointId', 'destination', 'confirm', 'requestId']);
+      const checkBinding = recoveryBinding(input, ['projectId', 'checkpointId', 'destination', 'destinationId', 'confirm', 'requestId']);
       validateId(input.projectId); validateId(input.checkpointId); validateId(input.requestId); requireValue(input.confirm === true);
-      if (typeof input.destination !== 'string' || !path.isAbsolute(input.destination) || (process.platform === 'win32' && !/^[A-Za-z]:[\\/]/.test(input.destination)) || input.destination.length > 4096 || /[\x00-\x1f\x7f]/.test(input.destination)) throw settingsFailure('BAD_DESTINATION', '恢复目录无效');
+      const planned = Object.hasOwn(input, 'destinationId');
+      requireValue(!(planned && Object.hasOwn(input, 'destination')));
+      if (planned) validateId(input.destinationId);
+      else if (typeof input.destination !== 'string' || !path.isAbsolute(input.destination) || (process.platform === 'win32' && !/^[A-Za-z]:[\\/]/.test(input.destination)) || input.destination.length > 4096 || /[\x00-\x1f\x7f]/.test(input.destination)) throw settingsFailure('BAD_DESTINATION', '恢复目录无效');
       await checkBinding();
-      return controller.startRecovery('restore', { requestId: input.requestId, projectId: input.projectId, checkpointId: input.checkpointId, destination: input.destination }, { checkBinding, admitDestination, signal });
+      return controller.startRecovery('restore', { requestId: input.requestId, projectId: input.projectId, checkpointId: input.checkpointId, ...(planned ? { destinationId: input.destinationId } : { destination: input.destination }) }, { checkBinding, admitDestination, signal, ...(planned ? { resolveDestination: identity => picker.resolve(input, identity) } : {}) });
     },
     async import(input, signal) {
       const checkBinding = recoveryBinding(input, ['restoreId', 'confirm', 'requestId']);

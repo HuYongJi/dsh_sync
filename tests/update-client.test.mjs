@@ -383,25 +383,46 @@ function pageSetup(t, handler) {
   return { ...mock, ...hooks, required, controller: slot.props.controller, tree: () => hooks.render(slot.Component, slot.props) };
 }
 
-test('update native React card is compact, mount-local and logged-out explicit check opens a target/source/restart-bound Modal only', async t => {
+test('update native React final card has one explicit action and a concise version/restart-bound Modal', async t => {
   let current = update(); const page = pageSetup(t, call => {
     if (call.action === 'checkupdate') current = available();
     return ok(call.action === 'status' ? status({ update: current }) : { update: current });
   });
   page.tree(); assert.equal(page.calls.length, 0); page.mount(); await settle();
   assert.deepEqual(page.required, ['react', '@deepseek-ai/dsh-client-ui-primitives']);
-  assert.equal(modal(page).props.open, false); assert.match(text(page.tree()), /插件更新/); assert.match(text(page.tree()), /运行版本 0.5.0/);
-  assert.match(text(page.tree()), /GitHub HuYongJi\/dsh_sync/); assert.equal(button(page.tree(), '检查更新').props.disabled, false);
-  assert.equal(button(page.tree(), '一键更新').props.disabled, true);
+  assert.equal(modal(page).props.open, false); assert.match(text(page.tree()), /插件更新/); assert.match(text(page.tree()), /当前版本 0.5.0/);
+  const children = page.tree().props.children.filter(node => node && typeof node === 'object');
+  const card = children.filter(node => node.type === 'section').at(-1);
+  assert.equal(card.props['data-personal-sync'], 'update-summary');
+  assert.equal(children.indexOf(card) < children.findIndex(node => node.type === 'native:Modal'), true);
+  assert.equal(nodes(card).filter(node => node.type === 'native:Button').length, 1);
+  assert.doesNotMatch(text(page.tree()), /GitHub|固定来源|一键更新|核对更新状态|取消更新|安全检查|Host 后台/);
+  assert.equal(button(card, '检查更新').props.disabled, false);
   button(page.tree(), '检查更新').props.onClick(); await settle();
-  button(page.tree(), '一键更新').props.onClick(); const confirm = modal(page);
-  assert.equal(confirm.props.open, true); assert.match(text(confirm), /运行版本 0.5.0 → 目标版本 0.6.0/);
-  assert.ok(text(confirm).includes(candidate.commit)); assert.match(text(confirm), /精确提交/); assert.match(text(confirm), /DSH Plugins/);
-  assert.match(text(confirm), /重启 DSH 再刷新页面（仅刷新无效）/); assert.match(text(confirm), /不更新云同步服务器/);
-  assert.match(text(confirm), /不会自动授权或添加版本豁免/);
+  assert.equal(nodes(page.tree()).some(node => node.type === 'native:Button' && text(node) === '检查更新'), false);
+  button(page.tree(), '手动更新').props.onClick(); const confirm = modal(page);
+  assert.equal(confirm.props.open, true); assert.match(text(confirm), /0.5.0 → 0.6.0/);
+  assert.equal(page.controller.getSnapshot().updateIntent.commit, candidate.commit);
+  assert.equal(text(confirm).includes(candidate.commit), false);
+  assert.match(text(confirm), /更新后需重启 DSH/);
+  assert.doesNotMatch(text(confirm), /GitHub|DSH Plugins|提交|豁免|自动/);
   assert.deepEqual(page.calls.map(call => call.action), ['status', 'checkupdate']);
   button(confirm, '取消').props.onClick(); assert.equal(modal(page).props.open, false);
   assert.ok(page.calls.every(call => !['installupdate', 'cancelupdate'].includes(call.action)));
+});
+
+test('an available update keeps one manual-update action disabled while preferences are dirty', async t => {
+  const page = pageSetup(t, () => ok(status({ ...signed, update: available() })));
+  await page.controller.refresh();
+  assert.equal(page.controller.setAutoSync(true), true);
+  const card = nodes(page.tree()).find(node => node.props?.['data-personal-sync'] === 'update-summary');
+  assert.equal(nodes(card).filter(node => node.type === 'native:Button').length, 1);
+  assert.equal(button(card, '手动更新').props.disabled, true);
+  assert.equal(nodes(card).some(node => node.type === 'native:Button' && text(node) === '检查更新'), false);
+  button(card, '手动更新').props.onClick(); await settle();
+  assert.deepEqual(page.calls.map(call => call.action), ['status']);
+  page.controller.discardChanges();
+  assert.equal(button(page.tree(), '手动更新').props.disabled, false);
 });
 
 test('update native React stale modal callbacks and duplicate click cannot write twice or use a replaced candidate', async t => {
@@ -409,18 +430,20 @@ test('update native React stale modal callbacks and duplicate click cannot write
     if (call.action === 'installupdate') current = running({ requestId: call.payload.requestId });
     return ok(call.action === 'status' ? status({ update: current }) : { update: current });
   });
-  await page.controller.refresh(); button(page.tree(), '一键更新').props.onClick();
+  await page.controller.refresh(); button(page.tree(), '手动更新').props.onClick();
   const old = button(modal(page), '确认更新').props.onClick;
   current = available({ candidate: { ...candidate, id: 'replacement', commit: 'b'.repeat(40) } }); await page.controller.refresh(); old(); await settle();
   assert.equal(modal(page).props.open, false); assert.equal(page.calls.some(call => call.action === 'installupdate'), false);
-  button(page.tree(), '一键更新').props.onClick(); const confirm = button(modal(page), '确认更新').props.onClick; confirm(); confirm(); await settle();
+  button(page.tree(), '手动更新').props.onClick(); const confirm = button(modal(page), '确认更新').props.onClick; confirm(); confirm(); await settle();
   assert.equal(page.calls.filter(call => call.action === 'installupdate').length, 1);
   assert.equal(page.calls.find(call => call.action === 'installupdate').payload.candidateId, 'replacement');
-  assert.equal(modal(page).props.open, false); assert.match(text(page.tree()), /原生安装中/); assert.match(text(page.tree()), /更新器忙碌/);
-  assert.equal(button(page.tree(), '取消更新').props.disabled, false); assert.equal(button(page.tree(), '登录').props.disabled, true);
+  assert.equal(modal(page).props.open, false); assert.match(text(page.tree()), /更新中…/);
+  assert.equal(button(page.tree(), '更新中…').props.disabled, true);
+  assert.doesNotMatch(text(page.tree()), /取消更新|核对更新状态|更新器忙碌/);
+  assert.equal(button(page.tree(), '登录').props.disabled, true);
 });
 
-test('update native React failure/install/restart rendering locks controls, shows installed version, safe native guidance and clears secrets', async t => {
+test('update native React failure/install/restart rendering locks controls, shows concise errors and clears secrets', async t => {
   let current = update(); const page = pageSetup(t, call => ok(call.action === 'status' ? status({ ...signed, update: current }) : { update: current }));
   await page.controller.refresh(); page.tree(); page.mount(); await settle();
   button(page.tree(), '修改密码').props.onClick();
@@ -430,10 +453,31 @@ test('update native React failure/install/restart rendering locks controls, show
   for (const label of ['修改密码', '退出登录', '立即同步', '浏览云端', '管理']) assert.equal(button(page.tree(), label).props.disabled, true, label);
   assert.equal(nodes(page.tree()).find(node => node.type === 'native:Switch').props.disabled, true);
   current = running({ state: 'failed', installedVersion: '0.6.0', errorCode: 'UPDATE_BUILD_APPROVAL_REQUIRED' }); await page.controller.refresh();
-  assert.match(text(page.tree()), /更新未完成/); assert.match(text(page.tree()), /已安装 0.6.0 · 待重启/);
-  assert.match(text(page.tree()), /原生安装需要脚本审批/); assert.match(text(page.tree()), /重启 DSH 再刷新页面/);
+  assert.match(text(page.tree()), /更新未完成/); assert.equal(page.controller.getSnapshot().update.installedVersion, '0.6.0');
+  assert.match(text(page.tree()), /原生安装需要脚本审批/); assert.match(text(page.tree()), /请重启 DSH/);
   assert.equal(button(page.tree(), '退出登录').props.disabled, false); assert.equal(button(page.tree(), '立即同步').props.disabled, true);
-  assert.equal(button(page.tree(), '一键更新').props.disabled, true); assert.doesNotMatch(text(page.tree()), /更新成功/);
+  assert.equal(button(page.tree(), '待重启').props.disabled, true); assert.doesNotMatch(text(page.tree()), /更新成功/);
+});
+
+test('update global refresh reconciles uncertainty and restart without reinstalling or exposing standalone actions', async t => {
+  let current = available();
+  const page = pageSetup(t, call => {
+    if (call.action === 'installupdate') throw new Error('response lost');
+    return ok(call.action === 'status' ? status({ update: current }) : { update: current });
+  });
+  await page.controller.refresh(); button(page.tree(), '手动更新').props.onClick();
+  button(modal(page), '确认更新').props.onClick(); await settle();
+  assert.equal(page.controller.getSnapshot().updateUncertain, true);
+  assert.equal(button(page.tree(), '检查更新').props.disabled, true);
+  assert.equal(button(page.tree(), '刷新').props.disabled, false);
+  const requestId = page.calls.find(call => call.action === 'installupdate').payload.requestId;
+  current = running({ requestId, state: 'restart-required' });
+  button(page.tree(), '刷新').props.onClick(); await settle();
+  assert.equal(page.calls.at(-1).action, 'status');
+  assert.equal(page.controller.getSnapshot().updateUncertain, false);
+  assert.equal(button(page.tree(), '待重启').props.disabled, true);
+  assert.equal(page.calls.filter(call => call.action === 'installupdate').length, 1);
+  assert.doesNotMatch(text(page.tree()), /核对更新状态|取消更新|一键更新/);
 });
 
 test('update source keeps adapter first import exact and adds no browser fetch/navigation or SDK dependency', async () => {

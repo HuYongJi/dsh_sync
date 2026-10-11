@@ -72,7 +72,7 @@ test('HTTP upload -> settings discover/list -> new directory restore -> explicit
   const catalog = await good(f.bridge, 'checkpoints', { ...f.bound, projectId: f.projectId });
   assert.deepEqual(catalog.heads, [f.checkpointId]);
   assert.deepEqual(Object.keys(catalog.checkpoints[0]).sort(), ['createdAt', 'deviceId', 'fileCount', 'id', 'parentId', 'projectId', 'totalBytes']);
-  assert.ok(!JSON.stringify(discovered).includes(f.source));
+  assert.equal(discovered.projects[0].sourceRoot, f.source); assert.equal(discovered.projects[0].label, 'source');
   const { payload, recovery } = await f.restore();
   assert.equal(recovery.state, 'succeeded'); assert.equal(recovery.sessionCount, 1); assert.equal(recovery.root, payload.destination);
   assert.equal(await fs.readFile(path.join(recovery.root, 'hello.txt'), 'utf8'), 'synthetic project');
@@ -90,13 +90,13 @@ test('HTTP upload -> settings discover/list -> new directory restore -> explicit
   assert.equal((await f.service.status()).revision, f.bound.revision);
 });
 
-test('project aggregates count only committed checkpoints and expose no source roots or secrets', async t => {
+test('project aggregates count only committed checkpoints and derive folder names without secrets', async t => {
   const f = await fixture(t);
   await fs.writeFile(path.join(f.source, 'hello.txt'), 'second checkpoint'); await f.controller.push(f.projectId);
   const pending = await f.controller.store.capture({ root: f.source, projectId: 'uncommitted-project', deviceId: f.client.deviceId });
   assert.ok(pending.queuedId);
   const { projects } = await f.client.projects(), listed = await f.client.list(f.projectId);
-  assert.deepEqual(projects, [{ projectId: f.projectId, checkpointCount: 2, latestCreatedAt: listed.checkpoints.map(item => item.createdAt).sort().at(-1) }]);
+  assert.deepEqual(projects, [{ projectId: f.projectId, checkpointCount: 2, latestCreatedAt: listed.checkpoints.map(item => item.createdAt).sort().at(-1), label: 'source', sourceRoot: f.source, latestCheckpointId: listed.checkpoints.at(-1).id }]);
 });
 
 test('new actions are exact POST and reject missing, invalid, extra and stale binding/confirmation fields', async t => {

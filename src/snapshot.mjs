@@ -116,15 +116,39 @@ export async function validateRestoreDestination(value, protectedRoots = [], { r
 export async function restoreCheckpoint({ manifest, destination, getBlob, signal, beforeWrite }) {
   manifest = validateManifest(manifest);
   destination = path.resolve(destination);
-  await assertNoSymlinks(path.dirname(destination));
-  await beforeWrite?.(); signal?.throwIfAborted();
+  const parent = path.dirname(destination);
+  await assertNoSymlinks(parent);
+  const parentIdentity = await fs.lstat(parent, { bigint: true });
+  let rootIdentity;
+  async function verifyLocation() {
+    try {
+      await assertNoSymlinks(parent);
+      const currentParent = await fs.lstat(parent, { bigint: true });
+      if (!currentParent.isDirectory() || currentParent.dev !== parentIdentity.dev || currentParent.ino !== parentIdentity.ino) throw destinationFailure('DESTINATION_CHANGED');
+      if (rootIdentity) {
+        await assertNoSymlinks(destination);
+        const currentRoot = await fs.lstat(destination, { bigint: true });
+        if (!currentRoot.isDirectory() || currentRoot.dev !== rootIdentity.dev || currentRoot.ino !== rootIdentity.ino) throw destinationFailure('DESTINATION_CHANGED');
+      }
+    } catch { throw destinationFailure('DESTINATION_CHANGED'); }
+  }
+  async function admitWrite() {
+    await verifyLocation();
+    await beforeWrite?.();
+    await verifyLocation();
+    signal?.throwIfAborted();
+  }
+  await admitWrite();
   // An exclusive directory reservation is the conflict policy for all local files.
   await fs.mkdir(destination, { mode: 0o700 });
+  rootIdentity = await fs.lstat(destination, { bigint: true });
   const meta = path.join(destination, '.dsh-sync');
-  // Finish the safety marker even if cancellation races the exclusive mkdir;
-  // never leave a reserved, half-restored directory appearing complete.
+  // Finish the marker on cancellation, but NEVER through a replaced parent/root.
+  // Only constant safety metadata is written before the next cancellation check.
+  await verifyLocation();
   await fs.mkdir(meta, { mode: 0o700 });
   const marker = path.join(meta, 'INCOMPLETE');
+  await verifyLocation();
   await writeNewFile(marker, Buffer.from('Restore is incomplete. Do not import or run this project.\n'));
   for (const file of manifest.files) {
     signal?.throwIfAborted();
@@ -132,15 +156,14 @@ export async function restoreCheckpoint({ manifest, destination, getBlob, signal
     assert(Buffer.isBuffer(bytes) && bytes.length === file.size && sha256(bytes) === file.sha256, `Corrupt blob: ${file.sha256}`);
     const relative = file.path.startsWith('project/') ? file.path.slice(8) : `.dsh-sync/${file.path}`;
     const target = path.join(destination, ...relative.split('/'));
-    await assertNoSymlinks(destination);
-    await beforeWrite?.(); signal?.throwIfAborted();
+    await admitWrite();
     await writeNewFile(target, bytes, file.executable);
   }
-  await beforeWrite?.(); signal?.throwIfAborted();
+  await admitWrite();
   await writeNewFile(path.join(meta, 'manifest.json'), Buffer.from(JSON.stringify(manifest, null, 2)));
   // This exact marker was exclusively created above; no arbitrary path cleanup.
   await assertNoSymlinks(marker);
-  await beforeWrite?.(); signal?.throwIfAborted();
+  await admitWrite();
   await fs.unlink(marker);
   return { root: destination, metadataDirectory: meta, sessionIds: manifest.sessionIds };
 }

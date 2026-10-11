@@ -73,9 +73,12 @@ Host/Origin 与 DSH 浏览器会话验证发生在 exact route 分派之前；�
 | `preferences` | `{revision, autoSync, projectIds}` | 新公共状态 |
 | `sync` | `{}` 或 `{projectId: 本机宿主项目ID}` | `{scheduled:true}`，亦兼容公共状态 |
 | `logout` | `{}` | 公共状态，可带 `warning` |
-| `projects` | `{revision, server, username}` | `{projects:[{projectId, checkpointCount, latestCreatedAt}]}` |
+| `projects` | `{revision, server, username}` | `{projects:[{projectId, label, sourceRoot?, checkpointCount, latestCreatedAt}], partial?, legacy?}` |
 | `checkpoints` | 上述身份绑定 + `{projectId}` | `{checkpoints:[{id, projectId, deviceId, parentId, createdAt, fileCount, totalBytes}], heads:[ID]}` |
-| `restore` | 上述身份绑定 + `{projectId, checkpointId, destination, confirm:true, requestId}` | `{recovery}`，接受后异步下载 |
+| `destinationpick` | 上述身份绑定 + `{projectId, checkpointId}` | `{destination:Plan}`、`{browser:Browser}` 或 `{cancelled:true}` |
+| `destinationbrowse` | 上述身份绑定 + `{browserId, nodeId}` | `{browser:Browser}` |
+| `destinationselect` | 上述身份绑定 + `{browserId, nodeId}` | `{destination:Plan}` |
+| `restore` | 上述身份绑定 + `{projectId, checkpointId, destinationId, confirm:true, requestId}` | `{recovery}`，接受后异步下载；旧 `destination` 字符串保留兼容但新界面不发送 |
 | `import` | 上述身份绑定 + `{restoreId, confirm:true, requestId}` | `{recovery}`，接受后异步导入 |
 | `updatestatus` | `{}` | `{update}`，只读本机状态，不请求 GitHub |
 | `checkupdate` | `{}` | `{update}`，显式检查固定仓库版本 |
@@ -119,7 +122,7 @@ Host 会验证当前密码，成功后撤销云端所有旧 token、退出本机
 
 ## 0.4.0 云端下载
 
-- “云端下载”提供云端项目浏览、手动云端项目 ID 查询（兼容旧服务器）、检查点列表、分支 head 标记、宿主新目录输入和显式下载确认。不会自动选择一个冲突分支，也不会从远端 sourceRoot 推导本机写入目录。
+- “云端下载”提供云端项目、检查点与显式下载确认。0.6.0 已把最初的手填 ID/绝对路径改为具名项目文件夹和宿主目标选择；冲突分支仍需明确选择，远端 sourceRoot 不能授权本机绝对写入位置。
 - 只读浏览不授权上传；无需选择任何本机同步项目。浏览数据与确认意图绑定保存的 server/username/revision，身份或版本变化后失效。远端响应只保留已验证字段，额外秘密字段不会进入状态。
 - 下载不是浏览器文件保存：目标在 DSH Host 机器，必须是不存在的新目录且父目录存在。Host 拒绝受保护目录、已注册工作区内目录、已有目录和跳转路径。
 - `restore/import` 返回任务状态后由 Host 继续执行。页面轮询 `status.recovery`，关闭页面只停止轮询，同一登录下重新打开读取已有结果；任务记录仅存于本次插件生命周期，不会带到新登录。超时/断线先读取状态，不自动重放写操作；请先检查已有目录和新会话。
@@ -149,6 +152,23 @@ Host 会验证当前密码，成功后撤销云端所有旧 token、退出本机
 - 首次仍需安装含更新入口的 0.5.0；后续需维护者递增稳定版本并把预构建 Client 一起推送到固定仓库默认分支。这不是 GitHub Releases 检查，也不是同版本强制重装工具。
 
 主测试使用合成 Connection、原生控件对象树与 native manager mock，元数据响应也为合成。已只读核对 rc.2 的 manager/可选 `ctx.get`/安装生命周期契约，但没有运行真实 pnpm 安装、修改真实 profile 或验收实际 GUI 更新。
+
+## 0.6.0 简洁布局与文件夹选择
+
+更新卡位于所有主设置卡片最后，只显示版本、状态和单个操作：`检查更新 → 手动更新`。更新中/待重启时仍只有该按钮的禁用状态，移除常驻来源/安全说明、独立核对/取消按钮；页面顶部刷新继续核对结果。确认弹窗仅显示版本变化和重启要求，内部候选/提交绑定、原生批准与重启屏障不变。
+
+下载弹窗只保留项目文件夹、检查点、保存位置、操作及条件结果，不显示常驻教程。项目 ID 仍是内部身份，但不能手填；路径只读展示，不挂载目标路径输入框。文件夹名称来自校验过的清单，源路径只作显示；旧目录接口缺名称时补读检查点，缺整个目录接口时仅回查已有绑定，无法枚举的新设备提示升级服务。
+
+可选 Host `directoryPicker` 经 `ctx.get` 获取：`capability().kind === 'native'` 调用 `pick(signal)`，`browse` 调用 `list(undefined|已发放路径, signal)`。没有挂载第二个 Gateway，也不调用浏览器 `showDirectoryPicker` 或宿主 `createDirectory`。browse 在原生 Modal 中呈现受限文件夹/导航，选择请求只有已发放的 ID：
+
+```js
+Plan = {id, root, parent}
+Browser = {id, path, currentId, crumbs:[{id,label}], directories:[{id,label}], selectable, truncated}
+```
+
+Host 把选定的真实父目录转为短期计划，自动建议不存在的新子目录（冲突时使用安全兄弟名称），确认前不创建目录。Client 新流程只发送 `destinationId`，显示的最终路径不会反向授权任意路径。取消原生选择保留此前有效选择；变更项目/检查点/账号/revision 或更新门禁会清空计划并取消选择请求，关闭页面也中止尚未完成的选择。已经接受的下载仍按原有 Host 异步任务规则继续，不混淆两者。
+
+计划与原生 provider、登录凭据、本机父目录身份及检查点绑定；重新校验链接、保护目录与 inode。15 分钟有效期只限制新任务准入，不中断已接受的长下载；同一请求重试返回已记录结果，不能重做文件写入。目录选择 SDK 契约已只读核实，测试仍是 mock 原生能力 + 真实 loopback 云服务，未验证真实系统对话框或实际 GUI 视觉。
 
 ## 源码、安全与生命周期
 

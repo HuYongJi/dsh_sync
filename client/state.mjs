@@ -1,7 +1,7 @@
 // Framework-free personal-sync state. Only the DSH Connection may carry requests.
 export const RPC_CHANNEL = '/api';
 export const RPC_PREFIX = 'dsh-personal-sync/';
-export const CLIENT_ACTIONS = Object.freeze(['status', 'login', 'password', 'preferences', 'sync', 'logout', 'projects', 'checkpoints', 'restore', 'import', 'updatestatus', 'checkupdate', 'installupdate', 'cancelupdate']);
+export const CLIENT_ACTIONS = Object.freeze(['status', 'login', 'password', 'preferences', 'sync', 'logout', 'projects', 'checkpoints', 'destinationpick', 'destinationbrowse', 'destinationselect', 'restore', 'import', 'updatestatus', 'checkupdate', 'installupdate', 'cancelupdate']);
 
 const MESSAGES = Object.freeze({
   BAD_SERVER: '服务器地址无效',
@@ -47,8 +47,13 @@ const MESSAGES = Object.freeze({
   UNSAVED_CHANGES: '请先保存或撤销更改',
   TIMEOUT: '请求超时，请刷新状态',
   REQUEST_FAILED: '请求失败，请刷新状态',
-  CLOUD_BROWSE_UNSUPPORTED: '云端不支持项目浏览，请手动输入项目 ID',
-  BAD_DESTINATION: '请输入 DSH Host 机器上的绝对路径',
+  CLOUD_BROWSE_UNSUPPORTED: '请更新同步服务器',
+  PROJECTS_PARTIAL: '部分项目读取失败',
+  DIRECTORY_PICKER_UNAVAILABLE: '此宿主不支持选择文件夹',
+  DIRECTORY_PICKER_FAILED: '文件夹选择失败',
+  DIRECTORY_PICKER_EXPIRED: '请重新选择文件夹',
+  DESTINATION_CHANGED: '目标目录已变更，请重新选择',
+  BAD_DESTINATION: '请选择有效目标文件夹',
   DESTINATION_EXISTS: '目标目录已存在，请选择全新目录',
   PROTECTED_DESTINATION: '目标目录受保护，不能下载到此处',
   CHECKPOINT_MISMATCH: '检查点与项目不匹配，请重新选择',
@@ -147,16 +152,41 @@ function requiredDate(value) {
   return value;
 }
 
-/** New remote surfaces retain no names, manifests, credentials or arbitrary error text. */
+/** Only validated folder labels and public metadata survive the Host boundary. */
 export function parseCloudProjects(value) {
-  if (!isRecord(value) || !Array.isArray(value.projects) || value.projects.length > 20000) fail('INVALID_RESPONSE');
+  if (!isRecord(value) || !Array.isArray(value.projects) || value.projects.length > 20000 || ['partial', 'legacy'].some(key => value[key] !== undefined && typeof value[key] !== 'boolean')) fail('INVALID_RESPONSE');
   const ids = new Set();
   return freeze(value.projects.map(item => {
     if (!isRecord(item) || !validId(item.projectId) || ids.has(item.projectId) || !integer(item.checkpointCount)) fail('INVALID_RESPONSE');
     ids.add(item.projectId);
     const latestCreatedAt = item.latestCreatedAt === null && item.checkpointCount === 0 ? null : requiredDate(item.latestCreatedAt);
-    return freeze({ projectId: item.projectId, checkpointCount: item.checkpointCount, latestCreatedAt });
+    if ((item.label !== undefined && !text(item.label, 1024, false)) || (item.sourceRoot !== undefined && !absolutePath(item.sourceRoot))) fail('INVALID_RESPONSE');
+    return freeze({ projectId: item.projectId, checkpointCount: item.checkpointCount, latestCreatedAt,
+      ...(item.label === undefined ? {} : { label: item.label }), ...(item.sourceRoot === undefined ? {} : { sourceRoot: item.sourceRoot }) });
   }));
+}
+export function parseDestination(value) {
+  if (!isRecord(value) || !validId(value.id) || !absolutePath(value.root) || !absolutePath(value.parent) || value.root === value.parent) fail('INVALID_RESPONSE');
+  return freeze({ id: value.id, root: value.root, parent: value.parent });
+}
+export function parseDirectoryBrowser(value) {
+  if (!isRecord(value) || !validId(value.id) || !absolutePath(value.path) || !validId(value.currentId) || typeof value.selectable !== 'boolean' || typeof value.truncated !== 'boolean') fail('INVALID_RESPONSE');
+  const rows = (items, cap) => {
+    if (!Array.isArray(items) || items.length > cap) fail('INVALID_RESPONSE');
+    const ids = new Set();
+    return freeze(items.map(item => {
+      if (!isRecord(item) || !validId(item.id) || ids.has(item.id) || !text(item.label, 1024, false)) fail('INVALID_RESPONSE');
+      ids.add(item.id); return freeze({ id: item.id, label: item.label });
+    }));
+  };
+  return freeze({ id: value.id, path: value.path, currentId: value.currentId, crumbs: rows(value.crumbs, 256), directories: rows(value.directories, 2000), selectable: value.selectable, truncated: value.truncated });
+}
+function parseDestinationReply(value, action) {
+  if (!isRecord(value) || (value.cancelled !== undefined && value.cancelled !== true) || ['cancelled', 'destination', 'browser'].filter(key => Object.hasOwn(value, key)).length !== 1) fail('INVALID_RESPONSE');
+  if (value.cancelled === true && action === 'destinationpick') return freeze({ cancelled: true });
+  if (value.destination !== undefined && action !== 'destinationbrowse') return freeze({ destination: parseDestination(value.destination) });
+  if (value.browser !== undefined && action !== 'destinationselect') return freeze({ browser: parseDirectoryBrowser(value.browser) });
+  fail('INVALID_RESPONSE');
 }
 export function parseCheckpoints(value, projectId) {
   if (!validId(projectId) || !isRecord(value) || !Array.isArray(value.checkpoints) || value.checkpoints.length > 20000 || !Array.isArray(value.heads)) fail('INVALID_RESPONSE');
@@ -227,8 +257,10 @@ export function parseUpdateStatus(value) {
   return freeze(result);
 }
 
+const destinationAction = action => ['destinationpick', 'destinationbrowse', 'destinationselect'].includes(action);
+const clearedDestination = cloud => freeze({ ...cloud, destination: '', destinationId: '', directoryBrowser: null, intent: null });
 function newCloud() {
-  return freeze({ binding: null, projects: freeze([]), projectId: '', checkpoints: freeze([]), heads: freeze([]), checkpointId: '', destination: '', loaded: false, browseUnsupported: false, error: null, intent: null });
+  return clearedDestination({ binding: null, projects: freeze([]), projectsLoaded: false, partial: false, legacy: false, projectId: '', checkpoints: freeze([]), heads: freeze([]), checkpointId: '', loaded: false, browseUnsupported: false, error: null });
 }
 
 /** Allowlist the public contract. Extra fields (including credentials) are discarded. */
@@ -323,7 +355,7 @@ export function filterProjects(projects, search = '') {
 
 export function deriveView(state) {
   const status = state.status;
-  const locked = !state.ready || state.loading || state.refreshing || Boolean(state.busy);
+  const locked = !state.ready || state.loading || state.refreshing || Boolean(state.busy) || Boolean(state.cloud?.directoryBrowser);
   // Preferences/logout are safety controls: Host aborts and joins active work before committing them.
   const recovering = status?.recovery?.state === 'running' || Boolean(state.recoveryPending);
   const updater = state.update ?? status?.update;
@@ -337,12 +369,15 @@ export function deriveView(state) {
   const canRecover = canBrowse && !status.running && !recovering && !state.scheduled && !state.conflict && !state.dirty;
   const selectedAvailable = status?.projects.filter(project => project.selected && project.available).length ?? 0;
   return freeze({ locked, editable, recovering, canBrowse, canRecover, updaterBusy, restartRequired, updateBlocked,
+    pickingDestination: destinationAction(state.busy) || Boolean(state.cloud?.directoryBrowser),
     updateError: state.updateError?.message ?? (updater?.errorCode ? MESSAGES[updater.errorCode] : ''),
     canCheckUpdate: !locked && !updateBlocked && updater?.supported !== false && updater?.state !== 'checking',
     canUpdate: !locked && !updateBlocked && !state.updateError && !recovering && !status?.running && !state.scheduled && !state.dirty && !state.conflict && updater?.supported === true && updater.state === 'available' && Boolean(updater.candidate),
     // A local read must not hide cancellation; cancellation invalidates the read before writing.
     canCancelUpdate: !state.busy && updateRunning(updater) && updater.state !== 'cancelling' && updater.errorCode !== 'UPDATE_CANCEL_TOO_LATE' && state.updateError?.code !== 'UPDATE_CANCEL_TOO_LATE' && Boolean(state.updatePendingId && state.updatePendingId === updater.requestId),
+    canChooseDestination: canRecover && Boolean(state.cloud?.checkpointId),
     canRestore: canRecover && Boolean(state.cloud?.checkpointId && absolutePath(state.cloud.destination)),
+    canRestoreDestination: canRecover && Boolean(state.cloud?.checkpointId && validId(state.cloud.destinationId) && absolutePath(state.cloud.destination)),
     canImport: canRecover && status?.recovery?.kind === 'restore' && status.recovery.state === 'succeeded' && status.recovery.sessionCount !== 0,
     recoveryError: status?.recovery?.errorCode ? MESSAGES[status.recovery.errorCode] : '',
     canLogin: !locked && !status?.running && !recovering && !updateBlocked, canLogout: !locked && !updaterBusy && Boolean(status?.loggedIn),
@@ -374,9 +409,20 @@ export function createController(connection, options = {}) {
   let observedWork = false;
   let uncertainChecks = 0;
   let updateUncertainChecks = 0;
+  let destinationAbort;
+  let destinationGeneration = 0;
+  const invalidateDestinationRequest = () => { ++destinationGeneration; destinationAbort?.abort(); destinationAbort = undefined; };
   const update = patch => {
     if (disposed) return;
-    state = freeze({ ...state, ...patch });
+    const next = { ...state, ...patch };
+    const identityChanged = state.status && (!sameBinding(state.status, next.status) || state.status.loggedIn !== next.status?.loggedIn);
+    const runtimeChanged = state.update && next.update && state.update.currentVersion !== next.update.currentVersion;
+    if (identityChanged || runtimeChanged || deriveView(state).updateBlocked !== deriveView(next).updateBlocked) {
+      invalidateDestinationRequest();
+      next.cloud = clearedDestination(next.cloud);
+      if (destinationAction(next.busy)) next.busy = null;
+    }
+    state = freeze(next);
     for (const listener of listeners) listener();
   };
   const clearPoll = () => { if (pollTimer !== undefined) clearTimer(pollTimer); pollTimer = undefined; };
@@ -483,7 +529,7 @@ export function createController(connection, options = {}) {
     }
   }
   async function refresh({ discardDraft = state.conflict } = {}) {
-    if (disposed || state.busy) return false;
+    if (disposed || (state.busy && !destinationAction(state.busy))) return false;
     clearPoll();
     invalidateRefresh();
     const current = generation;
@@ -509,7 +555,7 @@ export function createController(connection, options = {}) {
   }
   function report(error) { update({ error: publicError(error), notice: '' }); return false; }
   function guardAction(action) {
-    if (disposed || !state.ready || state.busy || state.loading || state.refreshing) return false;
+    if (disposed || !state.ready || state.busy || state.loading || state.refreshing || state.cloud.directoryBrowser) return false;
     const view = deriveView(state);
     if (view.updaterBusy) return report(new SettingsClientError('BUSY'));
     if (view.restartRequired && action !== 'logout') return report(new SettingsClientError('UPDATE_RESTART_REQUIRED'));
@@ -605,13 +651,13 @@ export function createController(connection, options = {}) {
     invalidateRefresh(); clearPoll();
     const abort = new AbortController(); active = abort;
     if (action === 'projects') update({ cloud: freeze({ ...newCloud(), binding }) });
-    else cloudUpdate({ binding, checkpoints: freeze([]), heads: freeze([]), checkpointId: '', loaded: false, intent: null, error: null });
+    else cloudUpdate({ ...clearedDestination(state.cloud), binding, checkpoints: freeze([]), heads: freeze([]), checkpointId: '', loaded: false, error: null });
     update({ busy: action });
     let needsStatus = false;
     try {
       const result = await withDeadline(action, action === 'projects' ? binding : { ...binding, projectId }, abort);
       if (disposed || !sameBinding(state.status, binding)) return false;
-      if (action === 'projects') cloudUpdate({ projects: parseCloudProjects(result) });
+      if (action === 'projects') cloudUpdate({ projects: parseCloudProjects(result), projectsLoaded: true, partial: result.partial === true, legacy: result.legacy === true });
       else cloudUpdate({ ...parseCheckpoints(result, projectId), loaded: true });
       return true;
     } catch (error) {
@@ -626,6 +672,62 @@ export function createController(connection, options = {}) {
     } finally {
       active = undefined;
       if (!disposed) { update({ busy: null }); if (needsStatus) await refresh(); else queuePoll(); }
+    }
+  }
+  function closeDestinationBrowser() {
+    invalidateDestinationRequest();
+    update({ ...(destinationAction(state.busy) ? { busy: null } : {}), cloud: freeze({ ...state.cloud, directoryBrowser: null, intent: null }) });
+    queuePoll();
+  }
+  async function destinationRequest(action, nodeId) {
+    if (disposed) return false;
+    const browser = state.cloud.directoryBrowser;
+    const view = deriveView({ ...state, cloud: { ...state.cloud, directoryBrowser: null } });
+    if (!view.canChooseDestination || (action !== 'destinationpick' && !browser)) return false;
+    let binding, payload;
+    const { projectId, checkpointId } = state.cloud;
+    try {
+      binding = validateBinding(state.status, state.cloud.binding);
+      if (!state.cloud.checkpoints.some(item => item.id === checkpointId && item.projectId === projectId)) fail('CHECKPOINT_MISMATCH');
+      if (action === 'destinationpick') payload = { ...binding, projectId, checkpointId };
+      else {
+        if (!validId(nodeId) || ![browser.currentId, ...browser.crumbs.map(item => item.id), ...browser.directories.map(item => item.id)].includes(nodeId)) fail('DIRECTORY_PICKER_EXPIRED');
+        if (action === 'destinationselect' && (!browser.selectable || nodeId !== browser.currentId)) fail('BAD_DESTINATION');
+        payload = { ...binding, browserId: browser.id, nodeId };
+      }
+    } catch (error) { return cloudReport(error); }
+    invalidateRefresh(); clearPoll(); invalidateDestinationRequest();
+    const current = destinationGeneration;
+    const runtime = state.update?.currentVersion;
+    const abort = new AbortController(); destinationAbort = abort;
+    update({ busy: action, refreshing: false, cloud: freeze({ ...state.cloud, intent: null, error: null }) });
+    const live = () => !disposed && current === destinationGeneration && sameBinding(state.status, binding) && state.status.loggedIn && state.cloud.projectId === projectId && state.cloud.checkpointId === checkpointId && state.update?.currentVersion === runtime && !deriveView(state).updateBlocked;
+    let needsStatus = false;
+    try {
+      const reply = await withDeadline(action, payload, abort);
+      if (!live()) return false;
+      const result = parseDestinationReply(reply, action);
+      if (result.cancelled) return false;
+      if (result.browser) {
+        if (action === 'destinationbrowse' && result.browser.id !== browser.id) fail('INVALID_RESPONSE');
+        cloudUpdate({ directoryBrowser: result.browser });
+      } else cloudUpdate({ destinationId: result.destination.id, destination: result.destination.root, directoryBrowser: null });
+      return true;
+    } catch (error) {
+      if (live()) {
+        const safe = publicError(error);
+        if (['ACCOUNT_MISMATCH', 'CONFIG_CONFLICT', 'NOT_LOGGED_IN'].includes(safe.code)) {
+          update({ cloud: newCloud() }); needsStatus = true;
+        } else if (['DIRECTORY_PICKER_EXPIRED', 'DESTINATION_CHANGED', 'CHECKPOINT_MISMATCH', 'INVALID_RESPONSE'].includes(safe.code)) cloudUpdate(clearedDestination(state.cloud));
+        cloudUpdate({ error: safe, intent: null });
+      }
+      return false;
+    } finally {
+      if (!disposed && current === destinationGeneration) {
+        destinationAbort = undefined;
+        update({ busy: null });
+        if (needsStatus) await refresh(); else queuePoll();
+      }
     }
   }
   function requestId() {
@@ -652,7 +754,8 @@ export function createController(connection, options = {}) {
         const cloud = state.cloud;
         if (!cloud.checkpoints.some(item => item.id === cloud.checkpointId && item.projectId === cloud.projectId)) fail('CHECKPOINT_MISMATCH');
         if (!absolutePath(cloud.destination)) fail('BAD_DESTINATION');
-        fields = { projectId: cloud.projectId, checkpointId: cloud.checkpointId, destination: cloud.destination };
+        fields = { projectId: cloud.projectId, checkpointId: cloud.checkpointId, destination: cloud.destination,
+          ...(cloud.destinationId ? { destinationId: cloud.destinationId } : {}) };
       } else {
         if (!deriveView(state).canImport) fail('RECOVERY_UNAVAILABLE');
         fields = { restoreId: state.status.recovery.id, root: state.status.recovery.root };
@@ -672,8 +775,9 @@ export function createController(connection, options = {}) {
       const binding = validateBinding(state.status, intent);
       if (!validRequestId(intent.requestId)) fail('BAD_REQUEST_ID');
       if (intent.kind === 'restore') {
-        if (intent.projectId !== state.cloud.projectId || intent.checkpointId !== state.cloud.checkpointId || intent.destination !== state.cloud.destination || !state.cloud.checkpoints.some(item => item.id === intent.checkpointId)) fail('CHECKPOINT_MISMATCH');
-        payload = { ...binding, projectId: intent.projectId, checkpointId: intent.checkpointId, destination: intent.destination, confirm: true, requestId: intent.requestId };
+        if (intent.projectId !== state.cloud.projectId || intent.checkpointId !== state.cloud.checkpointId || intent.destination !== state.cloud.destination || (intent.destinationId ?? '') !== state.cloud.destinationId || !state.cloud.checkpoints.some(item => item.id === intent.checkpointId)) fail('CHECKPOINT_MISMATCH');
+        payload = { ...binding, projectId: intent.projectId, checkpointId: intent.checkpointId,
+          ...(intent.destinationId ? { destinationId: intent.destinationId } : { destination: intent.destination }), confirm: true, requestId: intent.requestId };
       } else {
         if (!deriveView(state).canImport || intent.restoreId !== state.status.recovery.id || intent.root !== state.status.recovery.root) fail('RECOVERY_UNAVAILABLE');
         payload = { ...binding, restoreId: intent.restoreId, confirm: true, requestId: intent.requestId };
@@ -696,9 +800,9 @@ export function createController(connection, options = {}) {
     } catch (error) {
       if (!disposed) {
         const safe = publicError(error);
-        const rejected = ['BAD_REQUEST', 'BAD_DESTINATION', 'DESTINATION_EXISTS', 'PROTECTED_DESTINATION', 'CHECKPOINT_MISMATCH', 'RECOVERY_UNAVAILABLE', 'RECOVERY_LIMIT', 'CONFIG_CONFLICT', 'ACCOUNT_MISMATCH', 'NOT_LOGGED_IN', 'BUSY', 'AUTH_REQUIRED', 'FORBIDDEN', 'NOT_DEPLOYED', 'RATE_LIMITED'].includes(safe.code);
+        const rejected = ['BAD_REQUEST', 'BAD_DESTINATION', 'DESTINATION_EXISTS', 'PROTECTED_DESTINATION', 'DIRECTORY_PICKER_EXPIRED', 'DESTINATION_CHANGED', 'CHECKPOINT_MISMATCH', 'RECOVERY_UNAVAILABLE', 'RECOVERY_LIMIT', 'CONFIG_CONFLICT', 'ACCOUNT_MISMATCH', 'NOT_LOGGED_IN', 'BUSY', 'AUTH_REQUIRED', 'FORBIDDEN', 'NOT_DEPLOYED', 'RATE_LIMITED'].includes(safe.code);
         update({ recoveryPending: rejected ? null : intent, recoveryUncertain: !rejected });
-        cloudUpdate({ error: rejected ? safe : publicError(new SettingsClientError('RECOVERY_UNCERTAIN')) });
+        cloudUpdate({ ...(['DIRECTORY_PICKER_EXPIRED', 'DESTINATION_CHANGED'].includes(safe.code) ? clearedDestination(state.cloud) : {}), error: rejected ? safe : publicError(new SettingsClientError('RECOVERY_UNCERTAIN')) });
         if (['CONFIG_CONFLICT', 'ACCOUNT_MISMATCH', 'NOT_LOGGED_IN'].includes(safe.code)) update({ cloud: newCloud() });
       }
     } finally {
@@ -714,7 +818,7 @@ export function createController(connection, options = {}) {
   }
   const updateReport = error => { update({ updateError: publicError(error), updateIntent: null }); return false; };
   async function refreshUpdate() {
-    if (disposed || state.busy) return false;
+    if (disposed || (state.busy && !destinationAction(state.busy))) return false;
     clearPoll(); invalidateRefresh();
     const current = generation;
     const abort = new AbortController(); refreshAbort = abort;
@@ -812,18 +916,24 @@ export function createController(connection, options = {}) {
     cancelUpdateIntent() { update({ updateIntent: null }); },
     browseProjects: () => browse('projects'),
     loadCheckpoints: () => browse('checkpoints'),
+    chooseDestination: () => destinationRequest('destinationpick'),
+    browseDestination: nodeId => destinationRequest('destinationbrowse', nodeId),
+    selectDestination: (nodeId = state.cloud.directoryBrowser?.currentId) => destinationRequest('destinationselect', nodeId),
+    closeDestinationBrowser,
     setCloudProject(projectId) {
       if (!cloudEditable() || !text(projectId, 100)) return false;
-      cloudUpdate({ binding: bindingOf(state.status), projectId, checkpoints: freeze([]), heads: freeze([]), checkpointId: '', loaded: false, intent: null, error: null });
+      invalidateDestinationRequest();
+      cloudUpdate({ ...clearedDestination(state.cloud), binding: bindingOf(state.status), projectId, checkpoints: freeze([]), heads: freeze([]), checkpointId: '', loaded: false, error: null });
       return true;
     },
     selectCheckpoint(id) {
       if (!cloudEditable() || (id !== '' && !state.cloud.checkpoints.some(item => item.id === id))) return false;
-      cloudUpdate({ checkpointId: id, intent: null, error: null }); return true;
+      invalidateDestinationRequest();
+      cloudUpdate({ ...clearedDestination(state.cloud), checkpointId: id, error: null }); return true;
     },
     setDestination(destination) {
       if (!cloudEditable() || !text(destination, 4096)) return false;
-      cloudUpdate({ destination, intent: null, error: null }); return true;
+      cloudUpdate({ destination, destinationId: '', directoryBrowser: null, intent: null, error: null }); return true;
     },
     prepareRestore: () => prepareRecovery('restore'),
     prepareImport: () => prepareRecovery('import'),
@@ -841,6 +951,7 @@ export function createController(connection, options = {}) {
         if (ended) return;
         ended = true;
         if (--watchers === 0) {
+          closeDestinationBrowser();
           clearPoll();
           invalidateRefresh();
           update({ refreshing: false, loading: !state.status, updateIntent: null });
@@ -914,6 +1025,7 @@ export function createController(connection, options = {}) {
       clearPoll();
       invalidateRefresh();
       active?.abort();
+      invalidateDestinationRequest();
       listeners.clear();
       state = freeze({ ...state, busy: null, refreshing: false });
     },

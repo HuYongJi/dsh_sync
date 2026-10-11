@@ -73,7 +73,7 @@ test('plugin registers inert-by-default native login/commands and scoped setting
   t.after(() => hooks.find(([name]) => name === 'dispose')[1]());
   assert.equal(flows[0].key, credentialKeyForProfile(profileDir)); assert.equal(flows[0].methods[0].id, 'password');
   assert.equal(commands.length, 6); assert.ok(commands.every(command => command.recordInput === false));
-  assert.equal(routes.length, 14); assert.ok(routes.every(route => route.requestBody === 'streaming'));
+  assert.equal(routes.length, 17); assert.ok(routes.every(route => route.requestBody === 'streaming'));
 });
 test('native flow stores token only in its credential record and syncs only the mapped idle project', async t => {
   const directory = await temp(t), root = path.join(directory, 'root'); await fs.mkdir(root); await fs.writeFile(path.join(root, 'hello'), 'fixture');
