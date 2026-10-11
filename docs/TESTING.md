@@ -6,7 +6,7 @@
 node --test --test-isolation=none tests/*.test.mjs
 ```
 
-当前开发验证环境为 **Windows / Node.js 25.8.1**。全套测试已经运行：**179 项通过，0 失败，0 跳过**。服务只监听测试进程动态分配的 loopback 端口，使用测试密码和合成数据；临时文件局限在本仓库 `.test-tmp` 的独立子目录。
+当前开发验证环境为 **Windows / Node.js 25.8.1**。全套测试已经运行：**188 项通过，0 失败，0 跳过**。服务只监听测试进程动态分配的 loopback 端口，使用测试密码和合成数据；临时文件局限在本仓库 `.test-tmp` 的独立子目录。
 
 `--test-isolation=none` 避免 Windows 受限环境中测试运行器为子进程建立捕获管道。未开启替代 Web GUI 服务器、未访问真实账号数据、未上传真实项目、未修改已安装 DSH 或日常 profile。
 
@@ -22,6 +22,21 @@ node --test --test-isolation=none tests/*.test.mjs
 | [改密 Client](../tests/password-client.test.mjs) | 20 | 三个密码框清理、CAS 身份绑定、确认不发送、长度规则、当前密码拒绝、未知结果锁定、取消/超时不重发及精简 UI |
 | [改密 Host 与链路](../tests/password-host.test.mjs) | 19（含 2 个子测试） | 真实云端改密、所有旧 token 撤销、旧服务能力探测、intent 持久化/恢复、损坏回包、清理失败、秘密不落盘、Client→Host→云端闭环 |
 | [改密云服务](../tests/password-server.test.mjs) | 14 | 当前密码而非 token 鉴权、Unicode/JSON 边界、原子撤销、并发 CAS、旧登录/写入竞态、重启兼容及失败原子性 |
+| [GitHub 安装包](../tests/package.test.mjs) | 9 | 包入口、预构建产物一致性、仅发布白名单的独立包、缺失 Client、安装 lifecycle、可选/捆绑依赖、Cordis peer、不安全默认配置、错误模块 ID |
+
+## GitHub 地址安装的验证边界
+
+DSH 0.2.0-rc.2 的插件管理器原生识别 `https://github.com/HuYongJi/dsh_sync`，GitHub 连通检查后交给 pnpm 安装，再校验 bundle patch 与宿主 peer 版本。仓库包含预构建 Client，无需新增 `prepare`、`prepack` 或 `postinstall`。DSH profile 默认 `autoInstallPeers: false`，运行时提供已声明的宿主 SDK；不用把 peers 改成 dependencies 或安装另一份框架。
+
+```sh
+node scripts/check-install.mjs
+# 也可在源码仓库中核对一个已安装或解压的包目录：
+node scripts/check-install.mjs /absolute/path/to/dsh-personal-sync
+```
+
+检查真实 Host 模块导入、包 exports、Client ModuleLoader 注册和无自动同步的 patch，但**不调用 Host/Client 的 apply，不启动 DSH、不访问真实 profile，也不验证浏览器挂载或宿主服务注入**。回归测试另外将发布白名单复制到独立合成目录，确认没有源码工具、测试目录或 node_modules 仍能通过入口核验；这不是调用包管理器的替代品。已提交 Client 与源码逐字一致的测试在构建前即可发现过期产物。
+
+实际 GitHub 下载还需要联网的包管理器烟测。应使用独立目录及缓存，以 DSH 对应的 pnpm 配置测试，保留 TLS、版本检查与默认脚本批准策略；只运行 `--ignore-scripts` 不能证明默认安装策略下成功。pnpm 11 的 `autoInstallPeers` 等设置使用测试目录内的 `pnpm-workspace.yaml`，不能仅写入 `.npmrc`。所有这些包级验证仍不等价于真实 DSH GUI 安装验收。
 
 ## 额外通过：真实已安装 SDK / JSONL provider 烟测
 

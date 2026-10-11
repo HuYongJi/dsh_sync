@@ -5,10 +5,12 @@ import { gzipSync } from 'node:zlib';
 import { sha256 } from '../src/protocol.mjs';
 import { assertNoSymlinks, atomicWrite } from '../src/files.mjs';
 import { buildClient } from './build-client.mjs';
+import { checkInstall } from './check-install.mjs';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const pkg = JSON.parse(await fs.readFile(path.join(root, 'package.json'), 'utf8'));
 await buildClient();
+await checkInstall(root);
 const entries = [];
 async function add(relative) {
   const absolute = await assertNoSymlinks(path.join(root, relative));

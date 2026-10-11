@@ -2,6 +2,21 @@
 
 **各终端本地运行，云端只负责认证与存储。** 不替代 DeepSeek/Codex 登录，不在云端执行你的项目。
 
+## 直接粘贴 GitHub 地址安装
+
+适用于 **DSH 0.2.0-rc.2**。在 DSH **插件 → 添加插件** 的“包名、GitHub 仓库地址或本地目录”输入框粘贴：
+
+```text
+https://github.com/HuYongJi/dsh_sync
+```
+
+点击 **安装**，完成后按宿主提示重新加载或重启，并刷新原 DSH 页面；进入 **设置 → 个人云同步** 即可配置使用。无需下载源码、运行命令、手写 YAML 或手动构建。
+
+- 地址填在上方的**插件地址输入框**，不是“安装源”。安装源保留正常 npm 官方源或中国大陆镜像源；镜像源不会代替 GitHub 的访问，仍需能连接 GitHub。
+- 仓库已经提交 Host、组合包声明及预构建 Client，安装不需要本插件的 `prepare` / `postinstall` 构建批准，复用 DSH 已提供的 React 与宿主 SDK，不捆绑另一份。不要关闭 DSH 的脚本或版本安全检查。
+- 已有旧版时按宿主支持的卸载/重新安装流程升级，不要删除 profile、会话或凭据目录。
+- 安装不代表部署云服务，也不会默认选择项目或开始上传；安装后的服务器登录仍需填写你自己的服务地址和账号。
+
 ## 安装后直接在设置页使用
 
 在原生 **设置 → 个人云同步** 页面完成日常配置。0.3.2 登录后收起服务器、账号和密码输入，仅显示已登录用户名；同步项目改为摘要卡片，通过“管理”弹窗选择。保留改密功能及 8 位最低密码要求：
@@ -27,7 +42,7 @@ https://github.com/HuYongJi/dsh-openai-oauth/dsh-mcp-connector
 而 `dshmarket`、`dsh-workbuddy-connect` 等也被拼到同一仓库地址后面，应优先排查 **npm registry（软件包源）被误设为 GitHub 仓库地址**。DSH 安装时会一并解析当前 profile 的其他直接依赖；这些名字不代表本插件依赖它们。
 
 - **软件包源**应使用 npm registry，例如 `https://registry.npmjs.org/`，不能填写 GitHub 仓库网页。若原本使用组织私有源，先确认正确配置，不要盲目改为公共源。
-- **待安装插件**填写在包名/安装地址位置。可使用新版[发布包](<dist/dsh-personal-sync-0.3.2.tgz>)；把包复制到目标电脑后，使用那台电脑上的实际绝对路径。它不是上例中的 OAuth 插件。
+- **待安装插件**填写在包名/安装地址位置，直接使用 `https://github.com/HuYongJi/dsh_sync`。需要离线安装时，可在源码目录运行 `node scripts/pack.mjs` 生成 tgz，复制到目标电脑后填写该电脑上的实际绝对路径。它不是上例中的 OAuth 插件。
 - DSH 的源选择优先级是：**本次安装指定的 registry → `dsh-plugin-manager` 的 registry 配置 → pnpm 自身配置**。优先纠正安装时指定的源；若仍错误，再检查宿主配置、profile/用户级 `.npmrc` 与 `NPM_CONFIG_REGISTRY` 环境变量。只改命令行中的全局源，不一定能覆盖 DSH 的设置。
 - 如果目标电脑可以直接运行 pnpm，可在报错所指的 profile 目录中执行 `pnpm config get registry`，只查看有效源。无需提供完整配置或任何 token。
 - 修正源后重试安装，按宿主提示重新加载/重启。`No authorization header was set` 本身不说明需要 GitHub token；`UND_ERR_DESTROYED` 重试也不能修正错误的源地址。不要为此删除 profile、会话或凭据，也不要关闭供应链检查。
@@ -113,11 +128,14 @@ CLI 默认使用 `~/.dsh-sync`，接受 `--state DIRECTORY`，**不读取 GUI �
 
 ```sh
 node scripts/build-client.mjs
+node scripts/check-install.mjs
 node --test --test-isolation=none tests/*.test.mjs
 node scripts/pack.mjs
 ```
 
-构建/服务/CLI 只依赖 Node 内置模块，打包会先构建 Client，并按 [包白名单](<package.json>) 收集代码。研究用安装副本、部署资料、测试数据、真实配置或 token 均不会入包。
+构建/服务/CLI 只依赖 Node 内置模块，打包会先构建 Client，并按 [包白名单](<package.json>) 收集代码。研究用安装副本、真实部署记录、测试数据、真实配置或 token 均不会入包；`deploy` 只包含通用部署模板。
+
+GitHub 安装使用已提交的 [Client 产物](<client/dist/client.js>)，而不是在用户电脑上重新构建。修改 Client 后必须重新构建并连同源码一起提交；[安装回归测试](<tests/package.test.mjs>)会检测产物过期、缺失入口、不安全默认值和新增安装脚本。[入口检查](<scripts/check-install.mjs>)也可接受已安装/解压的包目录参数；它只验证包与入口，不激活插件，不代表真实 GUI 已完成验收。
 
 已验证的测试层次和限制见 [测试报告](<docs/TESTING.md>)：包含 Client 状态/原生控件契约、Host RPC、真实 HTTP 云服务、取消与账号隔离，以及隔离 native SDK 烟测；不把这些测试冒称为当前日常 GUI 已安装成功。
 

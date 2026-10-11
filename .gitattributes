@@ -1,0 +1,5 @@
+# Keep source and the checked-in client bundle identical on Windows and Unix.
+* text=auto eol=lf
+*.tgz binary
+*.png binary
+*.jpg binary
