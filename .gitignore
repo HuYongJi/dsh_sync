@@ -1,0 +1,16 @@
+node_modules/
+.inspection/
+.deployment/
+/DEPLOYMENT-*.md
+.test-tmp/
+.dsh-sync/
+.data/
+dist/
+# GitHub installs need the generated native settings entry.
+!/client/dist/
+/client/dist/*
+!/client/dist/client.js
+.env
+.env.*
+*.log
+*.tmp

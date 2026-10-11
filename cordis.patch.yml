@@ -1,0 +1,7 @@
+# Installing this bundle never uploads anything by default.
+- insert:
+    - id: dsh-personal-sync
+      name: dsh-personal-sync
+      config:
+        autoSync: false
+        projects: []

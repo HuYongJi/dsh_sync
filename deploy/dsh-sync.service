@@ -1,0 +1,28 @@
+[Unit]
+Description=DSH personal checkpoint sync (loopback only)
+After=network.target
+
+[Service]
+Type=simple
+User=dsh-sync
+Group=dsh-sync
+WorkingDirectory=/opt/dsh-sync
+Environment=NODE_ENV=production
+EnvironmentFile=/etc/dsh-sync/server.env
+ExecStart=/usr/bin/node /opt/dsh-sync/server/main.mjs
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=45
+UMask=0077
+StateDirectory=dsh-sync
+StateDirectoryMode=0700
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/dsh-sync
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

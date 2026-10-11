@@ -1,0 +1,14 @@
+# Copy to your own Caddy configuration and replace this placeholder domain.
+# Do not run this unchanged. Configure DNS/firewall/TLS according to your deployment.
+# The Node service itself must remain bound to 127.0.0.1:8787 (default).
+# Caddy obtains/renews HTTPS certificates; never expose the Node HTTP port publicly.
+sync.example.com {
+    request_body {
+        max_size 64MiB
+    }
+    header {
+        Strict-Transport-Security "max-age=31536000"
+        X-Content-Type-Options "nosniff"
+    }
+    reverse_proxy 127.0.0.1:8787
+}
