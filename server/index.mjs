@@ -12,6 +12,9 @@ import {
 
 import { readStableFile } from '../src/files.mjs';
 import { projectFolderMetadata } from '../src/client.mjs';
+import { createSyncStore } from './sync-store.mjs';
+import { createSyncHttp } from './sync-http.mjs';
+import { createDeviceAuth, validateDeviceAuthState } from './device-auth.mjs';
 
 const scrypt = promisify(scryptCallback);
 async function committedManifest(store, entry) {
@@ -54,6 +57,9 @@ function canonicalJson(value) {
 }
 function manifestText(value) {
   const manifest = validateManifest(value);
+  // New writes must also be safe to display. Keep historical manifest decoding
+  // unchanged, but do not admit roots which poison authenticated project browsing.
+  projectFolderMetadata(manifest.sourceRoot);
   // These lists are sets semantically; object key and listing order do not defeat idempotence.
   manifest.sessionIds.sort();
   manifest.files.sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
@@ -135,7 +141,7 @@ async function passwordMatches(password, auth) {
 }
 
 function validateState(value) {
-  if (!isRecord(value) || value.version !== 1 || !isRecord(value.auth) || !Array.isArray(value.tokens) || !Array.isArray(value.checkpoints)) {
+  if (!isRecord(value) || ![1, 2].includes(value.version) || !isRecord(value.auth) || !Array.isArray(value.tokens) || !Array.isArray(value.checkpoints)) {
     throw new Error('Invalid storage state');
   }
   const auth = value.auth;
@@ -163,7 +169,9 @@ function validateState(value) {
         (entry.parentId !== null && ids.get(entry.parentId)?.projectId !== entry.projectId)) throw new Error('Invalid checkpoint index');
     ids.set(entry.id, entry);
   }
-  return { ...value, auth: { ...auth, passwordRevision } };
+  if (value.version === 2) validateId(value.serverId);
+  const normalized = { ...value, auth: { ...auth, passwordRevision } };
+  return { ...normalized, ...validateDeviceAuthState(normalized) };
 }
 
 async function openStore(dataDir, username, password, loadBootstrapPassword) {
@@ -219,7 +227,7 @@ async function openStore(dataDir, username, password, loadBootstrapPassword) {
       if (contents.some(name => !allowed.has(name)) || occupied) throw new Error('Refusing to bootstrap nonempty storage without its state');
       const salt = randomBytes(32).toString('hex');
       state = {
-        version: 1,
+        version: 2, serverId: `server-${randomBytes(16).toString('hex')}`, families: [],
         auth: { username, algorithm: 'scrypt', salt, hash: (await passwordHash(password, salt)).toString('hex'), N: SCRYPT.N, r: SCRYPT.r, p: SCRYPT.p, passwordRevision: 0 },
         tokens: [], checkpoints: [],
       };
@@ -234,6 +242,22 @@ async function openStore(dataDir, username, password, loadBootstrapPassword) {
       if (password !== undefined && (!validPassword(password) || !(await passwordMatches(password, state.auth)))) {
         throw new Error('Bootstrap password does not match the existing account; automatic password reset is disabled');
       }
+    }
+    if (state.version === 1) {
+      // A schema-version fence prevents an old binary from bypassing v2 project
+      // migration or refresh-family revocation. Keep an owner-only pre-upgrade copy.
+      const backup = path.join(root, 'state-v1-before-upgrade.json');
+      let handle;
+      try {
+        handle = await fs.open(backup, 'wx', 0o600);
+        await handle.writeFile(JSON.stringify(state)); await handle.sync();
+      } catch (error) {
+        if (error.code !== 'EEXIST') throw error;
+        const prior = JSON.parse((await readStableFile(backup, 64 * 1024 * 1024)).bytes.toString('utf8'));
+        if (canonicalJson(prior) !== canonicalJson(state)) throw new Error('Pre-upgrade state backup differs; inspect storage before migrating');
+      } finally { await handle?.close(); }
+      state = { ...state, version: 2, serverId: `server-${randomBytes(16).toString('hex')}`, families: [] };
+      await atomicWrite(statePath, JSON.stringify(state));
     }
     const store = {
       root, blobDir, checkpointDir, temporaryDir, state, tail: Promise.resolve(), release,
@@ -266,7 +290,10 @@ function sendError(req, res, error) {
   if (res.headersSent) { res.destroy(); return; }
   const status = Number.isInteger(error.status) && error.status >= 400 && error.status < 600 ? error.status : 500;
   const message = status === 401 ? 'Unauthorized' : status === 404 ? 'Not found' : status >= 500 ? 'Internal server error' : error.message;
-  sendJson(req, res, status, { error: message });
+  const v2 = req.url?.startsWith('/v2/');
+  const safeCodes = new Set(['SYNC_PROJECT_CORRUPT', 'SYNC_HEAD_MISMATCH', 'SYNC_LEGACY_HEAD_MISMATCH', 'SYNC_MIGRATION_REQUIRED', 'SYNC_ALREADY_MIGRATED', 'SYNC_CLIENT_UPGRADE_REQUIRED', 'BAD_REQUEST']);
+  const code = safeCodes.has(error.code) ? error.code : status === 401 ? 'NOT_LOGGED_IN' : status === 429 ? 'RATE_LIMITED' : status === 409 ? 'SYNC_CONFLICT' : status >= 500 ? 'SERVER_UNAVAILABLE' : 'BAD_REQUEST';
+  sendJson(req, res, status, { error: message, ...(v2 ? { code } : {}) });
 }
 function contentLimit(req, limit) {
   const length = req.headers['content-length'];
@@ -351,6 +378,9 @@ async function uploadBlob(req, store, hash, limit, token) {
       try {
         const existing = await regularFile(target);
         if (existing.size !== size) throw problem(409, 'Stored blob size is inconsistent');
+        const stored = await readStableFile(target, limit);
+        if (stored.bytes.length !== size || sha256(stored.bytes) !== hash) throw problem(409, 'Stored blob integrity check failed');
+        assertTokenStillValid(token, store.state);
         return 204;
       } catch (error) { if (error.code !== 'ENOENT') throw error; }
       await fs.rename(temporary, target);
@@ -400,6 +430,18 @@ export async function createSyncServer(options = {}) {
     maxEntries: positiveInteger(options.loginMaxEntries, 1024, 'loginMaxEntries', 100_000),
   });
   const store = await openStore(options.dataDir, options.username, options.password, options.loadBootstrapPassword);
+  const verifyBlob = async ({ hash, size }) => {
+    validateBlobHash(hash);
+    const { bytes } = await readStableFile(path.join(store.blobDir, hash), maxBlobBytes);
+    if (bytes.length !== size || sha256(bytes) !== hash) throw problem(409, 'Referenced blob integrity check failed');
+  };
+  let sync, deviceAuth;
+  try {
+    deviceAuth = createDeviceAuth({ store, tokenTtlMs, maxTokens, ...(options.refreshIdleMs === undefined ? {} : { refreshIdleMs: options.refreshIdleMs }), ...(options.refreshAbsoluteMs === undefined ? {} : { refreshAbsoluteMs: options.refreshAbsoluteMs }) });
+    sync = await createSyncStore({ directory: path.join(store.root, 'sync-v2'), exclusive: task => store.exclusive(task), verifyBlob });
+  } catch (error) { await store.release(); throw error; }
+  const syncHttp = createSyncHttp({ sync, store, readJson, sendJson, assertTokenStillValid, verifyBlob, headsFor });
+  const publicGrant = value => ({ ...value, expiresAt: new Date(value.expiresAt).toISOString(), refreshExpiresAt: new Date(value.refreshExpiresAt).toISOString(), absoluteExpiresAt: new Date(value.absoluteExpiresAt).toISOString(), serverId: store.state.serverId });
   let loginConcurrency = 0, closing = false, closingPromise;
   const active = new Set();
   const sockets = new Set();
@@ -411,10 +453,11 @@ export async function createSyncServer(options = {}) {
     const pathname = url.pathname;
     if (req.method === 'GET' && pathname === '/health') {
       res.setHeader('X-DSH-Sync-Password-Change', '1');
+      res.setHeader('X-DSH-Sync-Protocol', '2');
       sendJson(req, res, 200, { ok: true }); return;
     }
-    const changingPassword = pathname === '/v1/password';
-    if (req.method === 'POST' && (pathname === '/v1/login' || changingPassword)) {
+    const changingPassword = pathname === '/v1/password', renewableLogin = pathname === '/v2/login';
+    if (req.method === 'POST' && (pathname === '/v1/login' || renewableLogin || changingPassword)) {
       // Both routes share the same per-address budget and concurrent KDF slots.
       if (!limiter.take(req.socket.remoteAddress ?? 'unknown') || loginConcurrency >= maxLoginConcurrency) {
         res.setHeader('Retry-After', '60'); throw problem(429, 'Too many login attempts');
@@ -452,9 +495,13 @@ export async function createSyncServer(options = {}) {
         await store.exclusive(async () => {
           assertPasswordStillCurrent(auth, store.state);
           // Credential replacement and revocation have one durable commit point.
-          await store.save({ ...store.state, auth: nextAuth, tokens: [] });
+          await store.save({ ...store.state, auth: nextAuth, tokens: [], families: [] });
         });
         sendJson(req, res, 200, { changed: true }); return;
+      }
+      if (renewableLogin) {
+        const grant = await deviceAuth.issue({ deviceId, authSnapshot: auth });
+        sendJson(req, res, 200, publicGrant(grant)); return;
       }
       const token = randomBytes(32).toString('base64url');
       const expiresAt = Date.now() + tokenTtlMs;
@@ -468,14 +515,20 @@ export async function createSyncServer(options = {}) {
       });
       sendJson(req, res, 200, { token, expiresAt: new Date(expiresAt).toISOString() }); return;
     }
+    if (req.method === 'POST' && ['/v2/refresh', '/v2/revoke'].includes(pathname)) {
+      if (!limiter.take(req.socket.remoteAddress ?? 'unknown')) { res.setHeader('Retry-After', '60'); throw problem(429, 'Too many authentication attempts'); }
+      const input = await readJson(req, LOGIN_BODY_LIMIT);
+      if (!isRecord(input) || Object.keys(input).some(key => !['deviceId', 'familyId', 'refreshToken'].includes(key))) throw problem(400, 'Invalid refresh request');
+      if (pathname === '/v2/refresh') sendJson(req, res, 200, publicGrant(await deviceAuth.refresh(input)));
+      else { await deviceAuth.revokeFamily(input); sendJson(req, res, 204); }
+      return;
+    }
     const token = bearer(req, store.state);
-    if (req.method === 'POST' && pathname === '/v1/logout') {
-      await store.exclusive(async () => {
-        assertTokenStillValid(token, store.state);
-        await store.save({ ...store.state, tokens: store.state.tokens.filter(item => item.hash !== token.hash && item.expiresAt > Date.now()) });
-      });
+    if (req.method === 'POST' && ['/v1/logout', '/v2/logout'].includes(pathname)) {
+      await deviceAuth.logout({ token });
       sendJson(req, res, 204); return;
     }
+    if (pathname.startsWith('/v2/') && await syncHttp(req, res, url, token)) return;
     if (pathname === '/v1/projects' && req.method === 'GET') {
       // Only the committed index is authoritative; never enumerate orphan manifests.
       const projects = new Map(), latest = new Map();
@@ -486,15 +539,23 @@ export async function createSyncServer(options = {}) {
         else projects.set(entry.projectId, { projectId: entry.projectId, checkpointCount: 1, latestCreatedAt: entry.createdAt });
         latest.set(entry.projectId, entry); // Append order is commit order; timestamps do not choose a branch.
       }
+      let partial = false;
       for (const [projectId, entry] of latest) {
-        const manifest = await committedManifest(store, entry);
-        Object.assign(projects.get(projectId), projectFolderMetadata(manifest.sourceRoot), { latestCheckpointId: manifest.id });
+        try {
+          const manifest = await committedManifest(store, entry);
+          Object.assign(projects.get(projectId), projectFolderMetadata(manifest.sourceRoot), { latestCheckpointId: manifest.id });
+        } catch {
+          // An unavailable project is not permission to present an older snapshot,
+          // and must not prevent browsing unrelated, verified projects.
+          projects.delete(projectId); partial = true;
+        }
       }
       assertTokenStillValid(token, store.state);
-      sendJson(req, res, 200, { projects: [...projects.values()].sort((a, b) => a.projectId.localeCompare(b.projectId, 'en')) }); return;
+      sendJson(req, res, 200, { projects: [...projects.values()].sort((a, b) => a.projectId.localeCompare(b.projectId, 'en')), ...(partial ? { partial: true } : {}) }); return;
     }
     if (pathname === '/v1/checkpoints' && req.method === 'GET') {
       const projectId = validateId(url.searchParams.get('projectId'));
+      if (await sync.head(projectId)) throw Object.assign(problem(426, 'This project requires a v2 sync client'), { code: 'SYNC_CLIENT_UPGRADE_REQUIRED' });
       const state = store.state;
       sendJson(req, res, 200, { checkpoints: state.checkpoints.filter(entry => entry.projectId === projectId).map(publicMetadata), heads: headsFor(state, projectId) }); return;
     }
@@ -505,6 +566,7 @@ export async function createSyncServer(options = {}) {
       const result = await store.exclusive(async () => {
         assertTokenStillValid(token, store.state);
         const state = store.state;
+        if (await sync.head(manifest.projectId)) throw Object.assign(problem(426, 'This project requires a v2 sync client'), { code: 'SYNC_CLIENT_UPGRADE_REQUIRED' });
         const existing = state.checkpoints.find(entry => entry.id === manifest.id);
         if (existing) {
           if (existing.manifestSha256 !== manifestSha256) throw problem(409, 'Checkpoint id already exists with different content');
@@ -521,7 +583,10 @@ export async function createSyncServer(options = {}) {
           try { info = await regularFile(path.join(store.blobDir, file.sha256)); }
           catch (error) { if (error.code === 'ENOENT') throw problem(409, 'Referenced blob is missing'); throw error; }
           if (info.size !== file.size) throw problem(409, 'Referenced blob size does not match');
+          const stored = await readStableFile(path.join(store.blobDir, file.sha256), maxBlobBytes);
+          if (stored.bytes.length !== file.size || sha256(stored.bytes) !== file.sha256) throw problem(409, 'Referenced blob integrity check failed');
         }
+        assertTokenStillValid(token, store.state);
         const previousHeads = headsFor(state, manifest.projectId);
         const conflict = manifest.parentId === null ? previousHeads.length > 0 : !previousHeads.includes(manifest.parentId);
         const entry = {

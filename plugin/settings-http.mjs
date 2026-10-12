@@ -1,9 +1,49 @@
 import { settingsFailure } from './settings-service.mjs';
+import { BIDIRECTIONAL_ACTIONS } from './bidirectional-service.mjs';
 
 export const SETTINGS_API = '/api/dsh-personal-sync/';
 export const MAX_SETTINGS_BODY = 64 * 1024;
 const messages = Object.freeze({
   BAD_REQUEST: '参数无效',
+  AUTH_RENEWAL_UNCERTAIN: '登录续期结果未确认，请重新登录',
+  SYNC_ARCHIVES_UNSUPPORTED: '此宿主暂不能归档会话，文件同步不受影响',
+  SYNC_ARCHIVES_SKIPPED: '部分会话已延后或仅可归档，文件同步不受影响',
+  SYNC_IMPORT_UNCERTAIN: '会话导入结果需核对，请保存新会话 ID，不要重复导入',
+  SYNC_IMPORT_SKIPPED: '会话不支持安全导入，已保留归档',
+  SYNC_IMPORT_UNATTACHED: '会话已写入但未关联项目，请核对新会话 ID',
+  SYNC_REPAIR_INCOMPLETE: '中断事务的核对尚未完成，请重新预览',
+  SYNC_REPAIR_UNAVAILABLE: '没有需要核对的中断事务',
+  SYNC_REPAIR_CHANGED: '文件或事务已变更，请重新预览',
+  SYNC_REPAIR_EXPIRED: '核对预览已过期，请重新预览',
+  SYNC_COMMIT_UNCERTAIN: '云端提交仍未确认，请先核对同步状态',
+  SYNC_REQUEST_CONFLICT: '请求记录不一致，请重新预览',
+  SYNC_PLAN_EXPIRED: '确认已过期，请重新预览',
+  SYNC_PLAN_CHANGED: '项目或设置已变更，请重新预览',
+  SYNC_MANAGED_PROJECT: '此项目已使用双向同步，请在双向同步中管理',
+  SYNC_CLIENT_UPGRADE_REQUIRED: '请升级同步服务器和各端插件后开启双向同步',
+  SYNC_MIGRATION_REQUIRED: '请先完成项目的双向同步连接',
+  SYNC_LEGACY_HEAD_MISMATCH: '旧项目出现新内容，请重新预览迁移',
+  SYNC_HEAD_MISMATCH: '云端内容已变更，请重新预览',
+  SYNC_ROOT_CHANGED: '项目目录已变更，已停止写入',
+  SYNC_POLICY_CHANGED: '排除规则已变更，请重新核对',
+  SYNC_LOCAL_CHANGED: '本机内容已变更，已保留双方内容',
+  SYNC_QUOTA: '同步存储达到安全上限，请检查回收副本和队列',
+  SYNC_INTEGRITY: '内容校验失败，未覆盖本机文件',
+  SYNC_PROJECT_CORRUPT: '云端项目校验失败，请检查服务器存储',
+  SYNC_METADATA_UNSAFE: '同步元数据路径不安全，已停止写入',
+  SYNC_VOLUME_CHANGED: '项目包含不同磁盘的挂载点，已停止写入',
+  SYNC_NOT_IDLE: '项目任务正在运行，等待空闲后应用更新',
+  SYNC_BINDING_MISMATCH: '同步绑定已变更，请重新核对授权',
+  SYNC_JOURNAL_CORRUPT: '同步事务记录损坏，已停止自动操作',
+  SYNC_STRUCTURAL_CONFLICT: '文件与目录或大小写冲突，请先调整冲突路径',
+  SYNC_UNTRACKED_DELETE: '无法证明删除来源，已保留本机文件',
+  SYNC_REMOTE_BLOB_MISSING: '云端缺少已记录的内容，请检查存储',
+  SYNC_APPLY_INCOMPLETE: '本机应用尚未完成，请核对任务结果',
+  SYNC_CONFLICT_CHANGED: '冲突已变化，请重新选择',
+  SYNC_CANCELLED: '操作已停止，已完成内容与回收副本保留',
+  SYNC_REPLAN_REQUIRED: '中断的事务需要核对，未自动重复写入',
+  SYNC_DESTINATION_UNAVAILABLE: '无法规划安全的新副本路径',
+  SERVER_UNAVAILABLE: '服务器暂时不可用，稍后自动重试',
   DOWNLOAD_CANCELLED: '已停止剩余下载',
   DOWNLOAD_LIMIT: '最多选择20个项目',
   DOWNLOAD_FINALIZATION_FAILED: '文件已下载，状态清理未完成',
@@ -33,7 +73,9 @@ const messages = Object.freeze({
   RESTORE_FAILED: '下载恢复未完成，请检查不完整目录',
   IMPORT_FAILED: '会话导入未全部完成，请检查结果',
   RECOVERY_UNAVAILABLE: '没有可导入的本次下载恢复',
-  RECOVERY_LIMIT: '本次插件运行的恢复请求已达上限',
+  RECOVERY_LIMIT: '恢复请求记录已达安全上限',
+  RECOVERY_STATE_CORRUPT: '恢复记录无法安全读取，已停止恢复操作',
+  PROJECT_REGISTRATION_UNCERTAIN: '项目登记结果未确认，请先核对 DSH 项目列表',
   NOT_LOGGED_IN: '请重新登录',
   ACCOUNT_MISMATCH: '账号不一致，请重新登录',
   ACCOUNT_BOUND: '账号已绑定同步记录',
@@ -111,7 +153,7 @@ async function readBody(request, timeoutMs) {
 export function createSettingsHttp(service, { bodyTimeoutMs = 10_000, maxActive = 16 } = {}) {
   let disposed = false, active = 0;
   const loginAttempts = [];
-  const actions = new Set(['status', 'login', 'password', 'preferences', 'sync', 'logout', 'projects', 'checkpoints', 'destinationpick', 'destinationbrowse', 'destinationselect', 'downloadpick', 'downloadbrowse', 'downloadselect', 'downloadstart', 'restore', 'import', 'updatestatus', 'checkupdate', 'installupdate', 'cancelupdate']);
+  const actions = new Set(['status', 'login', 'password', 'preferences', 'sync', 'logout', 'projects', 'checkpoints', 'destinationpick', 'destinationbrowse', 'destinationselect', 'downloadpick', 'downloadbrowse', 'downloadselect', 'downloadstart', 'restore', 'import', 'registerproject', 'updatestatus', 'checkupdate', 'installupdate', 'cancelupdate', ...BIDIRECTIONAL_ACTIONS]);
   return {
     async fetch(action, request) {
       let rpcId, payload;
@@ -142,7 +184,7 @@ export function createSettingsHttp(service, { bodyTimeoutMs = 10_000, maxActive 
           value = action === 'login' ? await service.login(payload, request.signal) : await service.password(payload, request.signal);
         } else if (action === 'preferences') value = await service.savePreferences(payload, request.signal);
         else if (action === 'sync') value = await service.sync(payload);
-        else if (['projects', 'checkpoints', 'destinationpick', 'destinationbrowse', 'destinationselect', 'downloadpick', 'downloadbrowse', 'downloadselect', 'downloadstart', 'restore', 'import', 'updatestatus', 'checkupdate', 'installupdate', 'cancelupdate'].includes(action)) value = await service[action](payload, request.signal);
+        else if (['projects', 'checkpoints', 'destinationpick', 'destinationbrowse', 'destinationselect', 'downloadpick', 'downloadbrowse', 'downloadselect', 'downloadstart', 'restore', 'import', 'registerproject', 'updatestatus', 'checkupdate', 'installupdate', 'cancelupdate', ...BIDIRECTIONAL_ACTIONS].includes(action)) value = await service[action](payload, request.signal);
         else value = await service.logout(payload);
         return response(rpcId ? { type: 'server-response', rpcId, result: { ok: true, value } } : value);
       } catch (error) {
@@ -161,7 +203,7 @@ export function createSettingsHttp(service, { bodyTimeoutMs = 10_000, maxActive 
   };
 }
 export function registerSettingsRoutes(ctx, bridge) {
-  for (const action of ['status', 'login', 'password', 'preferences', 'sync', 'logout', 'projects', 'checkpoints', 'destinationpick', 'destinationbrowse', 'destinationselect', 'downloadpick', 'downloadbrowse', 'downloadselect', 'downloadstart', 'restore', 'import', 'updatestatus', 'checkupdate', 'installupdate', 'cancelupdate']) {
+  for (const action of ['status', 'login', 'password', 'preferences', 'sync', 'logout', 'projects', 'checkpoints', 'destinationpick', 'destinationbrowse', 'destinationselect', 'downloadpick', 'downloadbrowse', 'downloadselect', 'downloadstart', 'restore', 'import', 'registerproject', 'updatestatus', 'checkupdate', 'installupdate', 'cancelupdate', ...BIDIRECTIONAL_ACTIONS]) {
     ctx.connection.fetch.register({ path: SETTINGS_API + action, methods: ['POST'], requestBody: 'streaming', fetch: request => bridge.fetch(action, request) });
   }
 }

@@ -578,7 +578,7 @@ test('client adapter registers the real native settings slot and only requires H
   assert.equal(page.calls.length, 0);
   const initial = page.tree();
   assert.equal(mainButton(initial, '管理').props.disabled, true);
-  assert.equal(nodes(initial).some(node => node.type === 'native:Checkbox' || node.props.type === 'search'), false);
+  assert.equal(nodes(initial).some(node => (node.type === 'native:Checkbox' && node.props['data-personal-sync'] !== 'remember-device') || node.props.type === 'search'), false);
   page.mountEffects(); await settle();
   const tree = page.tree();
   assert.equal(nodes(tree).some(node => node.type === 'aside' || (node.type !== 'native:Modal' && node.props?.title) || node.props?.description), false);
@@ -660,7 +660,8 @@ test('client adapter unmounts all login fields on a same-identity logged-in tran
   assert.equal(controls.some(node => node.type === 'native:Button' && /^(重新)?登录$/.test(renderedText(node))), false);
   assert.ok(renderedText(tree).includes(current.username));
   assert.equal(renderedText(tree).includes('unsubmitted-account'), false);
-  assert.equal(renderedText(tree).includes(current.server), false);
+  assert.equal(renderedText(tree).includes(current.server), true);
+  assert.ok(controls.some(node => node.props['aria-label'] === '已连接服务器')); // Readonly origin, never a mounted login field.
   assert.equal(mainButton(tree, '修改密码').props.disabled, false);
   assert.equal(mainButton(tree, '退出登录').props.disabled, false);
   current = { ...current, loggedIn: false }; // Expiry restores inputs without reviving a secret.
@@ -813,7 +814,7 @@ test('client project summary shows only draft selections, at most three names an
   assert.match(renderedText(card), /另有 2 个项目/);
   for (const project of projects) assert.equal(renderedText(card).includes(project.root), false);
   assert.equal(nodes(card).some(node => ['native:Input', 'native:Checkbox', 'native:Switch'].includes(node.type)), false);
-  assert.equal(nodes(page.tree()).some(node => node.type === 'native:Checkbox' || node.props.type === 'search'), false);
+  assert.equal(nodes(page.tree()).some(node => (node.type === 'native:Checkbox' && node.props['data-personal-sync'] !== 'remember-device') || node.props.type === 'search'), false);
   const modal = openProjects(page);
   assert.equal(nodes(modal).filter(node => node.type === 'native:Checkbox').length, projects.length);
   for (const project of projects) assert.ok(renderedText(modal).includes(project.root));
@@ -853,7 +854,7 @@ test('client project management mounts only while open and close preserves unsav
     assert.equal(mainButton(page.tree(), '撤销更改').props.disabled, false);
     if (closeWith === 'footer') button(modal, '关闭').props.onClick(); else modal.props.onClose();
     assert.equal(Boolean(projectModal(page)?.props.open), false);
-    assert.equal(nodes(page.tree()).some(node => node.type === 'native:Checkbox' || node.props.type === 'search'), false);
+    assert.equal(nodes(page.tree()).some(node => (node.type === 'native:Checkbox' && node.props['data-personal-sync'] !== 'remember-device') || node.props.type === 'search'), false);
     assert.equal(renderedText(page.tree()).includes(p1.root), false);
     assert.deepEqual(page.controller.getSnapshot().draft.projectIds, [p1.id]);
     assert.equal(page.controller.getSnapshot().dirty, true);
@@ -919,7 +920,7 @@ test('client project search and multi-select save explicitly; pending save locks
   assert.equal(Boolean(projectModal(page)?.props.open), false);
   assert.equal(page.controller.getSnapshot().dirty, false);
   assert.deepEqual(page.calls.map(call => call.action), ['status', 'preferences']);
-  assert.equal(nodes(page.tree()).some(node => node.type === 'native:Checkbox' || node.props.type === 'search'), false);
+  assert.equal(nodes(page.tree()).some(node => (node.type === 'native:Checkbox' && node.props['data-personal-sync'] !== 'remember-device') || node.props.type === 'search'), false);
 });
 
 test('client project save failure stays open with a safe error, and close does not discard or retry', async t => {

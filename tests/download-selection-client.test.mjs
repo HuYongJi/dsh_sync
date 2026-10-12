@@ -278,7 +278,7 @@ test('combobox filters, pointer-selects, keeps ordinary editing keys and closes 
   const escape = key('Escape'); manager(p).props.onKeyDownCapture(escape); assert.equal(escape.prevented, true); assert.equal(escape.stopped, true); assert.equal(manager(p).props.open, true); assert.equal(combo(p).props['aria-expanded'], false);
   const outer = key('Escape'); manager(p).props.onKeyDownCapture(outer); assert.equal(outer.prevented, false);
   combo(p).props.onFocus(); nodes(manager(p)).find(node => node.props?.role === 'option').props.onClick(); await settle(); assert.equal(p.controller.getSnapshot().downloadSelection[0].projectId, 'project-2');
-  button(manager(p), '完成').props.onClick(); assert.equal(manager(p).props.open, false); assert.equal(p.controller.getSnapshot().downloadSelection.length, 1);
+  button(manager(p), '关闭').props.onClick(); assert.equal(manager(p).props.open, false); assert.equal(p.controller.getSnapshot().downloadSelection.length, 1);
 });
 
 test('dropdown DOM stays bounded at100, highlights never reference filtered-out IDs, and empty results explain state', async t => {
@@ -292,7 +292,7 @@ test('already-focused Input click reopens suggestions; reopen resets interrupted
   const p = page(t); await open(p); combo(p).props.onClick(); assert.equal(combo(p).props['aria-expanded'], true);
   combo(p).props.onKeyDown(key('ArrowDown')); combo(p).props.onKeyDown(key('Enter')); await settle(); assert.equal(p.controller.getSnapshot().downloadSelection.length, 1);
   assert.equal(combo(p).props['aria-expanded'], false); combo(p).props.onClick(); assert.equal(combo(p).props['aria-expanded'], true);
-  combo(p).props.onCompositionStart(); button(manager(p), '完成').props.onClick();
+  combo(p).props.onCompositionStart(); button(manager(p), '关闭').props.onClick();
   const before = p.calls.filter(call => call.action === 'projects').length;
   nodes(p.tree()).find(node => node.props?.['aria-label'] === '管理下载项目').props.onClick(); await settle();
   assert.equal(p.calls.filter(call => call.action === 'projects').length, before + 1); assert.equal(p.controller.getSnapshot().downloadSelection.length, 1);
@@ -310,7 +310,7 @@ test('chosen rows contain only folder labels/removal and duplicate-name disambig
   assert.deepEqual(nodes(chosen).filter(node => node.type === 'native:Button').map(text), ['移除', '移除']);
   assert.doesNotMatch(text(chosen), /版本|检查点|分支|个文件|字节|2026/);
   assert.equal(p.calls.some(call => ['checkpoints', 'downloadpick', 'downloadstart'].includes(call.action)), false);
-  button(manager(p), '完成').props.onClick(); button(p.tree(), '保存位置').props.onClick(); await settle();
+  button(manager(p), '关闭').props.onClick(); button(p.tree(), '保存位置').props.onClick(); await settle();
   button(p.tree(), '下载所选').props.onClick();
   const review = nodes(p.tree()).find(node => node.type === 'native:Modal' && node.props.title === '确认下载所选项目');
   const intent = p.controller.getSnapshot().downloadIntent;

@@ -349,7 +349,7 @@ async function addPageProject(page) {
 }
 async function selectPage(page) {
   await browsePage(page); await addPageProject(page);
-  button(modal(page, managerTitle), '完成').props.onClick();
+  button(modal(page, managerTitle), '关闭').props.onClick();
   button(page.tree(), '保存位置').props.onClick(); await settle();
 }
 
@@ -365,7 +365,7 @@ test('recovery GUI stays compact/inert and uses positive latest-only chosen rows
   assert.equal(button(page.tree(), '保存位置').props.disabled, false);
   assert.doesNotMatch(renderedText(browse), /版本|检查点|分支|设备|project-one|手动输入|绝对路径|字节/);
   assert.equal(page.calls.some(call => call.action === 'checkpoints'), false);
-  button(modal(page, managerTitle), '完成').props.onClick();
+  button(modal(page, managerTitle), '关闭').props.onClick();
   button(page.tree(), '保存位置').props.onClick(); await settle(); assert.equal(button(page.tree(), '下载所选').props.disabled, false);
   button(page.tree(), '下载所选').props.onClick(); const confirm = modal(page, reviewTitle); assert.equal(confirm.props.open, true);
   assert.ok(renderedText(confirm).includes('本机已知名称')); assert.ok(renderedText(confirm).includes(destination));

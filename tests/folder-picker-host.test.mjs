@@ -13,11 +13,24 @@ import { createSyncServer, closeSyncServer } from '../server/index.mjs';
 import { sha256 } from '../src/protocol.mjs';
 
 const base = fileURLToPath(new URL('../.test-tmp/', import.meta.url));
+const fixtureLinks = new Map();
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; };
 const bound = status => ({ revision: status.revision, server: status.server, username: status.username });
 async function temporary(t) {
   await fs.mkdir(base, { recursive: true }); const root = await fs.mkdtemp(path.join(base, 'folder-picker-'));
-  t.after(async () => { assert.equal(path.dirname(root), path.resolve(base)); assert.ok(path.basename(root).startsWith('folder-picker-')); await fs.rm(root, { recursive: true, force: true }); });
+  fixtureLinks.set(root, []);
+  t.after(async () => {
+    assert.equal(path.dirname(root), path.resolve(base)); assert.ok(path.basename(root).startsWith('folder-picker-'));
+    // Windows junctions may not report isSymbolicLink and recursive rm can leave
+    // them behind. Remove ONLY the exact redirects created by this fixture.
+    for (const { link, target } of fixtureLinks.get(root) ?? []) {
+      assert.ok(path.resolve(link).startsWith(path.resolve(root) + path.sep));
+      assert.equal(await fs.realpath(link), await fs.realpath(target));
+      if (process.platform === 'win32') await fs.rmdir(link); else await fs.unlink(link);
+    }
+    fixtureLinks.delete(root);
+    await fs.rm(root, { recursive: true, force: true });
+  });
   return root;
 }
 async function fixture(t, options = {}) {
@@ -92,6 +105,7 @@ test('native chooser cancellation, unavailable provider, sanitized failures and 
 
 test('native rejects links, protected/current/historical projects and safely proposes collision suffix', async t => {
   const f = await fixture(t), link = path.join(f.root, 'redirect'); await fs.symlink(f.parent, link, process.platform === 'win32' ? 'junction' : 'dir');
+  fixtureLinks.get(f.root).push({ link, target: f.parent });
   for (const [selected, code] of [[link, 'BAD_DESTINATION'], [f.profileDir, 'PROTECTED_DESTINATION'], [f.source, 'PROTECTED_DESTINATION']]) {
     f.setCapability({ kind: 'native', pick: async () => selected }); await assert.rejects(f.choose(), { code });
   }
@@ -132,6 +146,7 @@ test('Host disposal actually aborts native callback and drains chooser', async t
 test('browse validates provider topology, filters protected/hidden/links and only accepts issued opaque nodes', async t => {
   const f = await fixture(t), child = path.join(f.parent, 'child'), hidden = path.join(f.parent, '.hidden'), protectedChild = path.join(f.parent, 'registered'), link = path.join(f.parent, 'link');
   await fs.mkdir(child); await fs.mkdir(hidden); await fs.mkdir(protectedChild); await fs.symlink(child, link, process.platform === 'win32' ? 'junction' : 'dir');
+  fixtureLinks.get(f.root).push({ link, target: child });
   f.workspaces.set('other', { id: 'other', title: 'Do not browse', path: protectedChild });
   const calls = [];
   f.setCapability({ kind: 'browse', list: async value => { calls.push(value); return value === child ? listing(child, [], [f.parent, child]) : listing(f.parent, [child, { name: '.hidden', path: hidden, hidden: true }, protectedChild, link], [f.root, f.parent]); }, createDirectory: () => assert.fail('picker must not create directories') });
@@ -163,7 +178,7 @@ test('picker caps fail explicitly; expired sessions are not reused, all RPCs are
   const child = path.join(f.parent, 'child'); await fs.mkdir(child); f.setCapability({ kind: 'browse', list: async () => listing(f.parent, [child]) });
   await assert.rejects(f.choose(), { code: 'DIRECTORY_PICKER_FAILED' });
   const routes = []; registerSettingsRoutes({ connection: { fetch: { register: value => routes.push(value) } } }, f.bridge);
-  assert.equal(routes.length, 21); assert.ok(routes.every(route => route.methods.length === 1 && route.methods[0] === 'POST' && route.requestBody === 'streaming'));
+  assert.equal(routes.length, 40); assert.ok(routes.every(route => route.methods.length === 1 && route.methods[0] === 'POST' && route.requestBody === 'streaming'));
   for (const action of ['destinationpick', 'destinationbrowse', 'destinationselect']) {
     assert.equal((await f.bridge.fetch(action, new Request(`http://dsh.internal${SETTINGS_API}${action}`))).status, 405);
     assert.equal((await f.rpc(action, { ...f.pickInput, path: f.parent })).error.code, 'BAD_REQUEST');
@@ -243,5 +258,7 @@ test('loopback committed folder metadata uses last commit, preserves old index a
   assert.deepEqual(result.projects.find(item => item.projectId === 'p'), { projectId: 'p', checkpointCount: 2, latestCreatedAt: first.createdAt, label: 'Final Folder', sourceRoot: 'C:\\source\\Final Folder', latestCheckpointId: 'last-committed' });
   const nfd = result.projects.find(item => item.projectId === 'nfd-project'); assert.equal(nfd.label, 'Café'); assert.equal(nfd.sourceRoot, decomposedRoot); assert.equal(proposedDirectoryName(nfd.sourceRoot), 'Café');
   assert.deepEqual(await fs.readFile(stateFile), before);
-  const file = path.join(dataDir, 'checkpoints', `${sha256('last-committed')}.json`); await fs.writeFile(file, '{}'); await assert.rejects(client.projects(), { httpStatus: 500 });
+  const file = path.join(dataDir, 'checkpoints', `${sha256('last-committed')}.json`); await fs.writeFile(file, '{}');
+  const partial = await client.projects(); assert.equal(partial.partial, true); assert.deepEqual(partial.projects.map(item => item.projectId), ['nfd-project']);
+  await assert.rejects(client.getCheckpoint('last-committed'), { httpStatus: 500 }); // Never silently substitute older content.
 });

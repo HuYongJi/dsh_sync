@@ -2,7 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
-import { sha256, validateId, validateManifest, validateRelativePath, MAX_BLOB_BYTES } from '../src/protocol.mjs';
+import { sha256, validateId, validateManifest, validateRelativePath, MAX_BLOB_BYTES, MAX_CHECKPOINT_BYTES } from '../src/protocol.mjs';
 import { assertNoSymlinks, readStableFile } from '../src/files.mjs';
 
 // Verified against installed DSH 0.2.0-rc.2, Session format 4. See .inspection/SDK-NOTES.md.
@@ -170,18 +170,21 @@ function resourcesOf(events, sourceRoot) {
   for (const ref of rawRefs) requireCondition(ids.has(ref.attachmentId), 'unsupported attachment reference outside a complete content block');
   return { attachments: [...refs.values()].sort((a, b) => refKey(a.kind, a.ref).localeCompare(refKey(b.kind, b.ref), 'en')), deliverables };
 }
-async function readAsset(attachments, item) {
+async function readAsset(attachments, item, { signal, check = async () => {} } = {}) {
   requireCondition(attachments, 'attachment provider unavailable');
+  await check(); signal?.throwIfAborted();
   let bytes;
-  if (item.kind === 'image') bytes = Buffer.from((await attachments.readImage(item.ref)).data);
+  if (item.kind === 'image') bytes = Buffer.from((await attachments.readImage(item.ref, signal)).data);
   else {
     const chunks = []; let size = 0;
-    for await (const chunk of attachments.readFileStream(item.ref)) {
+    for await (const chunk of attachments.readFileStream(item.ref, signal)) {
+      await check(); signal?.throwIfAborted();
       const data = Buffer.from(chunk); size += data.length;
       requireCondition(size <= item.ref.bytes && size <= MAX_BLOB_BYTES, 'attachment exceeds declared size'); chunks.push(data);
     }
     bytes = Buffer.concat(chunks, size);
   }
+  await check(); signal?.throwIfAborted();
   requireCondition(bytes.length === item.ref.bytes && sha256(bytes) === item.sha256, 'attachment integrity check failed');
   return bytes;
 }
@@ -207,72 +210,116 @@ async function activeReason(ctx, id) {
   }
 }
 
+// A cache path is a Host capability, never a browser-supplied string. Its namespace
+// is deliberately separate from the target workspace and from legacy restore files.
+const archiveDirectories = new WeakMap();
+const localKey = value => process.platform === 'win32' ? path.resolve(value).toLowerCase() : path.resolve(value);
+const within = (child, parent) => child === parent || child.startsWith(parent.endsWith(path.sep) ? parent : parent + path.sep);
+export async function authorizeSessionArchiveDirectory({ directory, stateDir }) {
+  requireCondition(typeof directory === 'string' && path.isAbsolute(directory) && typeof stateDir === 'string' && path.isAbsolute(stateDir), 'invalid archive cache directory');
+  const base = await fs.realpath(await assertNoSymlinks(path.join(stateDir, 'session-sync')));
+  const root = await fs.realpath(await assertNoSymlinks(directory));
+  requireCondition(within(localKey(root), localKey(base)) && localKey(root) !== localKey(base) && (await fs.lstat(root)).isDirectory(), 'archive directory is not a dedicated plugin cache');
+  const token = Object.freeze({}); archiveDirectories.set(token, { root, base }); return token;
+}
+async function archivePath(capability, root) {
+  const saved = archiveDirectories.get(capability);
+  requireCondition(saved, 'invalid Host archive directory capability');
+  const current = await fs.realpath(await assertNoSymlinks(saved.root));
+  requireCondition(localKey(current) === localKey(saved.root) && within(localKey(current), localKey(saved.base)) && !within(localKey(current), localKey(root)) && !within(localKey(root), localKey(current)), 'archive cache overlaps or changed target workspace');
+  return current;
+}
+
 /** Factory is an explicit test seam; production exports always use the installed SDK. */
 export function createDshAdapter({ loadSdk = loadInstalledSdk, newId = () => `session-${randomUUID()}` } = {}) {
   let sdkPromise;
   const sdkFor = () => sdkPromise ??= loadSdk();
   return {
     /** Export coherent durable V4 archives; no user configuration or credential API is read. */
-    async exportProjectSessions(ctx, root) {
+    async exportProjectSessions(ctx, root, options = {}) {
+      const { onAsset, onSession, signal, check = async () => {}, maxBytes = MAX_CHECKPOINT_BYTES } = options;
+      requireCondition(Number.isSafeInteger(maxBytes) && maxBytes > 0 && maxBytes <= MAX_CHECKPOINT_BYTES, 'invalid archive export budget');
+      const selected = options.sessionIds === undefined ? undefined : new Set(options.sessionIds.map(validateId));
+      let callbackError, totalBytes = 0;
+      const boundary = async action => { try { signal?.throwIfAborted(); return await action(); } catch (error) { callbackError = error; throw error; } };
+      const guard = () => boundary(check);
+      const charge = size => { totalBytes += size; requireCondition(totalBytes <= maxBytes, 'archive export exceeds aggregate safety limit'); };
+      await guard();
       root = await fs.realpath(await assertNoSymlinks(path.resolve(root)));
       const persistence = service(ctx, 'sessionPersistence');
       requireCondition(persistence && typeof persistence.list === 'function' && typeof persistence.open === 'function', 'session persistence provider unavailable');
-      const sdk = await sdkFor(), sessions = [], skipped = [], assets = new Map(), observations = new Map();
-      const initialListing = await persistence.list();
-      const rootIds = listing => listing.filter(item => sameForeignPath(item.header?.cwd, root)).map(item => item.header.id).sort();
+      const sdk = await sdkFor(), sessions = [], skipped = [], assets = new Map(), assetSizes = new Map(), observations = new Map();
+      const initialListing = await persistence.list({ signal });
+      const included = header => sameForeignPath(header?.cwd, root) && (!selected || selected.has(header.id));
+      const rootIds = listing => listing.filter(item => included(item.header)).map(item => item.header.id).sort();
       const initialIds = rootIds(initialListing);
       const liveSessions = service(ctx, 'sessions');
-      const liveIds = () => (liveSessions?.list?.() ?? []).filter(item => sameForeignPath(item.header?.cwd, root)).map(item => item.id).sort();
+      const liveIds = () => (liveSessions?.list?.() ?? []).filter(item => included(item.header)).map(item => item.id).sort();
       const initialLiveIds = liveIds();
       for (const listed of initialListing) {
         const id = listed.header?.id;
-        if (!sameForeignPath(listed.header?.cwd, root)) continue;
+        if (!included(listed.header)) continue;
+        await guard();
         let handle;
         try {
           validateId(id);
           requireCondition(Number.isSafeInteger(listed.sizeBytes) && listed.sizeBytes > 0, 'incomplete: session has not materialized on disk');
+          if (onSession || onAsset) requireCondition(listed.sizeBytes <= maxBytes, 'archive export exceeds aggregate safety limit');
           const activity = await activeReason(ctx, id); if (activity) refuse(activity);
           const live = service(ctx, 'sessions')?.get(id);
           if (live) await service(ctx, 'sessions').flush(live);
-          const before = await persistence.stat(id);
-          handle = await persistence.open(id, 'read');
-          const read = await handle.read();
+          const before = await persistence.stat(id, { signal });
+          handle = await persistence.open(id, 'read', { signal });
+          // One excess event makes a too-large log fail closed, never truncate into
+          // an apparently complete archive. The SDK may internally decode the whole log.
+          const read = await handle.read(0, MAX_EVENTS + 1, { signal });
+          await guard();
           const header = clone(handle.header);
           assertHeader(header, id, root);
           const artifact = validateArtifact(sdk, header, read.events, handle.inheritedEventCount);
           idleLog(artifact.events);
-          const resources = resourcesOf(artifact.events, root), pendingAssets = new Map();
+          const resources = resourcesOf(artifact.events, root), pendingAssets = new Map(), sessionAssets = new Set();
           let byteCount = 0;
           for (const item of resources.attachments) {
-            const bytes = assets.get(item.sha256) ?? pendingAssets.get(item.sha256) ?? await readAsset(service(ctx, 'attachments'), item);
-            requireCondition(bytes.length === item.ref.bytes, 'attachment size mismatch');
-            if (!pendingAssets.has(item.sha256)) { byteCount += bytes.length; pendingAssets.set(item.sha256, bytes); }
+            await guard();
+            if (!sessionAssets.has(item.sha256)) { byteCount += item.ref.bytes; sessionAssets.add(item.sha256); }
             requireCondition(byteCount <= MAX_SESSION_ASSET_BYTES, 'session attachments exceed export safety limit');
+            if (onAsset && assetSizes.has(item.sha256)) { requireCondition(assetSizes.get(item.sha256) === item.ref.bytes, 'attachment size mismatch'); continue; }
+            const bytes = assets.get(item.sha256) ?? pendingAssets.get(item.sha256) ?? await readAsset(service(ctx, 'attachments'), item, { signal, check: guard });
+            requireCondition(bytes.length === item.ref.bytes, 'attachment size mismatch');
+            if (!assetSizes.has(item.sha256)) { charge(bytes.length); assetSizes.set(item.sha256, bytes.length); }
+            if (onAsset) await boundary(() => onAsset(bytes, { hash: item.sha256, size: bytes.length }));
+            else pendingAssets.set(item.sha256, bytes);
           }
-          const after = await persistence.stat(id);
+          const after = await persistence.stat(id, { signal });
           const changed = !before || !after || before.revision !== after.revision || before.sizeBytes !== after.sizeBytes || JSON.stringify(before.header) !== JSON.stringify(after.header) || service(ctx, 'sessions')?.get(id) !== live || (live && live.seq !== artifact.events.length);
           requireCondition(!changed, 'active session changed during export');
           const finalActivity = await activeReason(ctx, id); if (finalActivity) refuse(finalActivity);
           // Every field is deterministic for unchanged content; polling will not mint false diffs.
           const data = { format: SESSION_ENVELOPE_FORMAT, version: SESSION_ENVELOPE_VERSION, sessionFormatVersion: FORMAT_VERSION, sessionId: id, sourceRoot: root, ...artifact, ...resources };
-          requireCondition(Buffer.byteLength(JSON.stringify(data)) <= MAX_BLOB_BYTES, 'session archive exceeds blob size limit');
-          sessions.push({ id, data });
+          const size = Buffer.byteLength(JSON.stringify(data));
+          requireCondition(size <= MAX_BLOB_BYTES, 'session archive exceeds blob size limit'); charge(size);
+          if (onSession) await boundary(() => onSession({ id, data }));
+          else sessions.push({ id, data });
           observations.set(id, { revision: after.revision, sizeBytes: after.sizeBytes, header: JSON.stringify(after.header), live, seq: live?.seq });
           for (const [hash, bytes] of pendingAssets) assets.set(hash, bytes);
         } catch (error) {
+          if (error === callbackError || signal?.aborted || (onAsset || onSession) && /(?:safety limit|blob size limit)$/.test(error?.adapterReason ?? '')) throw error;
           skipped.push({ id: typeof id === 'string' ? id : 'unknown', reason: safeReason(error, 'session validation or durable read failed') });
         } finally { if (handle) await handle.close(); }
       }
       // Called by the project snapshot owner immediately before it queues a checkpoint.
       // This is an optimistic Host execution guard, not a cross-process/filesystem transaction.
       const verifyUnchanged = async () => {
-        const listing = await persistence.list();
+        await guard();
+        const listing = await persistence.list({ signal });
         requireCondition(JSON.stringify(rootIds(listing)) === JSON.stringify(initialIds) && JSON.stringify(liveIds()) === JSON.stringify(initialLiveIds), 'active project session set changed during capture');
         for (const id of new Set([...initialIds, ...initialLiveIds])) {
           const activity = await activeReason(ctx, id); if (activity) refuse(activity);
         }
         for (const [id, observation] of observations) {
-          const current = await persistence.stat(id), live = service(ctx, 'sessions')?.get(id);
+          await guard();
+          const current = await persistence.stat(id, { signal }), live = service(ctx, 'sessions')?.get(id);
           requireCondition(current && current.revision === observation.revision && current.sizeBytes === observation.sizeBytes && JSON.stringify(current.header) === observation.header && live === observation.live && live?.seq === observation.seq, 'active session changed during project capture');
         }
       };
@@ -284,18 +331,22 @@ export function createDshAdapter({ loadSdk = loadInstalledSdk, newId = () => `se
      * Never calls agents.create/resume, sessions.create, a tool, a prompt, or an execution hook.
      * Unsupported archives remain untouched in .dsh-sync for future adapters/manual inspection.
      */
-    async importProjectSessions(ctx, { manifest, root }) {
-      manifest = validateManifest(manifest);
+    async importProjectSessions(ctx, { manifest, root, archiveDirectory, allocateSessionId, onResult, check = async () => {}, signal }) {
+      const guard = async () => { signal?.throwIfAborted(); await check(); signal?.throwIfAborted(); };
+      await guard(); manifest = validateManifest(manifest);
       root = await fs.realpath(await assertNoSymlinks(path.resolve(root)));
-      const meta = path.join(root, '.dsh-sync');
+      const meta = archiveDirectory === undefined ? path.join(root, '.dsh-sync') : await archivePath(archiveDirectory, root);
       await assertNoSymlinks(meta);
-      try { await fs.lstat(path.join(meta, 'INCOMPLETE')); refuse('incomplete project restore marker exists'); }
-      catch (error) { if (error.code !== 'ENOENT') throw error; }
+      for (const directory of new Set([meta, path.join(root, '.dsh-sync')])) {
+        try { await assertNoSymlinks(path.join(directory, 'INCOMPLETE')); refuse('incomplete project restore marker exists'); }
+        catch (error) { if (error.code !== 'ENOENT') throw error; }
+      }
       const persistence = service(ctx, 'sessionPersistence');
       requireCondition(persistence && typeof persistence.create === 'function' && typeof persistence.stat === 'function', 'session persistence provider unavailable');
       const sdk = await sdkFor(), imported = [], skipped = [], failed = [], mapping = {};
       const files = new Map(manifest.files.map(file => [file.path, file]));
       async function verifiedFile(logicalPath, physicalPath) {
+        await guard();
         const entry = files.get(logicalPath);
         requireCondition(entry, 'referenced file is absent from checkpoint manifest');
         const { bytes } = await readStableFile(await assertNoSymlinks(physicalPath));
@@ -303,7 +354,7 @@ export function createDshAdapter({ loadSdk = loadInstalledSdk, newId = () => `se
         return bytes;
       }
       for (const oldId of manifest.sessionIds) {
-        let id, handle, durable = false;
+        let id, handle, durable = false, providerWrite = false;
         try {
           const bytes = await verifiedFile(`sessions/${oldId}.json`, path.join(meta, 'sessions', `${oldId}.json`));
           const envelope = JSON.parse(bytes.toString('utf8'));
@@ -318,7 +369,9 @@ export function createDshAdapter({ loadSdk = loadInstalledSdk, newId = () => `se
           idleLog(artifact.events);
           checkImportSubset(sdk, artifact);
           const resources = resourcesOf(artifact.events, envelope.sourceRoot);
-          requireCondition(JSON.stringify(resources.attachments) === JSON.stringify(envelope.attachments) && JSON.stringify(resources.deliverables) === JSON.stringify(envelope.deliverables), 'session resource mapping mismatch');
+          // Canonical archive wrappers may reorder object keys; compare the exact
+          // logical mappings, not JSON member order. No fields/subsets are relaxed.
+          requireCondition(isDeepStrictEqual(resources.attachments, envelope.attachments) && isDeepStrictEqual(resources.deliverables, envelope.deliverables), 'session resource mapping mismatch');
           const assetBytes = new Map();
           let totalBytes = 0;
           for (const item of resources.attachments) {
@@ -334,7 +387,9 @@ export function createDshAdapter({ loadSdk = loadInstalledSdk, newId = () => `se
             await verifiedFile(`project/${item.relativePath}`, local);
             artifact.events[item.eventSeq].data.files[item.index].path = local;
           }
-          id = validateId(newId());
+          await guard();
+          id = validateId(allocateSessionId ? await allocateSessionId(oldId) : newId());
+          await guard();
           requireCondition(!manifest.sessionIds.includes(id) && !service(ctx, 'sessions')?.get(id) && !service(ctx, 'agents')?.get(id) && !(await persistence.stat(id)), 'new session identity collision');
           // Do not inherit another device's parent identity, selected executable preset,
           // delegation, or permissions. Unsupported event domains were rejected, not replayed.
@@ -342,14 +397,17 @@ export function createDshAdapter({ loadSdk = loadInstalledSdk, newId = () => `se
           const checked = validateArtifact(sdk, header, artifact.events, artifact.inheritedEventCount);
           const attachments = service(ctx, 'attachments');
           for (const item of resources.attachments) {
+            await guard();
             requireCondition(attachments, 'attachment provider unavailable');
+            providerWrite = true;
             const input = { data: assetBytes.get(item.sha256), ...(item.ref.name === undefined ? {} : { name: item.ref.name }) };
             const saved = item.kind === 'image' ? await attachments.saveImage({ ...input, mediaType: item.ref.mediaType }) : await attachments.saveFile(input);
             requireCondition(saved.attachmentId === item.ref.attachmentId && saved.bytes === item.ref.bytes && (item.kind !== 'image' || saved.mediaType === item.ref.mediaType && saved.width === item.ref.width && saved.height === item.ref.height) && saved.name === item.ref.name, 'attachment normalization changed immutable reference');
           }
-          handle = await persistence.create(checked.header, { inheritedEventCount: checked.inheritedEventCount });
-          await handle.append(checked.events);
-          await handle.flush();
+          await guard(); providerWrite = true;
+          handle = await persistence.create(checked.header, { inheritedEventCount: checked.inheritedEventCount, ...(signal ? { signal } : {}) });
+          await guard(); await handle.append(checked.events, { signal });
+          await guard(); await handle.flush({ signal });
           durable = true;
           await handle.close(); handle = undefined;
           mapping[oldId] = id;
@@ -357,21 +415,22 @@ export function createDshAdapter({ loadSdk = loadInstalledSdk, newId = () => `se
           imported.push(result);
           const workspaceRegistry = service(ctx, 'workspaceRegistry');
           if (workspaceRegistry) {
-            try { const workspace = await workspaceRegistry.create(root); await workspace.attachSession(id); result.workspaceId = workspace.id; result.workspaceAttached = true; }
+            try { await guard(); const workspace = await workspaceRegistry.create(root); await guard(); await workspace.attachSession(id); result.workspaceId = workspace.id; result.workspaceAttached = true; }
             catch { result.warning = 'Session is durable but workspace attachment failed; no agent was started'; }
           }
         } catch (error) {
           const reason = safeReason(error, 'session validation or import failed');
-          if (handle || durable) failed.push({ id: oldId, sessionId: id, reason, mayHaveDurableSession: true });
+          if (handle || durable || allocateSessionId && providerWrite) failed.push({ id: oldId, sessionId: id, reason, mayHaveDurableSession: true });
           else skipped.push({ id: oldId, reason });
         } finally {
           if (handle) try { await handle.close(); } catch { failed.push({ id: oldId, sessionId: id, reason: 'session handle close failed', mayHaveDurableSession: true }); }
         }
+        if (onResult) await onResult({ sourceId: oldId, imported: clone(imported.filter(item => item.sourceId === oldId)), skipped: clone(skipped.filter(item => item.id === oldId)), failed: clone(failed.filter(item => item.id === oldId)), mapping: id && mapping[oldId] ? { [oldId]: id } : {} });
       }
       return { imported, skipped, failed, mapping };
     },
   };
 }
 const installedAdapter = createDshAdapter();
-export const exportProjectSessions = (ctx, root) => installedAdapter.exportProjectSessions(ctx, root);
+export const exportProjectSessions = (ctx, root, options) => installedAdapter.exportProjectSessions(ctx, root, options);
 export const importProjectSessions = (ctx, options) => installedAdapter.importProjectSessions(ctx, options);

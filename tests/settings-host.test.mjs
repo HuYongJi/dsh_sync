@@ -375,7 +375,7 @@ test('production Client state, Host RPC and real HTTP cloud complete the setting
 test('exact streaming routes do not replace the native /api gateway or claim to implement admission', () => {
   const routes = [], bridge = createSettingsHttp({});
   registerSettingsRoutes({ connection: { fetch: { register: value => routes.push(value) } } }, bridge);
-  assert.equal(routes.length, 21); assert.ok(routes.every(route => route.requestBody === 'streaming' && route.path.startsWith(SETTINGS_API)));
+  assert.equal(routes.length, 40); assert.ok(routes.every(route => route.requestBody === 'streaming' && route.path.startsWith(SETTINGS_API)));
   assert.deepEqual(routes.find(route => route.path.endsWith('/status')).methods, ['POST']);
   assert.ok(routes.filter(route => !route.path.endsWith('/status')).every(route => route.methods.length === 1 && route.methods[0] === 'POST'));
 });

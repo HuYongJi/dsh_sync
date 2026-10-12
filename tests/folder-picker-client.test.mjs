@@ -220,7 +220,7 @@ async function chooseProject(page) {
   await openCloud(page);
   nodes(modal(page, managerTitle)).find(node => node.props?.role === 'combobox').props.onFocus();
   nodes(modal(page, managerTitle)).find(node => node.props?.role === 'option').props.onClick(); await settle();
-  button(modal(page, managerTitle), '完成').props.onClick();
+  button(modal(page, managerTitle), '关闭').props.onClick();
 }
 
 test('native React add dropdown uses readable folder labels, supports legacy metadata and concise partial/empty states', async t => {
@@ -246,9 +246,9 @@ test('native React single cloud Modal browses folders/crumbs, disables unsuitabl
   const before = page.calls.length; old(); await settle(); assert.equal(page.calls.length, before);
   button(picker, 'synthetic').props.onClick(); await settle(); button(modal(page, '选择保存位置'), '保存目录').props.onClick(); await settle();
   button(modal(page, '选择保存位置'), '选择此文件夹').props.onClick(); await settle();
-  assert.equal(modal(page, '选择保存位置').props.open, false); assert.ok(text(page.tree()).includes(plan.parent));
+  assert.equal(Boolean(modal(page, '选择保存位置')?.props.open), false); assert.ok(text(page.tree()).includes(plan.parent));
   assert.equal(nodes(page.tree()).some(node => node.type === 'native:Input'), false);
-  button(page.tree(), '下载所选').props.onClick(); const confirm = modal(page, '确认下载所选项目');
+  const confirm = modal(page, '确认下载所选项目'); // Folder selection now advances in the same Modal.
   assert.equal(confirm.props.open, true); assert.ok(text(confirm).includes(plan.root)); assert.ok(text(confirm).includes(project.label));
   assert.equal(nodes(page.tree()).filter(node => node.type === 'native:Modal' && node.props.open).length, 1);
   assert.equal(page.calls.some(call => ['downloadstart', 'restore', 'import', 'sync', 'preferences'].includes(call.action)), false);

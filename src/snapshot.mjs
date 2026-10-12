@@ -12,18 +12,52 @@ export function isExcluded(relative, patterns = []) {
   if (name === '.env' || name.startsWith('.env.') || /\.(?:pem|key|p12|pfx|keystore)$/.test(name) || /^(?:id_rsa|id_ed25519|\.?credentials(?:\.(?:json|ya?ml))?|\.npmrc|\.netrc|\.pypirc|auth\.json|tokens?\.json)$/.test(name)) return true;
   return patterns.some(pattern => path.posix.matchesGlob(relative, pattern) || path.posix.matchesGlob(`${relative}/`, pattern));
 }
-async function ignorePatterns(root, excluded) {
-  const patterns = [...excluded];
-  try {
-    const { bytes } = await readStableFile(path.join(root, '.dsh-syncignore'), 64 * 1024);
+/** Shared capture/send policy. Globs and literal directory names are never mixed. */
+export function createExclusionPolicy({ excluded = [], excludedPaths = [] } = {}) {
+  assert(Array.isArray(excluded) && Array.isArray(excludedPaths), 'Invalid exclusion policy');
+  const patterns = [...new Set(excluded.map(rule => {
+    assert(typeof rule === 'string' && rule.length > 0 && !rule.startsWith('!') && !rule.includes('\\') && !rule.startsWith('/'), '.dsh-syncignore supports only relative exclusion globs, not negation');
+    return rule.endsWith('/') ? `${rule}**` : rule;
+  }))].sort();
+  const literals = [...new Set(excludedPaths.map(value => validateRelativePath(value).toLowerCase()))].sort();
+  const fingerprint = sha256(JSON.stringify({ version: 1, patterns, literals }));
+  return Object.freeze({
+    fingerprint,
+    isExcluded(relative) {
+      assert(typeof relative === 'string' && relative.length > 0, 'Invalid exclusion path');
+      const folded = relative.toLowerCase();
+      if (literals.some(value => folded === value || folded.startsWith(`${value}/`))) return true;
+      // Capture prunes excluded directories. A queued descendant must obey the
+      // same policy even when a glob matches its ancestor, not the full filename.
+      const parts = relative.split('/');
+      for (let end = 1; end <= parts.length; end++) if (isExcluded(parts.slice(0, end).join('/'), patterns)) return true;
+      return false;
+    },
+  });
+}
+
+/** Read CURRENT policy; callers must reread at every send/commit boundary. */
+export async function readExclusionPolicy(root, { excluded = [], excludedPaths = [] } = {}) {
+  assert(Array.isArray(excluded) && Array.isArray(excludedPaths), 'Invalid exclusion policy');
+  root = await assertNoSymlinks(path.resolve(root));
+  const identity = await fs.lstat(root, { bigint: true });
+  assert(identity.isDirectory(), 'Project root must be a directory');
+  const patterns = [...excluded], filename = path.join(root, '.dsh-syncignore');
+  // Only an absent named ignore file is optional. A broken redirect or a file
+  // disappearing during a stable read must fail closed, not clear the policy.
+  let present = true;
+  try { await fs.lstat(filename); } catch (error) { if (error.code !== 'ENOENT') throw error; present = false; }
+  if (present) {
+    const { bytes } = await readStableFile(filename, 64 * 1024);
     for (const line of bytes.toString('utf8').split(/\r?\n/)) {
       const rule = line.trim();
-      if (!rule || rule.startsWith('#')) continue;
-      assert(!rule.startsWith('!') && !rule.includes('\\') && !rule.startsWith('/'), '.dsh-syncignore supports only relative exclusion globs, not negation');
-      patterns.push(rule.endsWith('/') ? `${rule}**` : rule);
+      if (rule && !rule.startsWith('#')) patterns.push(rule);
     }
-  } catch (error) { if (error.code !== 'ENOENT') throw error; }
-  return patterns;
+  }
+  await assertNoSymlinks(root);
+  const current = await fs.lstat(root, { bigint: true });
+  assert(current.isDirectory() && current.dev === identity.dev && current.ino === identity.ino, 'Project root changed while reading exclusion policy');
+  return createExclusionPolicy({ excluded: patterns, excludedPaths });
 }
 
 /** Capture only an explicitly selected project. putBlob must durably persist bytes. */
@@ -35,8 +69,7 @@ export async function captureCheckpoint({ root, projectId, deviceId, parentId = 
   try { await fs.lstat(path.join(root, '.dsh-sync', 'INCOMPLETE')); incomplete = true; } catch (error) { if (error.code !== 'ENOENT') throw error; }
   assert(!incomplete, 'Cannot synchronize an incomplete restore');
   validateId(projectId); validateId(deviceId);
-  const patterns = await ignorePatterns(root, excluded);
-  const literalExclusions = excludedPaths.map(value => validateRelativePath(value).toLowerCase());
+  const policy = await readExclusionPolicy(root, { excluded, excludedPaths });
   const files = [], skipped = [], seen = new Set();
   let total = 0;
   async function add(name, bytes, executable = false) {
@@ -56,7 +89,7 @@ export async function captureCheckpoint({ root, projectId, deviceId, parentId = 
     for (const entry of entries) {
       signal?.throwIfAborted();
       const name = relative ? `${relative}/${entry.name}` : entry.name;
-      if (isExcluded(name, patterns) || literalExclusions.some(value => name.toLowerCase() === value || name.toLowerCase().startsWith(`${value}/`))) { skipped.push({ path: name, reason: 'excluded' }); continue; }
+      if (policy.isExcluded(name)) { skipped.push({ path: name, reason: 'excluded' }); continue; }
       validateRelativePath(name);
       const absolute = path.join(directory, entry.name);
       const stat = await fs.lstat(absolute);

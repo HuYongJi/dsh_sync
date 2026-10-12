@@ -2,8 +2,58 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { atomicWrite, ensurePrivateDirectory, readJson, assertNoSymlinks, readStableFile, writeNewFile } from './files.mjs';
-import { assert, sha256, validateBlobHash, validateManifest, MAX_MANIFEST_BYTES } from './protocol.mjs';
-import { captureCheckpoint, contentFingerprint, restoreCheckpoint } from './snapshot.mjs';
+import { assert, sha256, validateBlobHash, validateId, validateManifest, MAX_MANIFEST_BYTES } from './protocol.mjs';
+import { captureCheckpoint, contentFingerprint, readExclusionPolicy, restoreCheckpoint } from './snapshot.mjs';
+
+function stateExclusions(root, directory, excludedPaths = []) {
+  const relative = path.relative(path.resolve(root), directory);
+  assert(relative !== '', 'Project root cannot be the sync state directory');
+  return [...excludedPaths, ...(!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative) ? [relative.split(path.sep).join('/')] : [])];
+}
+
+async function validateQueue(store, client, pending, { root, deviceId, excluded = [], excludedPaths = [], getExcludedPaths } = {}, validated = new Map()) {
+  const config = await store.config(), state = await store.state(), roots = new Map(), policies = new Map();
+  if (pending.length && config?.server) assert(client.server === config.server, 'Pending checkpoints are bound to another server');
+  const expectedDevice = deviceId || config?.deviceId || client.deviceId;
+  // Bind the ENTIRE immutable batch before reading its policy or sending bytes.
+  for (const manifest of pending) {
+    const source = path.resolve(manifest.sourceRoot);
+    if (root) assert(source === path.resolve(root), 'Pending checkpoints are bound to another project root');
+    if (expectedDevice) assert(manifest.deviceId === expectedDevice, 'Pending checkpoints are bound to another device');
+    const prior = Object.hasOwn(state.projects, manifest.projectId) ? state.projects[manifest.projectId] : undefined;
+    assert(!prior || path.resolve(prior.root) === source, 'Pending checkpoints are bound to another project root');
+    assert(!roots.has(manifest.projectId) || roots.get(manifest.projectId) === source, 'Pending checkpoints are bound to another project root');
+    roots.set(manifest.projectId, source);
+  }
+  for (const manifest of pending) {
+    const key = manifest.projectId;
+    if (!policies.has(key)) {
+      const dynamic = await getExcludedPaths?.(manifest) || [];
+      policies.set(key, await readExclusionPolicy(roots.get(key), { excluded, excludedPaths: stateExclusions(roots.get(key), store.directory, [...excludedPaths, ...dynamic]) }));
+    }
+    const policy = policies.get(key);
+    // The queue objects are private to this operation. Reread the policy each
+    // boundary; only unchanged effective policy may reuse a manifest scan.
+    if (validated.get(manifest) === policy.fingerprint) continue;
+    for (const file of manifest.files) {
+      if (file.path.startsWith('project/') && policy.isExcluded(file.path.slice(8))) throw Object.assign(new Error('Queued checkpoint contains a currently excluded path; retained locally. Resolve the protected queue before retrying.'), { code: 'PROTECTED_QUEUE' });
+    }
+    validated.set(manifest, policy.fingerprint);
+  }
+}
+
+function commitAcknowledgement(value, manifest) {
+  assert(value?.id === manifest.id && typeof value.conflict === 'boolean' && Array.isArray(value.heads), 'Invalid commit acknowledgement');
+  return { id: manifest.id, conflict: value.conflict, heads: value.heads.map(validateId) };
+}
+
+function attachFlushFailure(error, results, outcomes) {
+  const failure = error instanceof Error && Object.isExtensible(error) ? error : Object.assign(new Error('Checkpoint flush failed', { cause: error }), { ...(error?.code ? { code: error.code } : {}) });
+  // No raw acknowledgement extensions, manifests, bytes or credentials escape.
+  failure.results = structuredClone(results);
+  failure.outcomes = structuredClone(outcomes);
+  return failure;
+}
 
 export class LocalStore {
   constructor(directory) { this.directory = path.resolve(directory); }
@@ -64,14 +114,11 @@ export class LocalStore {
     assert(!prior || path.resolve(prior.root) === root, 'Project ID is mapped to another directory on this device');
     const queued = await this.pending(options.projectId);
     assert(queued.every(item => path.resolve(item.sourceRoot) === root && item.deviceId === options.deviceId), 'Pending checkpoints belong to another root or device; finish or explicitly discard them first');
-    assert(queued.length < 100, 'Offline queue has 100 checkpoints; upload it before capturing more');
+    if (queued.length >= 100) throw Object.assign(new Error('Offline queue has 100 checkpoints; upload it before capturing more'), { code: 'QUEUE_FULL' });
     const last = queued.at(-1);
     const restored = !last && !prior ? await readJson(path.join(root, '.dsh-sync', 'manifest.json'), null) : null;
     if (restored) assert(validateManifest(restored).projectId === options.projectId, 'Restored directory belongs to another project ID');
-    const relativeState = path.relative(root, this.directory);
-    assert(relativeState !== '', 'Project root cannot be the sync state directory');
-    const excludedPaths = [...(options.excludedPaths || [])];
-    if (!relativeState.startsWith(`..${path.sep}`) && relativeState !== '..' && !path.isAbsolute(relativeState)) excludedPaths.push(relativeState.split(path.sep).join('/'));
+    const excludedPaths = stateExclusions(root, this.directory, options.excludedPaths);
     const captured = await captureCheckpoint({ ...options, root, excludedPaths, parentId: last?.id ?? prior?.head ?? restored?.id ?? null, putBlob: (hash, bytes) => this.putBlob(hash, bytes) });
     await options.beforeQueue?.();
     const fingerprint = contentFingerprint(captured.manifest);
@@ -79,33 +126,64 @@ export class LocalStore {
     await atomicWrite(path.join(this.directory, 'pending', `${captured.manifest.id}.json`), JSON.stringify(captured.manifest));
     return { ...captured, unchanged: false, queuedId: captured.manifest.id };
   }
-  async flush(client, projectId, { root, deviceId, beforeUpload, beforeCommit } = {}) {
-    const results = [], config = await this.config(), pending = await this.pending(projectId);
-    if (pending.length && config?.server) assert(client.server === config.server, 'Pending checkpoints are bound to another server');
-    // Validate the entire queue before sending even its first blob.
-    for (const manifest of pending) {
-      if (root) assert(path.resolve(manifest.sourceRoot) === path.resolve(root), 'Pending checkpoints are bound to another project root');
-      const expectedDevice = deviceId || config?.deviceId || client.deviceId;
-      if (expectedDevice) assert(manifest.deviceId === expectedDevice, 'Pending checkpoints are bound to another device');
-    }
-    for (const manifest of pending) {
-      const uploaded = new Set();
-      for (const file of manifest.files) {
-        if (uploaded.has(file.sha256)) continue;
-        const bytes = await this.getBlob(file.sha256);
-        await beforeUpload?.(manifest, file);
-        await client.uploadBlob(file.sha256, bytes); uploaded.add(file.sha256);
+  /** Local-only admission, also usable before capture so protected queues stay untouched. */
+  async validatePending(client, projectId, options = {}) {
+    const pending = await this.pending(projectId);
+    await validateQueue(this, client, pending, options);
+    return pending;
+  }
+  /** Success retains the legacy ack array. Failures carry confirmed results + phase-specific outcomes. */
+  async flush(client, projectId, options = {}) {
+    const { beforeUpload, beforeCommit, beforeFlush } = options, results = [], outcomes = [];
+    let current;
+    try {
+      const pending = await this.pending(projectId), validated = new Map();
+      for (const manifest of pending) {
+        for (const file of manifest.files) Object.freeze(file);
+        Object.freeze(manifest.files); Object.freeze(manifest.sessionIds); Object.freeze(manifest);
       }
-      await beforeCommit?.(manifest);
-      const result = await client.commit(manifest);
-      const state = await this.state();
-      state.projects[manifest.projectId] = { root: manifest.sourceRoot, head: manifest.id, fingerprint: contentFingerprint(manifest) };
-      await this.saveState(state);
-      const pendingFile = path.join(this.directory, 'pending', `${manifest.id}.json`);
-      await assertNoSymlinks(pendingFile); await fs.unlink(pendingFile);
-      results.push(result);
+      const revalidate = async () => {
+        client.signal?.throwIfAborted();
+        await validateQueue(this, client, pending, options, validated);
+        client.signal?.throwIfAborted();
+      };
+      await beforeFlush?.();
+      await revalidate();
+      for (const manifest of pending) {
+        current = { id: manifest.id, projectId: manifest.projectId, status: 'pending', phase: 'upload' };
+        outcomes.push(current);
+        const uploaded = new Set();
+        for (const file of manifest.files) {
+          if (uploaded.has(file.sha256)) continue;
+          const bytes = await this.getBlob(file.sha256);
+          assert(bytes.length === file.size, 'Invalid local blob size');
+          await beforeUpload?.(manifest, file);
+          await revalidate();
+          await client.uploadBlob(file.sha256, bytes); uploaded.add(file.sha256);
+        }
+        current.phase = 'precommit';
+        await beforeCommit?.(manifest);
+        await revalidate();
+        current.phase = 'commit';
+        const result = commitAcknowledgement(await client.commit(manifest), manifest);
+        // Record a confirmed remote commit BEFORE any fallible local bookkeeping.
+        results.push(result); current.status = 'local-finalization-failed'; current.phase = 'finalize';
+        const state = await this.state();
+        state.projects[manifest.projectId] = { root: manifest.sourceRoot, head: manifest.id, fingerprint: contentFingerprint(manifest) };
+        await this.saveState(state);
+        const pendingFile = path.join(this.directory, 'pending', `${manifest.id}.json`);
+        await assertNoSymlinks(pendingFile); await fs.unlink(pendingFile);
+        current.status = 'committed'; current.phase = 'complete'; current = undefined;
+      }
+      return results;
+    } catch (error) {
+      if (current?.phase === 'commit') {
+        // Only a fully read HTTP refusal is definitive; a validator's status=400
+        // can instead mean a malformed acknowledgement AFTER a durable commit.
+        current.status = error?.definitive === true || ([400, 401, 403, 404, 405, 409, 413, 415, 422, 429].includes(error?.httpStatus)) ? 'rejected' : 'commit-uncertain';
+      }
+      throw attachFlushFailure(error, results, outcomes);
     }
-    return results;
   }
   async restore(client, id, destination, { projectId, signal = client.signal, beforeWrite } = {}) {
     const manifest = await client.getCheckpoint(id);

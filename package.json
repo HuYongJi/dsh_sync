@@ -1,7 +1,7 @@
 {
   "name": "dsh-personal-sync",
-  "version": "0.8.0",
-  "description": "Local-first checkpoint sync and personal authentication for DeepSeek Harness",
+  "version": "0.9.0",
+  "description": "Local-first bidirectional project sync, safe session handoff and personal authentication for DeepSeek Harness",
   "repository": { "type": "git", "url": "git+https://github.com/HuYongJi/dsh_sync.git" },
   "homepage": "https://github.com/HuYongJi/dsh_sync#readme",
   "bugs": { "url": "https://github.com/HuYongJi/dsh_sync/issues" },
@@ -38,6 +38,6 @@
     "check:install": "node scripts/check-install.mjs",
     "pack": "node scripts/pack.mjs"
   },
-  "files": ["src", "plugin", "client/adapter.mjs", "client/state.mjs", "client/dist/client.js", "client/README.md", "server", "deploy", "cordis.patch.yml", "README.md", "docs", "LICENSE"],
+  "files": ["src", "plugin", "client/adapter.mjs", "client/state.mjs", "client/bidirectional-state.mjs", "client/bidirectional-panel.mjs", "client/dist/client.js", "client/README.md", "server", "deploy", "cordis.patch.yml", "README.md", "docs", "LICENSE"],
   "license": "MIT"
 }

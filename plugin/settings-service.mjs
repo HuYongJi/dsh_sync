@@ -54,7 +54,11 @@ function summarizeLastResult(value) {
   const conflicts = results.flatMap(item => item.uploaded || []).filter(item => item.conflict).length;
   const skipped = results.reduce((count, item) => count + (item.skippedFiles?.length || 0) + (item.skippedSessions?.length || 0), 0);
   const protectedQueue = value.errorCode === 'PROTECTED_QUEUE' || results.some(item => item.errorCode === 'PROTECTED_QUEUE');
-  const message = protectedQueue ? '受保护路径已暂停' : failed ? '同步未完成' : deferred ? `已延后 ${deferred} 个项目` : `提交 ${committed} 个检查点${conflicts ? ` · 冲突 ${conflicts}` : ''}${skipped ? ` · 跳过 ${skipped}` : ''}`;
+  const outcomes = results.flatMap(item => item.outcomes || []);
+  const uncertain = outcomes.filter(item => item.status === 'commit-uncertain').length;
+  const finalization = outcomes.filter(item => item.status === 'local-finalization-failed').length;
+  const progress = `${committed ? ` · 已提交 ${committed}` : ''}${uncertain ? ` · 待确认 ${uncertain}` : ''}${finalization ? ` · 本机收尾失败 ${finalization}` : ''}`;
+  const message = protectedQueue ? `受保护路径已暂停${progress}` : failed ? `同步未完成${progress}` : deferred ? `已延后 ${deferred} 个项目${progress}` : `提交 ${committed} 个检查点${conflicts ? ` · 冲突 ${conflicts}` : ''}${skipped ? ` · 跳过 ${skipped}` : ''}`;
   return { at: value.at, ok: !failed, message };
 }
 
@@ -76,7 +80,7 @@ export function createSettingsService(ctx, controller, { profileDir, dshHome, pi
     if (protectedRoots.some(item => isInside(key, item))) throw settingsFailure('PROJECT_UNAVAILABLE', 'DSH 配置、账号和同步状态目录不能作为同步项目');
     return protectedRoots.filter(item => isInside(item, key)).map(item => path.relative(key, item).split(path.sep).join('/'));
   }
-  let preferences, loading;
+  let preferences, loading, workspaceSelectionGuard = async () => {};
   const registry = () => {
     const value = ctx.workspaceRegistry || ctx.get?.('workspaceRegistry');
     if (!value || typeof value.list !== 'function' || typeof value.get !== 'function') throw settingsFailure('PROJECTS_UNAVAILABLE', '当前宿主未提供项目列表');
@@ -199,6 +203,12 @@ export function createSettingsService(ctx, controller, { profileDir, dshHome, pi
   const service = {
     filename,
     initialize,
+    // Host-only hooks: caller owns controller.mutate; not exposed by HTTP routes.
+    setWorkspaceSelectionGuard(guard) { workspaceSelectionGuard = guard; },
+    async pauseLegacyWorkspace(workspaceId) {
+      await initialize();
+      if (preferences.selected.includes(workspaceId)) await persist({ ...preferences, revision: preferences.revision + 1, selected: preferences.selected.filter(id => id !== workspaceId) });
+    },
     async admit(mapping) {
       // Called under the operation lock, including immediately before queueing a snapshot.
       await initialize();
@@ -211,13 +221,13 @@ export function createSettingsService(ctx, controller, { profileDir, dshHome, pi
       await initialize();
       const snapshot = preferences, projects = await projectRows(), state = await controller.status();
       if (snapshot.revision !== preferences.revision || snapshot.server !== preferences.server || snapshot.username !== preferences.username) throw settingsFailure('CONFIG_CONFLICT', '设置已变更');
-      return { revision: snapshot.revision, server: snapshot.server || '', username: snapshot.username || '', loggedIn: state.loggedIn, ...(state.expiresAt ? { expiresAt: state.expiresAt } : {}), autoSync: state.reauthRequired ? false : snapshot.autoSync, intervalMs: snapshot.intervalMs, projects, pending: state.pending, running: state.running, ...(state.recovery ? { recovery: state.recovery } : {}), ...(state.download ? { download: state.download } : {}), ...(state.lastResult ? { lastResult: summarizeLastResult(state.lastResult) } : {}) };
+      return { revision: snapshot.revision, server: snapshot.server || '', username: snapshot.username || '', loggedIn: state.loggedIn, ...(state.expiresAt ? { expiresAt: state.expiresAt } : {}), ...(state.authState ? { authState: state.authState } : {}), reauthRequired: state.reauthRequired === true, autoSync: state.reauthRequired ? false : snapshot.autoSync, intervalMs: snapshot.intervalMs, projects, pending: state.pending, running: state.running, ...(state.recovery ? { recovery: state.recovery } : {}), ...(state.download ? { download: state.download } : {}), ...(state.lastResult ? { lastResult: summarizeLastResult(state.lastResult) } : {}) };
     },
     async login(input, signal) {
-      requireValue(exact(input, ['server', 'username', 'password']) && typeof input.server === 'string' && input.server.length <= 2048 && typeof input.username === 'string' && typeof input.password === 'string');
+      requireValue(exact(input, ['server', 'username', 'password', 'remember']) && (input.remember === undefined || typeof input.remember === 'boolean') && typeof input.server === 'string' && input.server.length <= 2048 && typeof input.username === 'string' && typeof input.password === 'string');
       const server = validateServerUrl(input.server.trim()), username = input.username.trim();
       await initialize();
-      const result = await controller.login({ server, username, password: input.password, signal });
+      const result = await controller.login({ server, username, password: input.password, signal, ...(input.remember === undefined ? {} : { remember: input.remember }) });
       return { ...await service.status(), ...(result.warning ? { warning: result.warning } : {}) };
     },
     async password(input, signal) {
@@ -253,6 +263,7 @@ export function createSettingsService(ctx, controller, { profileDir, dshHome, pi
         if (input.autoSync && !(await controller.status()).loggedIn) throw settingsFailure('NOT_LOGGED_IN', '请先登录，再开启自动同步');
         const current = listedWorkspaces(), byId = new Map(current.map(item => [item.id, item])), bindings = preferences.bindings.map(item => ({ ...item }));
         for (const id of input.projectIds) {
+          await workspaceSelectionGuard(id);
           const workspace = byId.get(id), prior = bindings.find(item => item.workspaceId === id);
           const alreadySelected = preferences.selected.includes(id);
           if (!workspace || !(await available(workspace.root))) {
@@ -343,6 +354,13 @@ export function createSettingsService(ctx, controller, { profileDir, dshHome, pi
       const checkBinding = recoveryBinding(input, ['restoreId', 'confirm', 'requestId']);
       validateId(input.restoreId); validateId(input.requestId); requireValue(input.confirm === true); await checkBinding();
       return controller.startRecovery('import', { requestId: input.requestId, restoreId: input.restoreId }, { checkBinding, signal });
+    },
+    async registerproject(input, signal) {
+      const checkBinding = recoveryBinding(input, ['restoreId', 'requestId', 'confirm']);
+      validateId(input.restoreId); validateId(input.requestId); requireValue(input.confirm === true); await checkBinding();
+      return controller.registerProject({ restoreId: input.restoreId, requestId: input.requestId }, { checkBinding, signal,
+        admitRoot: async root => { await protectCanonicalRoots(); protectedExclusions(root); if (!await available(root)) throw settingsFailure('PROJECT_UNAVAILABLE', '恢复目录不可安全读取'); },
+      });
     },
     async sync(input = {}) {
       requireValue(exact(input, ['projectId']) && (input.projectId === undefined || validWorkspaceId(input.projectId)));

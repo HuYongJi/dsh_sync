@@ -69,13 +69,24 @@ export async function runCli(argv, { env = process.env, output = value => consol
       const result = await client.logout(); delete config.token; delete config.expiresAt; await store.saveConfig(config); output({ loggedOut: true, ...result });
     } else if (command === 'list') {
       output(await client.list(o.project));
-    } else if (command === 'retry') {
-      if (o.project) validateId(o.project); output({ uploaded: await store.flush(client, o.project) });
-    } else if (command === 'push') {
-      assert(o.project && o.root, 'push requires --project and --root');
-      const captured = await store.capture({ root: o.root, projectId: o.project, deviceId: config.deviceId });
-      const uploaded = await store.flush(client, o.project, { root: o.root, deviceId: config.deviceId });
-      output({ checkpointId: captured.queuedId, unchanged: captured.unchanged, skipped: captured.skipped, uploaded });
+    } else if (command === 'retry' || command === 'push') {
+      let captured;
+      if (command === 'push') {
+        assert(o.project && o.root, 'push requires --project and --root');
+        // Local-only current-policy admission never sends the old queue first.
+        await store.validatePending(client, o.project, { root: o.root, deviceId: config.deviceId });
+        captured = await store.capture({ root: o.root, projectId: o.project, deviceId: config.deviceId });
+      } else if (o.project) validateId(o.project);
+      const summary = captured ? { checkpointId: captured.queuedId, unchanged: captured.unchanged } : {};
+      try {
+        // flush resolves each queued source root itself (including retry without
+        // --project) and rereads current ignore + literal state policy each send.
+        const uploaded = await store.flush(client, o.project, { ...(captured ? { root: o.root } : {}), deviceId: config.deviceId });
+        output({ ...summary, ...(captured ? { skipped: captured.skipped } : {}), uploaded });
+      } catch (error) {
+        output({ ...summary, incomplete: true, errorCode: error.code || 'SYNC_FAILED', uploaded: error.results || [], outcomes: error.outcomes || [] });
+        throw error;
+      }
     } else if (command === 'restore') {
       assert(o.id && o.to && path.isAbsolute(o.to), 'restore requires --id and absolute --to');
       const result = await store.restore(client, o.id, o.to);

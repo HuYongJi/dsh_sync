@@ -86,7 +86,7 @@ async function fixture(t, options = {}) {
 test('batch native selection validates whole cloud selection, picks once, reserves portable distinct roots without writes', async t => {
   const f = await fixture(t), routes = [];
   registerSettingsRoutes({ connection: { fetch: { register: route => routes.push(route) } } }, f.bridge);
-  assert.equal(routes.length, 21);
+  assert.equal(routes.length, 40);
   for (const action of ['downloadpick', 'downloadbrowse', 'downloadselect', 'downloadstart']) {
     assert.deepEqual(routes.find(route => route.path === SETTINGS_API + action).methods, ['POST']);
     assert.equal((await f.bridge.fetch(action, new Request(`http://dsh.internal${SETTINGS_API}${action}`))).status, 405);

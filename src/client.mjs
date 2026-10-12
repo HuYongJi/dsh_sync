@@ -114,7 +114,7 @@ export class SyncClient {
     }
     assert(result && Array.isArray(result.projects) && result.projects.length <= 10_000, 'Invalid projects response');
     const seen = new Set();
-    return { projects: result.projects.map(item => {
+    return { ...(result.partial === true ? { partial: true } : {}), projects: result.projects.map(item => {
       assert(item && typeof item === 'object' && !Array.isArray(item), 'Invalid project metadata');
       const projectId = validateId(item.projectId);
       assert(!seen.has(projectId), 'Duplicate cloud project'); seen.add(projectId);

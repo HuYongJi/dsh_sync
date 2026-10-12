@@ -1,10 +1,12 @@
 import { createController, deriveView, filterProjects } from './state.mjs';
+import { createBidirectionalPanel } from './bidirectional-panel.mjs';
 
 // DSH 0.2.0-rc.2 uses React slots; both React and controls come from its module loader.
 export function createClientPlugin(require) {
   const React = require('react');
   const { Button, Input, Checkbox, Switch, Modal, IconFolderCloseRegular } = require('@deepseek-ai/dsh-client-ui-primitives');
   const h = React.createElement;
+  const BidirectionalPanel = createBidirectionalPanel(React, { Button, Input, Checkbox, Switch, Modal });
   const folderIcon = IconFolderCloseRegular ? h('span', { 'aria-hidden': 'true', style: { display: 'inline-flex', flexShrink: 0 } }, h(IconFolderCloseRegular, { size: 16 })) : null;
   const styles = {
     page: { maxWidth: 820, minWidth: 0, display: 'flex', flexDirection: 'column', gap: 16, color: 'var(--dsw-alias-label-primary)' },
@@ -32,13 +34,14 @@ export function createClientPlugin(require) {
   };
   const sameIdentity = (status, binding) => Boolean(status && binding && status.server === binding.server && status.username === binding.username && status.revision === binding.revision);
 
-  function SettingsPage({ controller }) {
+  function SettingsPage({ controller, connection }) {
     const state = React.useSyncExternalStore(controller.subscribe, controller.getSnapshot);
     const status = state.status;
     const view = deriveView(state);
     const id = React.useId();
     const [server, setServer] = React.useState(status?.server ?? '');
     const [username, setUsername] = React.useState(status?.username ?? '');
+    const [remember, setRemember] = React.useState(false);
     const [search, setSearch] = React.useState('');
     const [projectManagerOpen, setProjectManagerOpen] = React.useState(false);
     const [cloudOpen, setCloudOpen] = React.useState(false);
@@ -94,12 +97,13 @@ export function createClientPlugin(require) {
       clearSecrets();
       setServer(status?.server ?? '');
       setUsername(status?.username ?? '');
+      setRemember(false);
     }, [status?.server, status?.username, status?.loggedIn]);
     const login = event => {
       event.preventDefault();
       const secret = password.current?.value ?? '';
       clearSecrets();
-      void controller.login({ server, username, password: secret }).finally(clearSecrets);
+      void controller.login({ server, username, password: secret, ...(remember ? { remember: true } : {}) }).finally(clearSecrets);
     };
     const openPassword = () => {
       const latest = controller.getSnapshot();
@@ -156,8 +160,15 @@ export function createClientPlugin(require) {
     const showProgress = () => { clearSecrets(); setCloudStage('progress'); setCloudOpen(true); void controller.refresh(); };
     const chooseDownloadFolder = () => {
       clearSecrets(); const lifetime = cloudLife.current;
-      void controller.chooseDownloadDestination().then(() => { if (cloudLife.current === lifetime && controller.getSnapshot().downloadBrowser) { setCloudStage('folders'); setCloudOpen(true); } });
+      setSuggestionsOpen(false); setCloudOpen(true);
+      void controller.chooseDownloadDestination().then(selected => {
+        if (cloudLife.current !== lifetime) return;
+        if (controller.getSnapshot().downloadBrowser) setCloudStage('folders');
+        else if (selected && controller.getSnapshot().downloadPlan && controller.prepareDownload()) setCloudStage('review');
+      });
     };
+    const backToDownloadSelection = () => { controller.closeDownloadBrowser(); controller.cancelDownloadIntent(); setCloudStage('select'); };
+    const registeredRoot = (restoreId, root) => state.registrationResults?.[restoreId]?.registered === true || status?.projects.some(project => project.root === root);
     React.useEffect(() => {
       if (!cloudOpen || cloudStage === 'select') return;
       stageFocus.current?.focus();
@@ -224,10 +235,15 @@ export function createClientPlugin(require) {
     const loginState = state.loading ? '读取中' : !state.ready ? '状态未确认' : status?.loggedIn ? '已登录' : '未登录';
     const passwordOpen = sameIdentity(status, passwordIdentity) && passwordBinding.current === passwordIdentity;
     const body = (content, extra = {}) => h('p', { style: styles.body, ...extra }, content);
+    const registrationControl = (restoreId, root, label) => registeredRoot(restoreId, root)
+      ? body('已添加到DSH项目', { role: 'status' })
+      : h(Button, { type: 'button', variant: 'outline', disabled: !view.canRecover, 'aria-label': `将 ${label} 添加到DSH项目`, onClick: () => { clearSecrets(); void controller.registerRestoredProject(restoreId); } }, state.registrationResults?.[restoreId]?.uncertain ? '核对项目登记' : '添加到DSH项目');
     const recoveryResult = !download && recovery && h('div', { style: styles.form, role: 'status', 'aria-live': 'polite', 'data-personal-sync': 'recovery-result' },
       body(`${recovery.kind === 'restore' ? '下载' : '导入'}${recovery.state === 'running' ? '进行中…' : recovery.state === 'succeeded' ? '完成' : '未完成'}`),
       body(recovery.root, { style: styles.root }),
       recovery.kind === 'restore' && recovery.sessionCount !== undefined && body(`会话归档 ${recovery.sessionCount} 个`),
+      recovery.kind === 'restore' && recovery.state === 'succeeded' && registrationControl(recovery.id, recovery.root, '已下载项目'),
+      state.registrationError && body(state.registrationError.message, { role: 'alert', style: styles.warning }),
       recovery.kind === 'import' && body(`已导入 ${recovery.importedCount ?? '未确认'} · 已跳过 ${recovery.skippedCount ?? '未确认'} · 失败 ${recovery.failedCount ?? '未确认'}`),
       view.recoveryError && body(view.recoveryError, { role: 'alert', style: { ...styles.body, ...styles.warning } }),
       recovery.state === 'failed' && body(recovery.kind === 'restore' ? '目录可能不完整，请使用新目录重试' : '部分会话可能已写入，勿重复导入', { style: { ...styles.body, ...styles.warning } }),
@@ -246,7 +262,7 @@ export function createClientPlugin(require) {
           h('h3', { id: `${id}-account-title`, style: styles.heading }, '账号'),
           h('span', { style: styles.badge, role: 'status', 'aria-live': 'polite', 'data-personal-sync': 'login-status' }, loginState)),
         status?.loggedIn
-          ? body(status.username, { 'aria-label': '已登录用户名', 'data-personal-sync': 'account-username', style: { ...styles.body, fontSize: 15, color: 'var(--dsw-alias-label-primary)' } })
+          ? h('div', { style: styles.form }, body(status.username, { 'aria-label': '已登录用户名', 'data-personal-sync': 'account-username', style: { ...styles.body, fontSize: 15, color: 'var(--dsw-alias-label-primary)' } }), body(status.server, { style: styles.root, 'aria-label': '已连接服务器' }))
           : h('form', { onSubmit: login, noValidate: true, autoComplete: 'off', style: styles.form, onBlur: blurSecrets },
             h('label', { style: styles.label, htmlFor: `${id}-server` }, '服务器',
               h(Input, { id: `${id}-server`, type: 'url', value: server, disabled: !view.canLogin,
@@ -260,6 +276,7 @@ export function createClientPlugin(require) {
               h('label', { style: styles.label, htmlFor: `${id}-password` }, '密码',
                 h(Input, { id: `${id}-password`, type: 'password', ref: password, disabled: !view.canLogin, autoComplete: 'off',
                   autoCapitalize: 'none', spellCheck: false, maxLength: 1024 }))),
+            h(Checkbox, { checked: remember, label: '在此设备保持登录（最长90天）', disabled: !view.canLogin, onChange: value => setRemember(value), 'data-personal-sync': 'remember-device' }),
             h('div', { style: styles.row },
               h(Button, { type: 'submit', variant: 'primary', disabled: !view.canLogin, 'aria-busy': state.busy === 'login' }, state.busy === 'login' ? '登录中…' : '登录'))),
         h('div', { style: styles.row },
@@ -267,6 +284,9 @@ export function createClientPlugin(require) {
           h(Button, { type: 'button', variant: 'ghost', disabled: !view.canLogout,
             onClick: () => { closePassword(); setConfirmLogout(true); } }, state.busy === 'logout' ? '退出中…' : '退出登录')),
         status?.warning && body(status.warning, { role: 'status', style: { ...styles.body, ...styles.warning } })),
+      h(BidirectionalPanel, { connection, identity: { server: status?.server ?? '', username: status?.username ?? '', loggedIn: status?.loggedIn === true }, onAuthenticationRequired: () => { clearSecrets(); void controller.refresh().then(() => password.current?.focus?.()); } }),
+      h('details', { style: { ...styles.form, gap: 16 }, 'data-personal-sync': 'legacy-actions' },
+      h('summary', { style: { ...styles.body, cursor: 'pointer' } }, '备份与恢复（高级）'),
       h('section', { style: styles.card, 'aria-labelledby': `${id}-projects-title`, 'data-personal-sync': 'projects-summary' },
         h('div', { style: { ...styles.between, alignItems: 'flex-start' } },
           h('div', { style: styles.summary },
@@ -314,7 +334,7 @@ export function createClientPlugin(require) {
             onClick: () => { clearSecrets(); void controller.savePreferences(); } }, state.busy === 'preferences' ? '保存中…' : '保存'),
           h(Button, { type: 'button', variant: 'ghost', disabled: !view.editable || !state.dirty, onClick: () => controller.discardChanges() }, '撤销更改'),
           h(Button, { type: 'button', variant: 'outline', disabled: !view.canSync, 'aria-busy': state.busy === 'sync',
-            onClick: () => { clearSecrets(); void controller.sync(); } }, state.busy === 'sync' ? '提交中…' : '立即同步'))),
+            onClick: () => { clearSecrets(); void controller.sync(); } }, state.busy === 'sync' ? '提交中…' : '立即同步')))),
       h('section', { style: styles.card, 'aria-labelledby': `${id}-update-title`, 'data-personal-sync': 'update-summary' },
         h('div', { style: styles.between },
           h('div', { style: styles.summary },
@@ -336,16 +356,18 @@ export function createClientPlugin(require) {
         footer: cloudOpen && h('div', { style: styles.between },
           h('span', { style: styles.body, role: 'status' }, cloudStage === 'select' ? `已选择 ${downloads.length} 个项目` : ''),
           h('div', { style: styles.row },
-            h(Button, { type: 'button', variant: 'ghost', onClick: closeCloud }, cloudStage === 'select' ? '完成' : '关闭'),
+            h(Button, { type: 'button', variant: 'ghost', onClick: closeCloud }, '关闭'),
+            cloudStage === 'select' && h(Button, { type: 'button', variant: 'primary', disabled: !view.canChooseDownloadDestination, onClick: chooseDownloadFolder }, '下一步：保存位置'),
+            ['folders', 'review'].includes(cloudStage) && h(Button, { type: 'button', variant: 'outline', disabled: Boolean(state.busy) || state.refreshing, onClick: backToDownloadSelection }, '返回选择'),
             cloudStage === 'review' && intent?.kind === 'download' && h(Button, { type: 'button', variant: 'primary', disabled: !view.canDownload, onClick: () => {
               if (controller.getSnapshot().downloadIntent !== intent) return;
               const lifetime = cloudLife.current;
-              void controller.confirmDownload(intent).then(() => { if (cloudLife.current === lifetime) setCloudStage('progress'); });
+              void controller.confirmDownload(intent).then(accepted => { if (cloudLife.current === lifetime && (accepted || controller.getSnapshot().downloadUncertain)) setCloudStage('progress'); });
             } }, '确认下载'),
             cloudStage === 'import' && intent?.kind === 'import' && h(Button, { type: 'button', variant: 'primary', disabled: !view.canRecover, onClick: () => {
               if (controller.getSnapshot().downloadIntent !== intent) return;
               const lifetime = cloudLife.current;
-              void controller.confirmDownloadImport(intent).then(() => { if (cloudLife.current === lifetime) setCloudStage('progress'); });
+              void controller.confirmDownloadImport(intent).then(accepted => { if (cloudLife.current === lifetime && (accepted || controller.getSnapshot().downloadUncertain)) setCloudStage('progress'); });
             } }, '确认导入'))) },
         cloudOpen && h('div', { style: styles.form, ref: stageFocus, tabIndex: -1, ...(cloudStage !== 'select' ? { 'data-modal-autofocus': '' } : {}) },
           cloudStage === 'select' && h('div', { style: styles.form },
@@ -393,13 +415,16 @@ export function createClientPlugin(require) {
             !directoryBrowser.directories.length && body('暂无子文件夹'), directoryBrowser.truncated && body('仅显示部分文件夹'),
             h(Button, { type: 'button', variant: 'primary', disabled: !directoryBrowser.selectable || Boolean(state.busy) || state.refreshing, onClick: () => {
               const lifetime = cloudLife.current;
-              if (controller.getSnapshot().downloadBrowser === directoryBrowser) void controller.selectDownloadDestination(directoryBrowser.currentId).then(selected => { if (selected && cloudLife.current === lifetime) closeCloud(); });
+              if (controller.getSnapshot().downloadBrowser === directoryBrowser) void controller.selectDownloadDestination(directoryBrowser.currentId).then(selected => { if (selected && cloudLife.current === lifetime && controller.prepareDownload()) setCloudStage('review'); });
             } }, '选择此文件夹')),
           cloudStage === 'review' && intent?.kind === 'download' && h('div', { style: styles.form },
             body(`将下载 ${intent.items.length} 个项目`), body('下载云端最新内容'),
             ...intent.items.map(item => h('div', { key: item.projectId, style: styles.project }, h('strong', null, item.label), body(item.root, { style: styles.root }))),
             body('新建目录，不覆盖现有文件'), body('关闭窗口后继续下载')),
           cloudStage === 'import' && intent?.kind === 'import' && h('div', { style: styles.form }, body(intent.label), body(intent.root, { style: styles.root }), body('仅导入安全会话，不启动代理。导入后请核对结果，勿重复提交。')),
+          ['review', 'import'].includes(cloudStage) && !intent && h('div', { style: styles.form },
+            body('请求未通过或结果尚未确认，请先核对状态；不会自动重试。'),
+            h(Button, { type: 'button', variant: 'outline', disabled: Boolean(state.busy) || state.refreshing, onClick: () => { void controller.refresh(); } }, '核对状态')),
           cloudStage === 'progress' && h('div', { style: styles.form },
             download && body(`下载${({ running: '进行中…', succeeded: '完成', partial: '部分完成', failed: '未完成' })[download.state]} · ${download.completed}/${download.total}`, { role: 'status', 'aria-live': 'polite' }),
             view.downloadWarning && body(view.downloadWarning, { role: 'alert', style: styles.warning }),
@@ -416,9 +441,11 @@ export function createClientPlugin(require) {
                   ...(item.importResult.sessions ?? []).map(session => h('div', { key: session.sourceId },
                     body(`${session.sourceId} → ${session.sessionId ?? '无新会话 ID'} · ${{ imported: '已导入', skipped: '已跳过', failed: '失败' }[session.outcome]}`),
                     session.workspaceAttached === false && body('未关联工作区，勿重复导入', { style: styles.warning }))))),
+              item.state === 'succeeded' && registrationControl(item.restoreId, item.root, item.label),
               item.canImport && h(Button, { type: 'button', variant: 'outline', disabled: !view.canRecover, 'aria-label': `导入 ${item.label} 的安全会话`, onClick: () => { if (controller.prepareDownloadImport(item.restoreId)) setCloudStage('import'); } }, '导入安全会话'))),
             h(Button, { type: 'button', variant: 'outline', disabled: Boolean(state.busy) || state.refreshing, onClick: () => { void controller.refresh(); } }, '核对状态')),
           state.downloadError && body(state.downloadError.message, { role: 'alert', style: styles.error }),
+          state.registrationError && body(state.registrationError.message, { role: 'alert', style: styles.warning }),
           state.downloadUncertain && body('结果未确认，请核对状态；勿重复提交。', { role: 'alert', style: styles.warning }),
           (state.dirty || state.conflict) && body('请先保存或撤销本机同步设置更改。'))),
       h(Modal, { open: projectManagerOpen, onClose: closeProjects, title: '管理同步项目', closeLabel: '关闭',
@@ -473,7 +500,7 @@ export function createClientPlugin(require) {
       ctx.effect(() => () => controller.dispose(), 'dsh-personal-sync: settings controller');
       ctx.slots.inject('settings.section', () => ctx.slots.register({
         name: 'settings.section', id: 'dsh-personal-sync', order: 45,
-        label: () => '个人云同步', inject: () => ({ controller }),
+        label: () => '个人云同步', inject: () => ({ controller, connection: ctx.connection }),
       }, SettingsPage));
       ctx.on('connection/reset', () => { void controller.refreshIfWatching(); });
     },
