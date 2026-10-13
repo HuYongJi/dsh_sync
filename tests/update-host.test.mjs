@@ -351,7 +351,7 @@ test('actual plugin dispose returns while native applying and cancellation need 
 test('all updater routes use exact admitted POST RPC, sanitize errors, and ordinary status includes optional update', async t => {
   const f = await fixture(t), routes = [];
   registerSettingsRoutes({ connection: { fetch: { register: value => routes.push(value) } } }, f.bridge);
-  assert.equal(routes.length, 26); assert.ok(routes.every(route => route.methods.length === 1 && route.methods[0] === 'POST' && route.requestBody === 'streaming'));
+  assert.equal(routes.length, 33); assert.ok(routes.every(route => route.methods.length === 1 && route.methods[0] === 'POST' && route.requestBody === 'streaming'));
   for (const action of ['updatestatus', 'checkupdate', 'installupdate', 'cancelupdate']) {
     assert.equal((await f.bridge.fetch(action, new Request(`http://dsh.internal${SETTINGS_API}${action}`))).status, 405);
     const result = await rpc(f, action, { password: 'never-reflect-this' }); assert.equal(result.ok, false); assert.equal(result.error.code, 'BAD_REQUEST'); assert.ok(!JSON.stringify(result).includes('never-reflect'));

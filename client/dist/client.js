@@ -625,8 +625,11 @@ return Object.freeze({RPC_CHANNEL, RPC_PREFIX, CLIENT_ACTIONS, SettingsClientErr
 })();
 __clientModules["./bidirectional-state.mjs"] = (() => {
 // Framework-free v2 GUI state. The authenticated DSH Connection is the only carrier.
-const BIDIRECTIONAL_ACTIONS = Object.freeze(['syncstatus', 'syncprojects', 'pairplan', 'paircommit', 'syncpause', 'syncrun', 'syncconflicts', 'syncresolveplan', 'syncresolve', 'syncrecycle', 'syncrestoreplan', 'syncrestore', 'syncarchives', 'syncarchiveplan', 'syncarchiveimport', 'syncrepairplan', 'syncrepair', 'syncsettings']);
-const WRITE_ACTIONS = new Set(['paircommit', 'syncrun', 'syncpause', 'syncresolve', 'syncrestore', 'syncarchiveimport', 'syncrepair', 'syncsettings']);
+const BIDIRECTIONAL_ACTIONS = Object.freeze(['syncstatus', 'syncprojects', 'syncclonepick', 'syncclonebrowse', 'synccloneselect', 'synccloneplan', 'syncclonecommit', 'syncpublishplan', 'syncpublishcommit', 'pairplan', 'paircommit', 'syncpause', 'syncrun', 'syncconflicts', 'syncresolveplan', 'syncresolve', 'syncrecycle', 'syncrestoreplan', 'syncrestore', 'syncarchives', 'syncarchiveplan', 'syncarchiveimport', 'syncrepairplan', 'syncrepair', 'syncsettings']);
+const WRITE_ACTIONS = new Set(['syncclonecommit', 'syncpublishcommit', 'paircommit', 'syncrun', 'syncpause', 'syncresolve', 'syncrestore', 'syncarchiveimport', 'syncrepair', 'syncsettings']);
+const MAX_ONBOARDING_PROJECTS = 20;
+const isOnboarding = kind => kind === 'clone' || kind === 'publish';
+const onboardingKind = action => ({ syncclonecommit: 'clone', syncpublishcommit: 'publish' })[action];
 const STORAGE_GIB = 1024 ** 3;
 const MAX_STORAGE_GIB = 1024;
 const REPAIR_CODES = new Set(['SYNC_LOCAL_CHANGED', 'SYNC_REPLAN_REQUIRED', 'SYNC_APPLY_INCOMPLETE', 'SYNC_REPAIR_INCOMPLETE']);
@@ -661,6 +664,14 @@ const MESSAGES = Object.freeze({
   SYNC_APPLY_INCOMPLETE: '本机应用尚未完成，请核对任务结果', SYNC_CONFLICT_CHANGED: '冲突已变化，请重新选择',
   SYNC_CANCELLED: '操作已停止，已完成内容与回收副本保留', SYNC_REPLAN_REQUIRED: '中断的事务需要核对，未自动重复写入',
   SYNC_DESTINATION_UNAVAILABLE: '无法规划安全的新副本路径',
+  SYNC_BATCH_LIMIT: '每次最多选择20个项目', SYNC_BATCH_SELECTION_REQUIRED: '请至少选择一个项目',
+  SYNC_PICKER_UNAVAILABLE: '宿主目录选择不可用，请检查宿主权限后重试', SYNC_DESTINATION_REQUIRED: '请在宿主选择父目录',
+  SYNC_DESTINATION_EXPIRED: '父目录选择已过期，请重新选择', SYNC_REGISTRATION_UNCERTAIN: '工作区注册结果未确认，仅核对状态，不要向同一目录重复提交',
+  DIRECTORY_PICKER_UNAVAILABLE: '宿主目录选择不可用，请检查宿主权限后重试', DIRECTORY_PICKER_FAILED: '宿主目录读取失败，请重新选择父目录',
+  DIRECTORY_PICKER_EXPIRED: '宿主目录选择已过期，请重新选择父目录', BAD_DESTINATION: '父目录位置不安全，请在宿主重新选择',
+  DESTINATION_CHANGED: '父目录已变化，请重新选择并预览', DESTINATION_EXISTS: '目标位置已存在，请重新选择父目录并预览',
+  CLOUD_PROJECT_EMPTY: '云端项目没有可同步的内容，请选择其他项目', PROJECT_REGISTRATION_UNCERTAIN: '工作区注册结果未确认，仅核对状态，不要向同一目录重复提交',
+  PROTECTED_DESTINATION: '此目录受保护，请在宿主选择其他父目录', SYNC_CATALOG_CHANGED: '云端列表已变化，请刷新列表后重新选择',
   SYNC_ARCHIVES_UNSUPPORTED: '此宿主仅支持文件同步，会话归档暂不可用', SYNC_ARCHIVES_SKIPPED: '部分会话归档已延后，文件同步不受影响',
   SYNC_IMPORT_UNCERTAIN: '部分会话可能已写入，请核对新会话 ID，不要重复导入', SYNC_IMPORT_SKIPPED: '部分会话不支持安全导入，已跳过',
   SYNC_IMPORT_UNATTACHED: '会话已写入但未关联项目，请核对新会话 ID，不要重复导入',
@@ -676,6 +687,7 @@ const DEFINITE = new Set(['NOT_DEPLOYED', 'AUTH_REQUIRED', 'FORBIDDEN', 'NOT_LOG
 // uncertain for writes: a mapped display code is NOT proof of no side effects.
 for (const code of ['SYNC_PLAN_CHANGED', 'SYNC_MANAGED_PROJECT', 'SYNC_CLIENT_UPGRADE_REQUIRED', 'SYNC_MIGRATION_REQUIRED', 'SYNC_ROOT_CHANGED', 'SYNC_POLICY_CHANGED', 'SYNC_LOCAL_CHANGED', 'SYNC_QUOTA', 'SYNC_METADATA_UNSAFE', 'SYNC_VOLUME_CHANGED', 'SYNC_NOT_IDLE', 'SYNC_BINDING_MISMATCH', 'SYNC_STRUCTURAL_CONFLICT', 'SYNC_CONFLICT_CHANGED', 'SYNC_DESTINATION_UNAVAILABLE', 'ACCOUNT_BOUND', 'PROJECT_UNAVAILABLE', 'PROJECTS_UNAVAILABLE', 'PROJECT_NOT_SELECTED', 'REQUEST_TOO_LARGE', 'UNSUPPORTED_MEDIA_TYPE']) DEFINITE.add(code);
 DEFINITE.add('SYNC_ARCHIVES_UNSUPPORTED');
+for (const code of ['DIRECTORY_PICKER_UNAVAILABLE', 'DIRECTORY_PICKER_FAILED', 'DIRECTORY_PICKER_EXPIRED', 'BAD_DESTINATION', 'DESTINATION_CHANGED', 'DESTINATION_EXISTS', 'CLOUD_PROJECT_EMPTY', 'PROTECTED_DESTINATION', 'SYNC_CATALOG_CHANGED']) DEFINITE.add(code);
 const BINDING_STATES = ['idle', 'scanning', 'offline', 'uploading', 'applying', 'deferred', 'conflicted', 'blocked', 'uncertain', 'synced', 'paused', 'needs-login'];
 const OP_STATES = ['running', 'succeeded', 'failed', 'uncertain'];
 const OP_KINDS = ['pair', 'run', 'sync', 'resolve', 'restore', 'import', 'repair', 'paircommit', 'syncrun', 'syncresolve', 'syncrestore', 'syncarchiveimport', 'syncrepair'];
@@ -694,7 +706,12 @@ const relative = value => text(value, 1024) && !/[\\:]/.test(value) && value.spl
 const accountEqual = (a, b) => Boolean(a && b && a.server === b.server && a.username === b.username);
 const identityEqual = (a, b) => accountEqual(a, b) && a.revision === b.revision;
 const identityOf = value => freeze({ revision: value.revision, server: value.server, username: value.username });
-const hostUncertain = status => Boolean(status?.operations.some(item => item.state === 'uncertain') || status?.bindings.some(item => item.state === 'uncertain'));
+// A terminal onboarding result consumes the original intent even if an individual
+// registration remains unknown. Preserve that readonly result, not a global lock
+// on unrelated healthy projects. Missing receipts and active ambiguity still lock.
+const terminalOnboarding = batch => ['succeeded', 'partial', 'failed', 'uncertain'].includes(batch.state) && batch.items.every(item => ['succeeded', 'failed', 'uncertain'].includes(item.state));
+const uncertainOnboarding = batch => batch.state === 'uncertain' || batch.items.some(item => item.state === 'uncertain');
+const hostUncertain = status => Boolean(status?.operations.some(item => item.state === 'uncertain') || status?.bindings.some(item => item.state === 'uncertain') || status?.onboarding.some(batch => !terminalOnboarding(batch) && uncertainOnboarding(batch)));
 const operationKinds = { paircommit: ['pair', 'paircommit'], syncrun: ['run', 'sync', 'syncrun'], syncresolve: ['resolve', 'syncresolve'], syncrestore: ['restore', 'syncrestore'], syncarchiveimport: ['import', 'syncarchiveimport'], syncrepair: ['repair', 'syncrepair'] };
 const errorCode = value => typeof value === 'string' && Object.hasOwn(MESSAGES, value) ? value : 'SYNC_FAILED';
 class BidirectionalClientError extends Error {
@@ -738,6 +755,69 @@ function importResult(value) {
   return result;
 }
 
+const BATCH_STATES = ['running', 'succeeded', 'partial', 'failed', 'uncertain'];
+const ITEM_STATES = ['pending', 'running', 'succeeded', 'failed', 'uncertain'];
+const BATCH_PHASES = ['pending', 'accepted', 'mkdir-started', 'root-owned', 'migration-committing', 'migration-complete', 'downloading', 'downloaded', 'registering', 'registered', 'publishing', 'paired', 'complete', 'interrupted'];
+function safeRoot(value) {
+  if (!absolute(value)) return false;
+  const normalized = value.replaceAll('\\', '/'), windows = /^[A-Za-z]:|^\\\\/.test(value);
+  if (windows && (/[<>"|?*]/u.test(value) || normalized.slice(/^[A-Za-z]:/.test(value) ? 2 : 0).includes(':'))) return false;
+  return !windows || normalized.split('/').every(part => !part || !/[. ]$/.test(part));
+}
+function freshChild(parent, root) {
+  if (!safeRoot(parent) || !safeRoot(root)) return false;
+  const prefix = `${pathKey(parent)}/`, target = pathKey(root);
+  return target.startsWith(prefix) && target.length > prefix.length && !target.slice(prefix.length).includes('/');
+}
+function expiry(value, now) {
+  const result = typeof value === 'number' ? value : typeof value === 'string' ? Date.parse(value) : NaN;
+  check(Number.isSafeInteger(result) && result > 0);
+  if (result <= now()) fail('SYNC_PLAN_EXPIRED');
+  return result;
+}
+function syncSummary(value) {
+  check(record(value)); const result = {};
+  for (const key of ['upload', 'download', 'delete', 'conflicts', 'blocked']) { check(integer(value[key])); result[key] = value[key]; }
+  return freeze(result);
+}
+function batchSummary(value, items) {
+  const result = syncSummary(value);
+  for (const key of Object.keys(result)) check(result[key] === items.reduce((sum, item) => sum + item.summary[key], 0));
+  return result;
+}
+function parseOnboarding(value) {
+  return rows(value, batch => {
+    check(id(batch.id) && isOnboarding(batch.kind) && BATCH_STATES.includes(batch.state) && date(batch.at));
+    check(batch.parent === undefined || (batch.kind === 'clone' && safeRoot(batch.parent)));
+    const items = rows(batch.items, item => {
+      check(id(item.id) && text(item.label, 1024) && safeRoot(item.root) && ITEM_STATES.includes(item.state) && typeof item.phase === 'string' && /^[a-z0-9][a-z0-9-]{0,63}$/.test(item.phase));
+      check(item.projectId === undefined || id(item.projectId)); check(item.workspaceId === undefined || opaque(item.workspaceId)); check(item.bindingId === undefined || id(item.bindingId));
+      if (batch.parent !== undefined) check(freshChild(batch.parent, item.root));
+      return { id: item.id, label: item.label, root: item.root, state: item.state, phase: BATCH_PHASES.includes(item.phase) ? item.phase : 'unknown',
+        ...(item.projectId === undefined ? {} : { projectId: item.projectId }), ...(item.workspaceId === undefined ? {} : { workspaceId: item.workspaceId }), ...(item.bindingId === undefined ? {} : { bindingId: item.bindingId }), ...optionalError(item.errorCode) };
+    }, MAX_ONBOARDING_PROJECTS);
+    check(items.length > 0 && new Set(items.map(item => pathKey(item.root))).size === items.length);
+    if (batch.state === 'succeeded') check(items.every(item => item.state === 'succeeded'));
+    if (['succeeded', 'partial', 'failed'].includes(batch.state)) check(!items.some(item => ['pending', 'running'].includes(item.state)));
+    return { id: batch.id, kind: batch.kind, state: batch.state, at: batch.at, ...(batch.parent === undefined ? {} : { parent: batch.parent }), items };
+  }, 100);
+}
+function parseBrowser(value) {
+  check(record(value) && id(value.id) && safeRoot(value.path) && id(value.currentId) && typeof value.selectable === 'boolean' && typeof value.truncated === 'boolean');
+  const parseNode = item => { check(id(item.id) && text(item.label, 1024)); return { id: item.id, label: item.label }; };
+  return freeze({ id: value.id, path: value.path, currentId: value.currentId, crumbs: rows(value.crumbs, parseNode, 256), directories: rows(value.directories, parseNode, 2000), selectable: value.selectable, truncated: value.truncated });
+}
+function parseDestination(value, projectIds, now, workspaces) {
+  check(record(value) && id(value.id) && safeRoot(value.parent));
+  const items = rows(value.items, item => {
+    check(id(item.projectId) && projectIds.includes(item.projectId) && text(item.label, 1024) && freshChild(value.parent, item.root));
+    check(!workspaces.some(workspace => pathKey(workspace.root) === pathKey(item.root)));
+    return { projectId: item.projectId, label: item.label, root: item.root };
+  }, MAX_ONBOARDING_PROJECTS);
+  check(items.length === projectIds.length && items.length > 0 && new Set(items.map(item => pathKey(item.root))).size === items.length);
+  return freeze({ id: value.id, parent: value.parent, expiresAt: expiry(value.expiresAt, now), items });
+}
+
 /** Deep allowlist: credentials, arbitrary exception bodies and unknown DTO fields never survive. */
 function parseSyncStatus(value) {
   check(record(value) && integer(value.revision) && typeof value.loggedIn === 'boolean');
@@ -758,7 +838,7 @@ function parseSyncStatus(value) {
     check(id(item.id) && OP_STATES.includes(item.state) && (item.bindingId === undefined || id(item.bindingId)) && (item.requestId === undefined || id(item.requestId)));
     return { id: item.id, kind: OP_KINDS.includes(item.kind) ? item.kind : 'unknown', state: item.state, ...(item.bindingId === undefined ? {} : { bindingId: item.bindingId }), ...(item.requestId === undefined ? {} : { requestId: item.requestId }), ...importResult(item), ...optionalError(item.errorCode) };
   });
-  return freeze({ revision: value.revision, server, username, loggedIn: value.loggedIn, capability, running: value.running === true, workspaces, bindings, operations, ...(value.storage === undefined ? {} : { storage: parseStorage(value.storage) }), ...(value.warning === undefined ? {} : { warning: errorCode(value.warning) }) });
+  return freeze({ revision: value.revision, server, username, loggedIn: value.loggedIn, capability, running: value.running === true, workspaces, bindings, operations, onboarding: parseOnboarding(value.onboarding ?? []), ...(value.storage === undefined ? {} : { storage: parseStorage(value.storage) }), ...(value.warning === undefined ? {} : { warning: errorCode(value.warning) }) });
 }
 function parseSyncProjects(value) {
   check(record(value) && (value.partial === undefined || typeof value.partial === 'boolean'));
@@ -813,12 +893,16 @@ function uuid(crypto) {
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value ?? '')) fail('BAD_REQUEST_ID');
   return value;
 }
-const emptyProjects = () => freeze({ items: freeze([]), loaded: false, partial: false, identity: null });
+const emptyProjects = () => freeze({ items: freeze([]), loaded: false, partial: false, identity: null, loadedAt: 0 });
 
 /**
  * Controller lifecycle: subscribe/getSnapshot, watch()->stop, refresh, dispose,
  * setIdentity({server,username,loggedIn}) (never a legacy revision).
- * Pair: openPair/loadProjects/selectWorkspace(id)/selectProject(id|null)/
+ * Onboarding: openPublish (local only) / openClone (explicit cached discovery),
+ * selectOnboarding(id,checked), planPublish or pickCloneParent/browseCloneParent/
+ * selectCloneParent/selectCloneLegacy/planClone, then confirmPublish/confirmClone.
+ * Exact plans authorize independent batches, never all-or-nothing rollback.
+ * Pair (internal compatibility only): openPair/loadProjects/selectWorkspace(id)/selectProject(id|null)/
  * selectLegacy(id)/planPair/confirmPair(exactPlan). null explicitly creates cloud;
  * undefined clears cloud selection, '' clears workspace. No automatic selection.
  * Daily: setEnabled(bindingId,boolean), run(bindingId).
@@ -839,6 +923,7 @@ function createBidirectionalController(connection, options = {}) {
   const setTimer = options.setTimeout ?? globalThis.setTimeout.bind(globalThis), clearTimer = options.clearTimeout ?? globalThis.clearTimeout.bind(globalThis);
   const now = options.now ?? Date.now, activePollMs = Math.max(1000, options.activePollMs ?? 3000), idlePollMs = Math.max(10000, options.idlePollMs ?? 10000), timeoutMs = Math.max(1000, options.timeoutMs ?? 60000);
   const maxPollErrors = Math.max(1, options.maxPollErrors ?? 3), maxUncertainChecks = Math.max(1, options.maxUncertainChecks ?? 10);
+  const projectCacheMs = Math.min(30000, Math.max(0, options.projectCacheMs ?? 30000));
   let state = freeze({ status: null, ready: false, refreshing: false, busy: null, error: null, notice: '', projects: emptyProjects(), dialog: null, pending: freeze([]), uncertain: false, pollStopped: false });
   let external = null, disposed = false, watchers = 0, readAllowed = true, pollTimer, expiryTimer, refreshAbort, dialogAbort, refreshGeneration = 0, dialogGeneration = 0, failures = 0, uncertainChecks = 0, pauseSequence = 0;
   const listeners = new Set(), attemptedImports = new Map();
@@ -875,7 +960,7 @@ function createBidirectionalController(connection, options = {}) {
     const stopped = failures >= maxPollErrors || ((state.pending.length > 0 || state.uncertain) && uncertainChecks >= maxUncertainChecks);
     if (state.pollStopped !== stopped) emit({ pollStopped: stopped });
     if (disposed || !watchers || !readAllowed || state.busy || state.refreshing || stopped) return;
-    const active = state.pending.length > 0 || state.status?.running || state.status?.operations.some(item => ['running', 'uncertain'].includes(item.state)) || state.status?.bindings.some(item => ['scanning', 'uploading', 'applying'].includes(item.state));
+    const active = state.pending.length > 0 || state.uncertain || state.status?.running || state.status?.onboarding.some(item => item.state === 'running') || state.status?.operations.some(item => ['running', 'uncertain'].includes(item.state)) || state.status?.bindings.some(item => ['scanning', 'uploading', 'applying'].includes(item.state));
     const enabled = state.status?.bindings.some(item => item.enabled);
     if (!active && (!enabled || !state.status?.loggedIn || !accountVisible())) return;
     pollTimer = setTimer(() => { pollTimer = undefined; void refresh({ automatic: true }); }, active ? activePollMs : idlePollMs); pollTimer?.unref?.();
@@ -899,7 +984,7 @@ function createBidirectionalController(connection, options = {}) {
   }
   function invalidateAuthority(stale = true) {
     cancelDialogRead(); clearExpiry();
-    if (state.dialog) patchDialog({ plan: null, identity: null, stale, stage: ['progress', 'uncertain'].includes(state.dialog.stage) ? state.dialog.stage : 'choose' });
+    if (state.dialog) patchDialog({ plan: null, identity: null, stale, ...(isOnboarding(state.dialog.kind) ? { selectedIds: freeze([]), browser: null, destination: null, legacyChoices: freeze([]), primaryLegacyIds: freeze([]) } : {}), stage: ['progress', 'uncertain'].includes(state.dialog.stage) ? state.dialog.stage : 'choose' });
     emit({ projects: freeze({ ...state.projects, loaded: false, identity: null }) });
   }
   function acceptStatus(status) {
@@ -919,6 +1004,20 @@ function createBidirectionalController(connection, options = {}) {
         if (status.revision > item.identity.revision && status.storage?.limitBytes === item.quotaBytes) { notice = '存储上限已保存；不会自动删除内容'; continue; }
         pending.push(item); continue;
       }
+      const batchKind = onboardingKind(item.action);
+      if (batchKind) {
+        // Batch IDs are the original client request IDs, including after a lost ACK.
+        // Never correlate by project/path or invent a replacement request.
+        const batch = status.onboarding.find(row => row.id === item.requestId && row.kind === batchKind);
+        if (!batch) { pending.push(uncertainChecks >= maxUncertainChecks ? freeze({ ...item, uncertain: true }) : item); continue; }
+        if (state.dialog?.requestId === item.requestId && state.dialog.kind === batchKind) patchDialog({ operationId: batch.id, batch });
+        if (terminalOnboarding(batch)) {
+          notice = uncertainOnboarding(batch) ? '部分项目结果仍未确认，不会重复提交；其他项目可独立操作' : batch.state === 'succeeded' ? '各项目已独立完成，已启用双向同步' : batch.state === 'partial' ? '部分项目完成；失败项目未回滚已完成项目，请逐项核对' : '项目未完成，请逐项核对；不会自动重试';
+          continue;
+        }
+        pending.push(freeze({ ...item, operationId: batch.id, uncertain: uncertainOnboarding(batch) }));
+        continue;
+      }
       const operation = status.operations.find(op => (op.id === item.requestId || op.requestId === item.requestId) && operationKinds[item.action]?.includes(op.kind) && (!item.bindingId || !op.bindingId || op.bindingId === item.bindingId));
       if (!operation) { pending.push(uncertainChecks >= maxUncertainChecks ? freeze({ ...item, uncertain: true }) : item); continue; }
       if (state.dialog?.requestId === item.requestId) patchDialog({ operationId: operation.id });
@@ -930,16 +1029,20 @@ function createBidirectionalController(connection, options = {}) {
       pending.push(freeze({ ...item, operationId: operation.id, uncertain: operation.state === 'uncertain' }));
     }
     const uncertain = pending.some(item => item.uncertain) || hostUncertain(status);
-    const observedPending = pending.length > 0 && pending.every(item => item.operationId && status.operations.some(op => op.id === item.operationId && op.state === 'running'));
+    const observedPending = pending.length > 0 && pending.every(item => item.operationId && (onboardingKind(item.action) ? status.onboarding.some(batch => batch.id === item.requestId && batch.kind === onboardingKind(item.action) && batch.state === 'running') : status.operations.some(op => op.id === item.operationId && op.state === 'running')));
     if (!uncertain && (!pending.length || observedPending)) uncertainChecks = 0;
     const error = uncertain ? publicError(new BidirectionalClientError('SYNC_UNCERTAIN')) : state.error?.code === 'SYNC_UNCERTAIN' ? null : state.error;
     emit({ status, ready: !external || (accountEqual(external, status) && external.loggedIn === status.loggedIn), pending: freeze(pending), uncertain, notice, error });
+    if (isOnboarding(state.dialog?.kind) && state.dialog.requestId) {
+      const batch = status.onboarding.find(item => item.id === state.dialog.requestId && item.kind === state.dialog.kind);
+      if (batch) patchDialog({ batch, identity: identityOf(status), stale: false, error: null, stage: uncertainOnboarding(batch) ? 'uncertain' : 'progress' });
+    }
     if (state.dialog?.kind === 'archives') {
       const items = guardedArchives(state.dialog.items, identityOf(status), state.dialog.bindingId);
       patchDialog({ items, ...(state.dialog.stage === 'choose' && !items.some(item => item.id === state.dialog.selectedId && item.state === 'available') ? { selectedId: '' } : {}) });
     }
     if (state.dialog?.kind === 'repair' && state.dialog.plan && !canRepairBinding(status.bindings.find(item => item.id === state.dialog.bindingId))) { clearExpiry(); patchDialog({ plan: null, stage: 'choose', stale: true }); }
-    if (state.dialog?.stage === 'uncertain' && !uncertain) patchDialog({ stage: 'progress', error: null });
+    if (state.dialog?.stage === 'uncertain' && !uncertain && !(isOnboarding(state.dialog.kind) && state.dialog.batch && uncertainOnboarding(state.dialog.batch))) patchDialog({ stage: 'progress', error: null });
   }
   async function refresh({ automatic = false } = {}) {
     if (disposed || (automatic && !readAllowed) || WRITE_ACTIONS.has(state.busy)) return false;
@@ -972,30 +1075,38 @@ function createBidirectionalController(connection, options = {}) {
     } catch { external = freeze({ server: '', username: '', loggedIn: false }); cancelRefresh(); invalidateAuthority(); emit({ ready: false, dialog: null, error: publicError(new BidirectionalClientError('ACCOUNT_MISMATCH')) }); return false; }
   }
   async function dialogRead(action, payload, accept) {
-    if (!ready({ discovery: action === 'syncprojects' }) || !state.dialog) return false;
+    if (!ready({ discovery: action === 'syncprojects' || ['syncpublishplan', 'syncclonepick', 'syncclonebrowse', 'synccloneselect', 'synccloneplan'].includes(action) }) || !state.dialog) return false;
     clearPoll(); cancelDialogRead(); const generation = dialogGeneration, abort = new AbortController(), bound = identityOf(state.status), dialog = state.dialog;
     dialogAbort = abort; emit({ busy: action }); patchDialog({ error: null });
     try {
       const value = await call(action, { ...bound, ...payload }, abort);
       if (disposed || generation !== dialogGeneration || !state.dialog || state.dialog.kind !== dialog.kind || !identityEqual(bound, state.status) || !accountVisible()) return false;
       accept(value, bound); return true;
-    } catch (error) { if (!disposed && generation === dialogGeneration) patchDialog({ plan: null, stage: 'choose', error: publicError(error) }); return false; }
+    } catch (error) {
+      if (!disposed && generation === dialogGeneration) {
+        const stage = dialog.kind === 'clone' && state.dialog?.browser && ['syncclonebrowse', 'synccloneselect'].includes(action) ? 'folder' : dialog.kind === 'clone' && state.dialog?.destination && action === 'synccloneplan' ? (state.dialog.legacyChoices.length ? 'legacy' : 'destination') : 'choose';
+        patchDialog({ plan: null, stage, error: publicError(error) });
+      }
+      return false;
+    }
     finally { if (!disposed && generation === dialogGeneration) { dialogAbort = undefined; emit({ busy: null }); expirePlan(); queuePoll(); } }
   }
-  async function loadProjects() {
+  async function loadProjects({ force = true } = {}) {
+    const kind = state.dialog?.kind;
+    if (!['pair', 'clone'].includes(kind) || (kind === 'clone' && ['progress', 'uncertain'].includes(state.dialog.stage)) || !ready({ discovery: true })) return false;
+    if (kind === 'clone' && !force && state.projects.loaded && identityEqual(state.projects.identity, state.status) && now() - state.projects.loadedAt < projectCacheMs) return true;
+    const needsStatus = kind === 'pair' || state.status.capability !== 'supported';
     const pending = dialogRead('syncprojects', {}, (value, identity) => {
-      const parsed = parseSyncProjects(value); emit({ projects: freeze({ items: parsed.projects, loaded: true, partial: parsed.partial, identity }) });
-      patchDialog({ identity, stale: false, ...(state.dialog.projectId && !parsed.projects.some(item => item.projectId === state.dialog.projectId) ? { projectChoice: '', projectId: null } : {}) });
+      const parsed = parseSyncProjects(value); emit({ projects: freeze({ items: parsed.projects, loaded: true, partial: parsed.partial, identity, loadedAt: now() }) });
+      patchDialog({ identity, stale: false, plan: null, ...(kind === 'clone' ? { selectedIds: freeze(state.dialog.selectedIds.filter(projectId => parsed.projects.some(item => item.projectId === projectId) && !state.status.bindings.some(item => item.projectId === projectId))), browser: null, destination: null, legacyChoices: freeze([]), primaryLegacyIds: freeze([]), stage: 'choose' } : {}), ...(state.dialog.projectId && !parsed.projects.some(item => item.projectId === state.dialog.projectId) ? { projectChoice: '', projectId: null } : {}) });
     });
     const generation = dialogGeneration, loaded = await pending;
-    if (disposed || !readAllowed || generation !== dialogGeneration || state.dialog?.kind !== 'pair') return false;
-    // syncstatus is deliberately local-only. Only this explicit cloud catalog
-    // probe discovers/upgrades capability; then read its freshly persisted result.
+    if (disposed || !readAllowed || generation !== dialogGeneration || state.dialog?.kind !== kind) return false;
+    // Catalog discovery is explicit. Known capability avoids a redundant status read;
+    // first discovery must reconcile Host's newly persisted capability, not guess it.
     const unsupported = ['SYNC_CLIENT_UPGRADE_REQUIRED', 'SYNC_UPGRADE_REQUIRED', 'SYNC_UNSUPPORTED'].includes(state.dialog.error?.code);
-    if (loaded || unsupported) {
-      const refreshed = await refresh({ automatic: true });
-      if (!refreshed || !state.dialog || state.dialog.kind !== 'pair') return false;
-      // A probe bound to an older revision cannot authorize selections/plans.
+    if ((loaded && needsStatus) || unsupported) {
+      if (!await refresh({ automatic: true }) || state.dialog?.kind !== kind) return false;
       if (!state.projects.loaded || !identityEqual(state.projects.identity, state.status)) return false;
     }
     return loaded;
@@ -1004,6 +1115,122 @@ function createBidirectionalController(connection, options = {}) {
     if (!ready({ discovery: true })) return false;
     closeDialog(); emit({ dialog: freeze({ kind: 'pair', stage: 'choose', identity: identityOf(state.status), stale: false, workspaceId: '', projectChoice: '', projectId: null, primaryLegacyId: null, legacyChoices: freeze([]), plan: null, error: null }) });
     return loadProjects();
+  }
+  function openOnboarding(kind) {
+    if (!ready({ discovery: true })) return false;
+    closeDialog(); emit({ dialog: freeze({ kind, stage: 'choose', identity: identityOf(state.status), stale: false, selectedIds: freeze([]), browser: null, destination: null, legacyChoices: freeze([]), primaryLegacyIds: freeze([]), plan: null, batch: null, error: null, message: '' }) });
+    return true;
+  }
+  function openPublish() { return openOnboarding('publish'); }
+  async function openClone() { return openOnboarding('clone') ? loadProjects({ force: false }) : false; }
+  const availableWorkspace = workspaceId => state.status?.workspaces.find(row => row.id === workspaceId && row.available && !state.status.bindings.some(binding => binding.workspaceId === row.id));
+  function selectOnboarding(value, checked) {
+    const dialog = state.dialog;
+    if (!isOnboarding(dialog?.kind) || dialog.stage !== 'choose' || dialog.stale || !identityEqual(dialog.identity, state.status) || !ready({ discovery: true }) || typeof checked !== 'boolean') return false;
+    if (dialog.kind === 'publish' ? !availableWorkspace(value) : !state.projects.loaded || !identityEqual(state.projects.identity, state.status) || !state.projects.items.some(row => row.projectId === value) || state.status.bindings.some(row => row.projectId === value)) return false;
+    const selectedIds = dialog.selectedIds.filter(item => item !== value);
+    if (checked) selectedIds.push(value);
+    if (selectedIds.length > MAX_ONBOARDING_PROJECTS) return report('SYNC_BATCH_LIMIT', true);
+    clearExpiry(); patchDialog({ selectedIds: freeze(selectedIds), plan: null, browser: null, destination: null, legacyChoices: freeze([]), primaryLegacyIds: freeze([]), error: null, message: '' });
+    return true;
+  }
+  function validOnboarding(kind) {
+    const dialog = state.dialog;
+    if (dialog?.kind !== kind || !ready({ discovery: true }) || ['progress', 'uncertain'].includes(dialog.stage)) return false;
+    if (dialog.stale || !identityEqual(dialog.identity, state.status)) return report('SYNC_REFRESH_REQUIRED', true);
+    if (!dialog.selectedIds.length) return report('SYNC_BATCH_SELECTION_REQUIRED', true);
+    if (dialog.selectedIds.length > MAX_ONBOARDING_PROJECTS) return report('SYNC_BATCH_LIMIT', true);
+    return true;
+  }
+  async function planPublish() {
+    if (!validOnboarding('publish')) return false;
+    const dialog = state.dialog, needsStatus = state.status.capability !== 'supported';
+    const workspaces = dialog.selectedIds.map(availableWorkspace);
+    if (workspaces.some(item => !item)) return report('SYNC_PROJECT_UNAVAILABLE', true);
+    const result = await dialogRead('syncpublishplan', { workspaceIds: [...dialog.selectedIds] }, (value, identity) => {
+      check(record(value) && record(value.plan)); const source = value.plan;
+      check(id(source.id));
+      const items = rows(source.items, item => {
+        const workspace = workspaces.find(row => row.id === item.workspaceId);
+        check(workspace && id(item.projectId) && text(item.label, 1024) && safeRoot(item.root) && pathKey(item.root) === pathKey(workspace.root));
+        check(!state.status.bindings.some(row => row.projectId === item.projectId) && !state.projects.items.some(row => row.projectId === item.projectId));
+        return { workspaceId: workspace.id, projectId: item.projectId, label: item.label, root: item.root, summary: syncSummary(item.summary) };
+      }, MAX_ONBOARDING_PROJECTS);
+      check(items.length === workspaces.length && new Set(items.map(item => item.workspaceId)).size === items.length && new Set(items.map(item => pathKey(item.root))).size === items.length);
+      patchDialog({ stage: 'review', stale: false, plan: freeze({ kind: 'publish', id: source.id, expiresAt: expiry(source.expiresAt, now), identity, items, summary: batchSummary(source.summary, items) }) });
+    });
+    if (!result || !needsStatus) return result;
+    const plan = state.dialog?.plan;
+    return await refresh({ automatic: true }) && state.dialog?.plan === plan && identityEqual(plan?.identity, state.status) && state.status.capability === 'supported';
+  }
+  function acceptDestination(value, identity) {
+    check(record(value));
+    const alternatives = [value.cancelled === true, value.browser !== undefined, value.destination !== undefined].filter(Boolean).length;
+    check(alternatives === 1);
+    if (value.cancelled === true) { patchDialog({ stage: 'choose', browser: null, destination: null, plan: null, message: '已取消目录选择，尚未创建目录或工作区。' }); return; }
+    if (value.browser !== undefined) { patchDialog({ identity, browser: parseBrowser(value.browser), destination: null, plan: null, stage: 'folder', message: '' }); return; }
+    const destination = parseDestination(value.destination, state.dialog.selectedIds, now, state.status.workspaces);
+    patchDialog({ identity, browser: null, destination, plan: null, stage: 'destination', message: '' });
+  }
+  async function pickCloneParent() {
+    if (!validOnboarding('clone')) return false;
+    if (!state.projects.loaded || !identityEqual(state.projects.identity, state.status)) return report('SYNC_REFRESH_REQUIRED', true);
+    clearExpiry(); patchDialog({ browser: null, destination: null, plan: null, legacyChoices: freeze([]), primaryLegacyIds: freeze([]), message: '' });
+    return dialogRead('syncclonepick', { projectIds: [...state.dialog.selectedIds] }, acceptDestination);
+  }
+  async function browseCloneParent(nodeId) {
+    if (!validOnboarding('clone')) return false;
+    const browser = state.dialog.browser;
+    if (!browser || ![...browser.crumbs, ...browser.directories].some(item => item.id === nodeId)) return false;
+    return dialogRead('syncclonebrowse', { browserId: browser.id, nodeId }, acceptDestination);
+  }
+  async function selectCloneParent() {
+    if (!validOnboarding('clone')) return false;
+    const browser = state.dialog.browser;
+    if (!browser?.selectable) return report('SYNC_DESTINATION_UNAVAILABLE', true);
+    return dialogRead('synccloneselect', { browserId: browser.id, nodeId: browser.currentId }, (value, identity) => {
+      if (record(value?.destination)) check(safeRoot(value.destination.parent) && pathKey(value.destination.parent) === pathKey(browser.path));
+      acceptDestination(value, identity);
+    });
+  }
+  function selectCloneLegacy(projectId, checkpointId) {
+    if (!validOnboarding('clone') || state.dialog.stage !== 'legacy') return false;
+    if (!state.dialog.legacyChoices.some(row => row.projectId === projectId && row.heads.some(head => head.id === checkpointId))) return false;
+    patchDialog({ primaryLegacyIds: freeze([...state.dialog.primaryLegacyIds.filter(row => row.projectId !== projectId), freeze({ projectId, checkpointId })]), error: null }); return true;
+  }
+  async function planClone() {
+    if (!validOnboarding('clone')) return false;
+    const dialog = state.dialog, destination = dialog.destination;
+    if (!destination) return report('SYNC_DESTINATION_REQUIRED', true);
+    if (destination.expiresAt <= now()) { patchDialog({ destination: null, browser: null, plan: null, stage: 'choose' }); return report('SYNC_DESTINATION_EXPIRED', true); }
+    if (dialog.legacyChoices.some(row => !dialog.primaryLegacyIds.some(choice => choice.projectId === row.projectId))) return report('SYNC_BATCH_SELECTION_REQUIRED', true);
+    return dialogRead('synccloneplan', { destinationId: destination.id, ...(dialog.primaryLegacyIds.length ? { primaryLegacyIds: dialog.primaryLegacyIds } : {}) }, (value, identity) => {
+      check(record(value));
+      if (value.requiresLegacyChoice === true) {
+        check(!value.plan);
+        const choices = rows(value.choices, item => {
+          check(dialog.selectedIds.includes(item.projectId) && text(item.label, 1024));
+          const heads = rows(item.heads, head => { check(id(head.id) && text(head.label, 1024)); return { id: head.id, label: head.label }; }, 256);
+          check(heads.length > 1); return { projectId: item.projectId, label: item.label, heads };
+        }, MAX_ONBOARDING_PROJECTS);
+        check(choices.length > 0); patchDialog({ legacyChoices: choices, primaryLegacyIds: freeze([]), plan: null, stage: 'legacy' }); return;
+      }
+      const source = value.plan; check(record(source) && id(source.id) && safeRoot(source.parent) && pathKey(source.parent) === pathKey(destination.parent));
+      const items = rows(source.items, item => {
+        const target = destination.items.find(row => row.projectId === item.projectId);
+        check(target && text(item.label, 1024) && freshChild(source.parent, item.root) && pathKey(item.root) === pathKey(target.root) && typeof item.migrationRequired === 'boolean');
+        const summary = syncSummary(item.summary); check(summary.upload === 0 && summary.delete === 0);
+        return { projectId: target.projectId, label: item.label, root: item.root, summary, migrationRequired: item.migrationRequired };
+      }, MAX_ONBOARDING_PROJECTS);
+      check(items.length === destination.items.length);
+      patchDialog({ stage: 'review', plan: freeze({ kind: 'clone', id: source.id, identity, expiresAt: expiry(source.expiresAt, now), parent: source.parent, items, summary: batchSummary(source.summary, items) }) });
+    });
+  }
+  function openOnboardingStatus(batchId) {
+    if (disposed || !state.ready || !accountVisible() || state.busy || !state.status?.loggedIn) return false;
+    const batch = state.status.onboarding.find(item => item.id === batchId);
+    if (!batch) return false;
+    closeDialog(); emit({ dialog: freeze({ kind: batch.kind, stage: uncertainOnboarding(batch) ? 'uncertain' : 'progress', identity: identityOf(state.status), stale: false, requestId: batch.id, operationId: batch.id, batch, plan: null, error: null }) }); return true;
   }
   function editDialog(patch) {
     if (!ready() || !state.dialog || ['progress', 'uncertain'].includes(state.dialog.stage)) return false;
@@ -1057,12 +1284,16 @@ function createBidirectionalController(connection, options = {}) {
     });
   }
   async function reloadDialog() {
-    if (!state.dialog || state.busy) return false;
+    if (!state.dialog || state.busy || ['progress', 'uncertain'].includes(state.dialog.stage)) return false;
     const kind = state.dialog.kind, bindingId = state.dialog.bindingId;
     // A stale revision must first be replaced by syncstatus; retrying a catalog
     // read with the rejected old revision would strand the wizard in a loop.
     if (!await refresh() || state.dialog?.kind !== kind || state.dialog.bindingId !== bindingId) return false;
     if (kind === 'repair') { patchDialog({ identity: identityOf(state.status), stale: false, plan: null, stage: 'choose', error: null }); return true; }
+    if (isOnboarding(kind)) {
+      patchDialog({ identity: identityOf(state.status), stale: false, ...(kind === 'publish' ? { selectedIds: freeze(state.dialog.selectedIds.filter(value => availableWorkspace(value))) } : {}), browser: null, destination: null, legacyChoices: freeze([]), primaryLegacyIds: freeze([]), plan: null, stage: 'choose', error: null, message: '' });
+      return kind === 'clone' ? loadProjects({ force: true }) : true;
+    }
     return kind === 'pair' ? loadProjects() : loadItems();
   }
   function selectItem(kind, value) {
@@ -1138,7 +1369,7 @@ function createBidirectionalController(connection, options = {}) {
     const pending = freeze({ localId, action, identity, requestId: requestId ?? null, operationId: null, ...(bindingId ? { bindingId } : {}), ...(plan?.kind === 'archives' ? { archiveId: plan.archiveId } : {}), ...(enabled === undefined ? {} : { enabled }), ...(quotaBytes === undefined ? {} : { quotaBytes }), uncertain: false });
     if (plan?.kind === 'archives') attemptedImports.set(archiveKey(identity, bindingId, plan.archiveId), freeze({ state: 'uncertain', requestId }));
     emit({ busy: action, refreshing: false, error: null, pending: freeze([...state.pending, pending]) });
-    if (plan) patchDialog({ plan: null, error: null, requestId, ...(plan.kind === 'archives' ? { items: guardedArchives(state.dialog.items, identity, bindingId) } : {}) });
+    if (plan) patchDialog({ plan: null, error: null, requestId, ...(isOnboarding(plan.kind) ? { submittedItems: plan.items, parent: plan.parent, stage: 'progress' } : {}), ...(plan.kind === 'archives' ? { items: guardedArchives(state.dialog.items, identity, bindingId) } : {}) });
     let accepted = false;
     try {
       const value = await call(action, { ...identity, ...payload }, new AbortController());
@@ -1177,7 +1408,9 @@ function createBidirectionalController(connection, options = {}) {
   }
   async function confirm(kind, action, plan) {
     if (!plan || state.dialog?.kind !== kind || state.dialog.plan !== plan || !ready()) return false;
-    if (kind === 'pair' && plan.summary.blocked > 0) return report('SYNC_BLOCKED', true);
+    if ((kind === 'pair' || isOnboarding(kind)) && plan.summary.blocked > 0) return report('SYNC_BLOCKED', true);
+    if (kind === 'publish' && plan.items.some(item => { const workspace = availableWorkspace(item.workspaceId); return !workspace || pathKey(workspace.root) !== pathKey(item.root); })) return report('SYNC_ROOT_CHANGED', true);
+    if (kind === 'clone' && plan.items.some(item => state.status.workspaces.some(workspace => pathKey(workspace.root) === pathKey(item.root)))) return report('SYNC_DESTINATION_EXISTS', true);
     if (plan.bindingId) {
       const binding = state.status.bindings.find(item => item.id === plan.bindingId);
       if (!binding || pathKey(binding.root) !== pathKey(plan.root)) return report('SYNC_ROOT_CHANGED', true);
@@ -1201,7 +1434,10 @@ function createBidirectionalController(connection, options = {}) {
     try { return await write('syncrun', { bindingId, requestId: uuid(options.crypto ?? globalThis.crypto) }, { bindingId }); }
     catch (error) { return report(error); }
   }
-  function back() { if (!state.dialog || state.busy || state.uncertain || ['progress', 'uncertain'].includes(state.dialog.stage)) return false; clearExpiry(); patchDialog({ plan: null, stage: 'choose', error: null }); return true; }
+  function back() {
+    if (!state.dialog || state.busy || state.uncertain || ['progress', 'uncertain'].includes(state.dialog.stage)) return false;
+    clearExpiry(); patchDialog({ plan: null, stage: 'choose', error: null, ...(isOnboarding(state.dialog.kind) ? { browser: null, destination: null, legacyChoices: freeze([]), primaryLegacyIds: freeze([]), message: '' } : {}) }); return true;
+  }
   function closeDialog() { cancelDialogRead(); clearExpiry(); emit({ dialog: null }); queuePoll(); }
   function watch() {
     if (disposed) return () => {};
@@ -1215,6 +1451,8 @@ function createBidirectionalController(connection, options = {}) {
   }
   function dispose() { if (disposed) return; readAllowed = false; clearPoll(); clearExpiry(); cancelRefresh(); cancelDialogRead(); disposed = true; listeners.clear(); }
   return freeze({ subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener); }, getSnapshot: () => state, watch, refresh, dispose, setIdentity,
+    openPublish, openClone, selectOnboarding, planPublish, pickCloneParent, browseCloneParent, selectCloneParent, selectCloneLegacy, planClone, openOnboardingStatus,
+    confirmPublish: plan => confirm('publish', 'syncpublishcommit', plan), confirmClone: plan => confirm('clone', 'syncclonecommit', plan),
     openPair, loadProjects, selectWorkspace, selectProject, selectLegacy, planPair, confirmPair: plan => confirm('pair', 'paircommit', plan),
     setEnabled, setStorageLimit, run, openConflicts: bindingId => openItems('conflicts', bindingId), selectConflict: value => selectItem('conflicts', value), setConflictChoice,
     planResolution: () => planItem('conflicts'), confirmResolution: plan => confirm('conflicts', 'syncresolve', plan),
@@ -1224,10 +1462,10 @@ function createBidirectionalController(connection, options = {}) {
     reloadDialog, back, closeDialog });
 }
 
-return Object.freeze({BIDIRECTIONAL_ACTIONS, STORAGE_GIB, MAX_STORAGE_GIB, canRepairBinding, BidirectionalClientError, bidirectionalMessage, validateStorageLimit, parseSyncStatus, parseSyncProjects, parseSyncArchives, createBidirectionalController});
+return Object.freeze({BIDIRECTIONAL_ACTIONS, MAX_ONBOARDING_PROJECTS, STORAGE_GIB, MAX_STORAGE_GIB, canRepairBinding, BidirectionalClientError, bidirectionalMessage, validateStorageLimit, parseSyncStatus, parseSyncProjects, parseSyncArchives, createBidirectionalController});
 })();
 __clientModules["./bidirectional-panel.mjs"] = (() => {
-const { createBidirectionalController, bidirectionalMessage, canRepairBinding, STORAGE_GIB, MAX_STORAGE_GIB } = __clientModules["./bidirectional-state.mjs"];
+const { createBidirectionalController, bidirectionalMessage, canRepairBinding, STORAGE_GIB, MAX_STORAGE_GIB, MAX_ONBOARDING_PROJECTS } = __clientModules["./bidirectional-state.mjs"];
 
 /** Native DSH React/controls are injected; this module imports no React, fetch, or storage. */
 function createBidirectionalPanel(React, { Button, Input, Checkbox, Switch, Modal }) {
@@ -1297,7 +1535,8 @@ function createBidirectionalPanel(React, { Button, Input, Checkbox, Switch, Moda
     const locked = !state.ready || !identityMatches || Boolean(state.busy) || state.refreshing || state.uncertain;
     const canDiscover = !locked && loggedIn;
     const canAct = canDiscover && status.capability === 'supported';
-    const discoveryLabel = status?.capability === 'supported' ? '配对项目' : status?.capability === 'upgrade-required' ? '重新检查连接' : '连接项目';
+    const onboarding = ['clone', 'publish'].includes(dialog?.kind);
+    const selectedCount = dialog?.selectedIds?.length ?? 0;
     const storage = status?.storage, configuredGiB = storage ? storage.limitBytes / STORAGE_GIB : undefined;
     const quotaValue = quotaDraft?.value ?? (Number.isInteger(configuredGiB) && configuredGiB >= 1 && configuredGiB <= MAX_STORAGE_GIB ? String(configuredGiB) : '');
     const quotaValid = typeof quotaValue === 'string' && /^[1-9][0-9]{0,3}$/.test(quotaValue) && Number(quotaValue) <= MAX_STORAGE_GIB;
@@ -1340,14 +1579,14 @@ function createBidirectionalPanel(React, { Button, Input, Checkbox, Switch, Moda
     for (const row of state.projects.items) { const key = row.label.normalize('NFC').toLocaleLowerCase(); projectNames.set(key, (projectNames.get(key) ?? 0) + 1); }
     const duplicateProject = row => projectNames.get(row.label.normalize('NFC').toLocaleLowerCase()) > 1;
     const items = dialog?.items?.filter(row => matches(row, itemSearch)) ?? [], selected = dialog?.items?.find(row => row.id === dialog.selectedId), plan = dialog?.plan;
-    const titles = { pair: '配对同步项目', conflicts: '处理文件冲突', recycle: '本机回收站', archives: '会话归档', repair: '核对中断事务' };
-    const reviewTitles = { pair: '确认启用双向同步', conflicts: '确认处理冲突', recycle: '确认恢复文件', archives: '确认导入安全会话', repair: '确认修复中断事务' };
-    const title = dialog?.stage === 'review' ? reviewTitles[dialog.kind] : dialog?.stage === 'legacy' ? '选择云端主要版本' : ['progress', 'uncertain'].includes(dialog?.stage) ? '核对同步结果' : titles[dialog?.kind] ?? '本机回收站';
+    const titles = { publish: '同步本地项目到云端', clone: '同步云端项目到本地', conflicts: '处理文件冲突', recycle: '本机回收站', archives: '会话归档', repair: '核对中断事务' };
+    const reviewTitles = { publish: '确认启用双向同步', clone: '确认启用双向同步', conflicts: '确认处理冲突', recycle: '确认恢复文件', archives: '确认导入安全会话', repair: '确认修复中断事务' };
+    const title = dialog?.stage === 'review' ? reviewTitles[dialog.kind] : dialog?.stage === 'legacy' ? '选择云端主要版本' : dialog?.stage === 'folder' ? '选择宿主父目录' : dialog?.stage === 'destination' ? '确认新建位置' : ['progress', 'uncertain'].includes(dialog?.stage) ? '核对同步结果' : titles[dialog?.kind] ?? '本机回收站';
     const repairReady = canAct && canRepairBinding(binding) && !dialog?.stale;
     const planReady = Boolean(canAct && plan && plan.expiresAt > Date.now() && (dialog.kind !== 'archives' || plan.eligibility === 'unchecked') && (dialog.kind !== 'repair' || repairReady));
     const itemReady = Boolean(canAct && selected && !dialog?.stale && (dialog.kind !== 'archives' || selected.state === 'available'));
-    const confirmations = { pair: controller.confirmPair, conflicts: controller.confirmResolution, recycle: controller.confirmRestore, archives: controller.confirmArchiveImport, repair: controller.confirmRepair };
-    const previews = { pair: controller.planPair, conflicts: controller.planResolution, recycle: controller.planRestore, archives: controller.planArchiveImport, repair: controller.planRepair };
+    const confirmations = { publish: controller.confirmPublish, clone: controller.confirmClone, conflicts: controller.confirmResolution, recycle: controller.confirmRestore, archives: controller.confirmArchiveImport, repair: controller.confirmRepair };
+    const previews = { publish: controller.planPublish, clone: controller.planClone, conflicts: controller.planResolution, recycle: controller.planRestore, archives: controller.planArchiveImport, repair: controller.planRepair };
     const confirm = () => act(() => confirmations[dialog.kind](plan));
     const planAction = () => act(() => previews[dialog.kind]());
     const idsView = ids => {
@@ -1361,28 +1600,49 @@ function createBidirectionalPanel(React, { Button, Input, Checkbox, Switch, Moda
       body(operationLabel(item.state)),
       ['import', 'syncarchiveimport'].includes(item.kind) && h('div', { style: styles.column }, body(`已导入 ${item.importedCount ?? '未确认'} · 跳过 ${item.skippedCount ?? '未确认'} · 失败 ${item.failedCount ?? '未确认'}`), idsView(item.sessionIds)),
       item.errorCode && body(bidirectionalMessage(item.errorCode), { role: 'alert', style: { ...styles.body, ...styles.warning } }));
+    const batchView = batch => h('div', { key: batch.id, style: styles.column, 'data-onboarding-id': batch.id },
+      body(({ running: '各项目独立处理中', succeeded: '全部项目已完成', partial: '部分项目已完成', failed: '项目未完成', uncertain: '结果未确认，仅核对原请求' })[batch.state], { role: 'status', 'aria-live': 'polite' }),
+      body('每个项目独立执行；失败不会回滚已完成项目，不会自动重试。'),
+      batch.parent && root(`宿主父目录：${batch.parent}`),
+      h('div', { style: styles.list, 'aria-label': '各项目同步结果' }, ...batch.items.map(item => h('div', { key: item.id, style: styles.item, 'data-onboarding-item': item.id },
+        h('strong', null, item.label), root(item.root),
+        body(({ pending: '等待处理', running: '处理中', succeeded: '已完成', failed: '未完成', uncertain: '结果未确认' })[item.state], { role: 'status' }),
+        body(({ accepted: '宿主已接收', 'mkdir-started': '创建全新子目录', 'root-owned': '已确认新目录', 'migration-committing': '保留历史并迁移', 'migration-complete': '历史迁移已完成', downloading: '同步文件到本地', downloaded: '文件已同步到本地', registering: '注册新工作区', registered: '新工作区已注册', publishing: '创建云端项目并同步', paired: '双向同步已启用', complete: '本项目处理完成', interrupted: '处理已中断，请核对状态' })[item.phase] ?? '以宿主核对结果为准'),
+        item.errorCode && body(bidirectionalMessage(item.errorCode), { role: 'alert', style: { ...styles.body, ...styles.warning } }),
+        item.state === 'uncertain' && body('可能已创建目录或注册工作区。不要向同一位置重复提交，仅核对原请求。', { role: 'status' })))));
     const modalFooter = dialog && h('div', { style: styles.between },
       h(Button, { type: 'button', variant: 'ghost', onClick: close }, '关闭'),
       h('div', { style: styles.row },
-        dialog.stage === 'review' && h(Button, { type: 'button', variant: 'ghost', disabled: Boolean(state.busy), onClick: () => controller.back() }, '返回修改'),
-        ['choose', 'legacy'].includes(dialog.stage) && h(Button, { type: 'button', variant: 'outline', disabled: Boolean(state.busy) || state.refreshing || state.uncertain || !identity?.loggedIn, onClick: () => act(() => controller.reloadDialog()) }, dialog.kind === 'repair' ? '刷新状态' : '刷新列表'),
-        ['choose', 'legacy'].includes(dialog.stage) && h(Button, { type: 'button', variant: 'primary', disabled: dialog.kind === 'pair' ? !canAct || !dialog.workspaceId || !dialog.projectChoice || !state.projects.loaded || (dialog.legacyChoices.length > 0 && !dialog.primaryLegacyId) : dialog.kind === 'repair' ? !repairReady : !itemReady, onClick: planAction }, dialog.kind === 'archives' ? '预览导入' : '预览变更'),
-        dialog.stage === 'review' && h(Button, { type: 'button', variant: 'primary', disabled: !planReady || (dialog.kind === 'pair' && plan?.summary.blocked > 0), onClick: confirm }, ({ pair: '确认并启用', conflicts: '确认处理', recycle: '确认恢复', archives: '确认导入新会话', repair: '确认修复并继续' })[dialog.kind]),
+        (dialog.stage === 'review' || (onboarding && ['folder', 'destination', 'legacy'].includes(dialog.stage))) && h(Button, { type: 'button', variant: 'ghost', disabled: Boolean(state.busy) || state.uncertain, onClick: () => controller.back() }, '返回修改'),
+        dialog.stage === 'choose' && h(Button, { type: 'button', variant: 'outline', disabled: Boolean(state.busy) || state.refreshing || state.uncertain || !identity?.loggedIn, onClick: () => act(() => controller.reloadDialog()) }, dialog.kind === 'repair' ? '刷新状态' : '刷新列表'),
+        dialog.stage === 'choose' && dialog.kind === 'clone' && h(Button, { type: 'button', variant: 'primary', disabled: !canDiscover || dialog.stale || !selectedCount || !state.projects.loaded, onClick: () => act(() => controller.pickCloneParent()) }, '选择宿主父目录'),
+        dialog.stage === 'folder' && h(Button, { type: 'button', variant: 'primary', disabled: !canDiscover || !dialog.browser?.selectable || dialog.stale, onClick: () => act(() => controller.selectCloneParent()) }, '使用此父目录'),
+        ['destination', 'legacy'].includes(dialog.stage) && h(Button, { type: 'button', variant: 'outline', disabled: !canDiscover || dialog.stale, onClick: () => act(() => controller.pickCloneParent()) }, '重新选择父目录'),
+        ((dialog.stage === 'choose' && dialog.kind !== 'clone') || ['destination', 'legacy'].includes(dialog.stage)) && h(Button, { type: 'button', variant: 'primary', disabled: onboarding ? !canDiscover || dialog.stale || !selectedCount || (dialog.kind === 'clone' && (!dialog.destination || dialog.legacyChoices.some(row => !dialog.primaryLegacyIds.some(choice => choice.projectId === row.projectId)))) : dialog.kind === 'repair' ? !repairReady : !itemReady, onClick: planAction }, dialog.kind === 'archives' ? '预览导入' : '预览变更'),
+        dialog.stage === 'review' && h(Button, { type: 'button', variant: 'primary', disabled: !planReady || (onboarding && plan?.summary.blocked > 0), onClick: confirm }, ({ publish: '确认并启用', clone: '确认并启用', conflicts: '确认处理', recycle: '确认恢复', archives: '确认导入新会话', repair: '确认修复并继续' })[dialog.kind]),
         ['progress', 'uncertain'].includes(dialog.stage) && h(Button, { type: 'button', variant: 'outline', disabled: Boolean(state.busy) || state.refreshing, onClick: () => act(() => controller.refresh()) }, '核对状态')));
     return h('section', { style: styles.card, 'aria-labelledby': `${id}-title`, 'aria-busy': state.refreshing || Boolean(state.busy), 'data-personal-sync': 'bidirectional' },
       h('div', { style: styles.between }, h('h3', { id: `${id}-title`, style: styles.heading }, '双向同步'),
-        h('div', { style: styles.row },
-          h(Button, { type: 'button', variant: 'ghost', ref: refreshFocus, disabled: state.refreshing || Boolean(state.busy), onClick: () => act(() => controller.refresh()) }, state.refreshing ? '读取中…' : '刷新状态'),
-          h(Button, { type: 'button', variant: 'outline', disabled: !canDiscover, onClick: () => start(() => controller.openPair()) }, discoveryLabel))),
-      body('配对前先预览，确认后才启用；不会自动选择工作区。'),
+        h(Button, { type: 'button', variant: 'ghost', ref: refreshFocus, disabled: state.refreshing || Boolean(state.busy), onClick: () => act(() => controller.refresh()) }, state.refreshing ? '读取中…' : '刷新状态')),
+      body('一个双向同步：首次选择方向并预览，明确确认后持续双向同步。每批最多20个项目。'),
+      h('div', { style: styles.grid, 'aria-label': '添加双向同步项目' },
+        h('div', { style: styles.column, 'data-onboarding-entry': 'publish' },
+          h(Button, { type: 'button', variant: 'outline', disabled: !canDiscover, onClick: () => start(() => controller.openPublish()) }, '本地项目→同步到云端'),
+          body(`本地项目${identityMatches && status ? ` ${status.workspaces.length} 个` : ''} · 点击后选择；各自创建新的云端项目。`)),
+        h('div', { style: styles.column, 'data-onboarding-entry': 'clone' },
+          h(Button, { type: 'button', variant: 'outline', disabled: !canDiscover, onClick: () => start(() => controller.openClone()) }, '云端项目→同步到本地'),
+          body('点击后读取云端列表；选择一个宿主父目录，各自新建子目录与工作区。'))),
       (!identity?.loggedIn || rejectedSavedIdentity) && h('div', { style: styles.row }, body(rejectedSavedIdentity ? '同步授权已失效，请重新登录；不会自动重发凭据。' : '请先在账号卡片登录。'), h(Button, { type: 'button', variant: 'outline', onClick: requestAuthentication }, rejectedSavedIdentity ? '重新登录' : '前往登录')),
       identity?.loggedIn && status?.capability === 'upgrade-required' && body('请升级同步服务器后使用双向同步。已有云端数据会保留，不会自动启用同步。', { role: 'status', style: { ...styles.body, ...styles.warning } }),
       identity?.loggedIn && (!state.ready || !identityMatches) && body(state.refreshing ? '正在核对账号状态…' : '状态尚未确认，请刷新。', { role: 'status' }),
-      loggedIn && state.ready && status.capability === 'unknown' && body('点击“连接项目”检查服务器能力；打开页面或刷新状态不会连接云端。', { role: 'status' }),
+      loggedIn && state.ready && status.capability === 'unknown' && body('打开本地选择器不读取云端列表；只有打开云端选择器或明确预览时才连接云端。', { role: 'status' }),
       state.error && body(state.error.message, { role: 'alert', style: { ...styles.body, ...styles.warning } }),
       state.notice && body(state.notice, { role: 'status', 'aria-live': 'polite' }),
       state.pollStopped && body('自动核对已停止；可手动刷新，不会重发未确认的写入。', { role: 'status' }),
       identityMatches && status?.warning && body(bidirectionalMessage(status.warning), { role: 'status', style: styles.warning }),
+      identityMatches && status?.onboarding.length > 0 && h('details', { 'aria-label': '最近添加结果' }, h('summary', { style: styles.body }, `最近添加结果（${status.onboarding.length} 批）`),
+        ...status.onboarding.slice(-10).reverse().map(batch => h('div', { key: batch.id, style: styles.item }, body(`${batch.kind === 'clone' ? '云端→本地' : '本地→云端'} · ${batch.items.length} 个项目 · ${({ running: '处理中', succeeded: '已完成', partial: '部分完成', failed: '未完成', uncertain: '结果未确认' })[batch.state]}`),
+          h(Button, { type: 'button', variant: 'ghost', disabled: Boolean(state.busy) || !state.ready, 'aria-label': `查看 ${batch.items.length} 个项目的批次结果 ${batch.id}`, onClick: () => start(() => controller.openOnboardingStatus(batch.id)) }, '查看批次结果')))),
       identityMatches && status?.bindings.length === 0 && body('尚未配对项目'),
       identityMatches && status?.bindings.length > 20 && search(bindingSearch, setBindingSearch, '搜索已配对项目'),
       identityMatches && status?.bindings.length > 0 && visibleBindings.length === 0 && body('没有匹配的配对项目'),
@@ -1419,25 +1679,38 @@ function createBidirectionalPanel(React, { Button, Input, Checkbox, Switch, Moda
           body('仅调整本机共享软上限，不选择或上传项目、不清理内容，也不改变文件和清单的硬限制。'))),
       h(Modal, { open: Boolean(dialog), onClose: close, title, closeLabel: '关闭', footer: modalFooter, onKeyDownCapture: protectIme },
         dialog && h('div', { style: styles.column, ref: stageFocus, tabIndex: -1, ...(dialog.stage !== 'choose' ? { 'data-modal-autofocus': '' } : {}) },
-          dialog.kind === 'pair' && ['choose', 'legacy'].includes(dialog.stage) && h('div', { style: styles.column },
-            h('div', { style: styles.grid },
-              h('div', { style: styles.column }, h('h4', { style: styles.heading }, '本机工作区'), search(workspaceSearch, setWorkspaceSearch, '搜索本机工作区', true),
-                h('div', { style: styles.list, role: 'group', 'aria-label': '本机工作区列表' }, ...workspaces.slice(0, 100).map(row => h('div', { key: row.id, style: styles.item },
-                  h(Checkbox, { checked: dialog.workspaceId === row.id, label: row.label + (row.available ? '' : ' · 不可用'), disabled: !canAct || !row.available, onChange: selected => act(() => controller.selectWorkspace(selected ? row.id : '')) }), root(row.root)))),
-                !workspaces.length && body('没有匹配的工作区；请先在 DSH 中添加工作区。'), workspaces.length > 100 && body('仅显示前100项，请继续搜索。')),
-              h('div', { style: styles.column }, h('h4', { style: styles.heading }, '云端项目'), search(projectSearch, setProjectSearch, '搜索云端项目'),
-                h('div', { style: styles.projectOption, 'data-cloud-choice': 'new' },
-                  h(Checkbox, { checked: dialog.projectChoice === 'new', label: '创建新的云端项目', disabled: !canAct || !state.projects.loaded, onChange: selected => act(() => controller.selectProject(selected ? null : undefined)) }),
-                  root('新建独立项目，不覆盖已有备份。')),
-                h('div', { style: { ...styles.list, ...styles.column, gap: 8 }, role: 'group', 'aria-label': '云端项目列表' }, ...projects.slice(0, 100).map(row => h('div', { key: row.projectId, style: styles.projectOption, 'data-cloud-project-id': row.projectId },
-                  h(Checkbox, { checked: dialog.projectChoice === 'existing' && dialog.projectId === row.projectId, label: row.label, disabled: !canAct || !state.projects.loaded, onChange: selected => act(() => controller.selectProject(selected ? row.projectId : undefined)) }),
-                  row.sourceRoot && root(`来源：${row.sourceRoot}`),
-                  row.checkpointCount !== undefined && root(`已保存 ${row.checkpointCount} 个版本${row.latestCreatedAt ? ` · 最近 ${when(row.latestCreatedAt)}` : ''}`),
-                  duplicateProject(row) && h('details', null, h('summary', { style: styles.root }, '区分同名项目'), root(`项目标识：${row.projectId}`))))),
-                body('已有云端内容会保留；首次连接须预览并确认。'),
-                state.projects.loaded && !projects.length && body('暂无匹配的云端项目，可显式创建新项目。'), projects.length > 100 && body('仅显示前100项，请继续搜索。'), state.projects.partial && body('部分云端项目读取失败，请刷新核对。', { role: 'alert' }))),
-            dialog.legacyChoices.length > 0 && h('div', { style: styles.column, role: 'group', 'aria-label': '云端主要版本' }, body('这个项目保存过不同分支。请选择首次连接采用的主要版本，其余差异和历史内容仍保留，不会把缺少的文件当作删除指令。'),
-              ...dialog.legacyChoices.map(row => h('div', { key: row.id, style: styles.projectOption }, h(Checkbox, { checked: dialog.primaryLegacyId === row.id, label: row.label, disabled: !canAct, onChange: checked => { if (checked) act(() => controller.selectLegacy(row.id)); } }))))),
+          onboarding && dialog.stage === 'choose' && h('div', { style: styles.column },
+            body(`已选择 ${selectedCount} / ${MAX_ONBOARDING_PROJECTS} 个项目`, { role: 'status', 'aria-live': 'polite' }),
+            dialog.kind === 'publish' ? h('div', { style: styles.column },
+              body('每个本地项目创建新的独立云端项目；不关联已有云端项目。'), search(workspaceSearch, setWorkspaceSearch, '搜索本机工作区', true),
+              h('div', { style: styles.list, role: 'group', 'aria-label': '本机工作区列表' }, ...workspaces.slice(0, 100).map(row => {
+                const bound = status.bindings.some(binding => binding.workspaceId === row.id), checked = dialog.selectedIds.includes(row.id);
+                return h('div', { key: row.id, style: styles.item, 'data-local-workspace-id': row.id },
+                  h(Checkbox, { checked, label: row.label + (bound ? ' · 已启用双向同步' : row.available ? '' : ' · 不可用'), disabled: !canDiscover || dialog.stale || !row.available || bound || (!checked && selectedCount >= MAX_ONBOARDING_PROJECTS), onChange: selected => act(() => controller.selectOnboarding(row.id, selected)) }), root(row.root));
+              })),
+              !workspaces.length && body('没有匹配的工作区；请先在 DSH 中添加工作区。'), workspaces.length > 100 && body('仅显示前100项，请继续搜索。')) : h('div', { style: styles.column },
+              body('已有云端内容会保留；每个项目必须新建本地子目录和工作区，不关联已有工作区。'), search(projectSearch, setProjectSearch, '搜索云端项目', true),
+              h('div', { style: { ...styles.list, ...styles.column, gap: 8 }, role: 'group', 'aria-label': '云端项目列表' }, ...(state.projects.loaded ? projects : []).slice(0, 100).map(row => h('div', { key: row.projectId, style: styles.projectOption, 'data-cloud-project-id': row.projectId },
+                h(Checkbox, { checked: dialog.selectedIds.includes(row.projectId), label: row.label, disabled: !canDiscover || dialog.stale || !state.projects.loaded || status.bindings.some(binding => binding.projectId === row.projectId) || (!dialog.selectedIds.includes(row.projectId) && selectedCount >= MAX_ONBOARDING_PROJECTS), onChange: selected => act(() => controller.selectOnboarding(row.projectId, selected)) }),
+                status.bindings.some(binding => binding.projectId === row.projectId) && body('已在本机启用双向同步，请在已有配对中管理。'),
+                row.sourceRoot && root(`来源：${row.sourceRoot}`),
+                row.checkpointCount !== undefined && root(`已保存 ${row.checkpointCount} 个版本${row.latestCreatedAt ? ` · 最近 ${when(row.latestCreatedAt)}` : ''}`),
+                duplicateProject(row) && h('details', null, h('summary', { style: styles.root }, '区分同名项目'), root(`项目标识：${row.projectId}`))))),
+              state.projects.loaded && !projects.length && body('暂无匹配的云端项目。'), projects.length > 100 && body('仅显示前100项，请继续搜索。'), state.projects.partial && body('部分云端项目读取失败，请刷新核对。', { role: 'alert' }))),
+          dialog.kind === 'clone' && dialog.stage === 'folder' && dialog.browser && h('div', { style: styles.column },
+            body(`为 ${selectedCount} 个项目选择一个宿主父目录。浏览和选择均不创建目录。`), root(dialog.browser.path),
+            h('nav', { style: styles.row, 'aria-label': '宿主目录位置' }, ...dialog.browser.crumbs.map(node => h(Button, { key: node.id, type: 'button', variant: 'ghost', disabled: !canDiscover, onClick: () => act(() => controller.browseCloneParent(node.id)) }, node.label))),
+            search(itemSearch, setItemSearch, '筛选宿主子目录'),
+            h('div', { style: styles.list, 'aria-label': '宿主子目录列表' }, ...dialog.browser.directories.filter(node => matches(node, itemSearch)).slice(0, 100).map(node => h('div', { key: node.id, style: styles.item },
+              h(Button, { type: 'button', variant: 'outline', disabled: !canDiscover, 'aria-label': `进入宿主目录 ${node.label}`, onClick: () => act(() => controller.browseCloneParent(node.id)) }, node.label)))),
+            !dialog.browser.selectable && body('当前位置不可用，请进入可用目录或重新选择。', { role: 'status' }),
+            (dialog.browser.truncated || dialog.browser.directories.length > 100) && body('目录列表有数量限制；可筛选已返回目录或进入更具体的位置。')),
+          dialog.kind === 'clone' && ['destination', 'legacy'].includes(dialog.stage) && dialog.destination && h('div', { style: styles.column },
+            body('已选择宿主父目录（只读）：'), root(dialog.destination.parent), body('每个项目使用以下全新子目录；尚未创建目录或注册工作区。'),
+            h('div', { style: styles.list, 'aria-label': '计划新建目录' }, ...dialog.destination.items.map(item => h('div', { key: item.projectId, style: styles.item }, h('strong', null, item.label), root(item.root)))),
+            dialog.stage === 'legacy' && h('div', { style: styles.column, 'aria-label': '云端主要版本' }, body('以下项目存在不同分支，请逐项选择主要版本。其余差异和历史内容仍保留，不将缺少文件当作删除。'),
+              ...dialog.legacyChoices.map(project => h('div', { key: project.projectId, style: styles.column, role: 'group', 'aria-label': `${project.label} 的主要版本` }, h('strong', null, project.label),
+                ...project.heads.map(head => h(Checkbox, { key: head.id, checked: dialog.primaryLegacyIds.some(choice => choice.projectId === project.projectId && choice.checkpointId === head.id), label: head.label, disabled: !canDiscover, onChange: checked => { if (checked) act(() => controller.selectCloneLegacy(project.projectId, head.id)); } })))))),
           ['conflicts', 'recycle'].includes(dialog.kind) && dialog.stage === 'choose' && h('div', { style: styles.column },
             binding && h('div', null, body(binding.label), root(binding.root)), search(itemSearch, setItemSearch, dialog.kind === 'conflicts' ? '搜索冲突文件' : '搜索回收文件', true),
             dialog.kind === 'conflicts' && body('默认保留双方。先预览目标文件，再明确确认；不提供自动文本合并。'),
@@ -1465,11 +1738,15 @@ function createBidirectionalPanel(React, { Button, Input, Checkbox, Switch, Moda
             body('预览与关闭窗口均不写入文件，修复不会丢弃旧备份。'),
             !canRepairBinding(binding) && body('当前状态不允许修复。请刷新核对，不会自动启用同步或修复根目录/授权异常。', { role: 'alert' })),
           dialog.stage === 'review' && plan && h('div', { style: styles.column },
-            dialog.kind === 'pair' && h('div', { style: styles.column }, body(plan.label), root(plan.root),
-              body(`上传 ${plan.summary.upload} · 下载 ${plan.summary.download} · 删除 ${plan.summary.delete} · 冲突 ${plan.summary.conflicts} · 阻止 ${plan.summary.blocked}`, { 'aria-label': '配对变更摘要' }),
+            onboarding && h('div', { style: styles.column },
+              body(`${plan.items.length} 个项目 · 确认后逐项启用持续双向同步；并非整批原子操作。`),
+              dialog.kind === 'clone' ? h('div', null, body('一个宿主父目录，每个项目创建全新子目录和工作区；不关联已有工作区。'), root(plan.parent)) : body('每个本地项目创建全新云端项目，再启用持续双向同步。'),
+              h('div', { style: styles.list, 'aria-label': '各项目变更预览' }, ...plan.items.map(item => h('div', { key: item.projectId, style: styles.item }, h('strong', null, item.label), root(item.root),
+                body(`上传 ${item.summary.upload} · 下载 ${item.summary.download} · 删除 ${item.summary.delete} · 冲突 ${item.summary.conflicts} · 阻止 ${item.summary.blocked}`),
+                item.migrationRequired && body('此项目的历史内容会保留。连接后以双向状态为准，旧客户端将不能再向此项目追加备份。')))),
+              body(`合计：上传 ${plan.summary.upload} · 下载 ${plan.summary.download} · 删除 ${plan.summary.delete} · 冲突 ${plan.summary.conflicts} · 阻止 ${plan.summary.blocked}`, { 'aria-label': '批次变更摘要' }),
               plan.summary.blocked > 0 && body('存在阻止项，不能启用。请返回处理后重新预览。', { role: 'alert' }),
-              body('确认后启用此配对的自动双向同步。未跟踪文件不会被当作删除；有冲突时保留副本。'),
-              state.projects.items.find(row => row.projectId === dialog.projectId)?.legacy && body('此项目的历史内容会保留。连接后以双向状态为准，旧客户端将不能再向此项目追加备份。')),
+              body('每个项目独立报告结果；部分失败不会回滚已完成的项目。未跟踪文件不视作删除，有冲突时保留副本。')),
             dialog.kind === 'conflicts' && h('div', { style: styles.column }, root(plan.root), body(plan.summary),
               body(`选择：${({ both: '保留双方', local: '本机版本', remote: '云端版本' })[plan.choice]}`),
               h('ul', { style: { ...styles.body, ...styles.list }, 'aria-label': '冲突处理目标' }, ...plan.paths.map((name, index) => h('li', { key: index }, name)))),
@@ -1489,7 +1766,10 @@ function createBidirectionalPanel(React, { Button, Input, Checkbox, Switch, Moda
             body('预览不写入文件；只有下方明确确认才提交。')),
           ['progress', 'uncertain'].includes(dialog.stage) && h('div', { style: styles.column },
             body(dialog.stage === 'uncertain' ? '结果未确认，请核对状态；不会重发写入。' : '已提交至宿主，可关闭窗口。关闭不会取消已提交操作。', { role: 'status', 'aria-live': 'polite' }),
-            ...(status?.operations.filter(item => item.id === dialog.operationId || (dialog.bindingId && item.bindingId === dialog.bindingId)) ?? []).map(operationView)),
+            onboarding && (dialog.batch ? batchView(dialog.batch) : h('div', { style: styles.column }, body('宿主尚未返回逐项结果，仅核对原请求；不会自动生成新请求或重新提交。'),
+              h('div', { style: styles.list, 'aria-label': '等待核对的项目' }, ...(dialog.submittedItems ?? []).map(item => h('div', { key: item.projectId, style: styles.item }, h('strong', null, item.label), root(item.root), body('等待宿主确认')))))),
+            ...(!onboarding ? status?.operations.filter(item => item.id === dialog.operationId || (dialog.bindingId && item.bindingId === dialog.bindingId)) ?? [] : []).map(operationView)),
+          dialog.message && body(dialog.message, { role: 'status' }),
           dialog.stale && body('状态已变更，请刷新列表后重新预览。', { role: 'status' }),
           state.busy && body('处理中…', { role: 'status' }),
           dialog.error && body(dialog.error.message, { role: 'alert', style: { ...styles.body, ...styles.warning } }))));

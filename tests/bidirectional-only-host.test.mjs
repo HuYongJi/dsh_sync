@@ -151,7 +151,7 @@ test('Host keeps exact services, profile authority and only status/logout native
   const session = { signal: new AbortController().signal }, authorizationResult = { authorized: true };
   const authorize = t.mock.method(f.controller, 'authorize', async value => { assert.equal(value, session); return authorizationResult; });
   assert.equal(await f.flows[0].run(session), authorizationResult); assert.equal(authorize.mock.callCount(), 1);
-  assert.equal(publicActions.length, 26);
+  assert.equal(publicActions.length, 33);
   assert.deepEqual(f.routes.map(route => route.path), publicActions.map(action => settingsHttp.SETTINGS_API + action));
   assert.equal(new Set(f.routes.map(route => route.path)).size, f.routes.length);
   assert.ok(f.routes.every(route => route.path.startsWith(settingsHttp.SETTINGS_API) && !route.path.includes('*') && route.requestBody === 'streaming' && JSON.stringify(route.methods) === '["POST"]'));
@@ -216,6 +216,16 @@ test('all removed native HTTP operations are absent and return 404 before readin
   } finally { bridge.dispose(); }
 });
 
+test('catalog generation errors stay actionable through native RPC without exposing remote diagnostics', async t => {
+  const bridge = settingsHttp.createSettingsHttp({ async syncprojects() { throw Object.assign(new Error('untrusted-catalog-secret'), { code: 'SYNC_CATALOG_CHANGED', details: { token: 'untrusted-catalog-secret' } }); } });
+  t.after(() => bridge.dispose());
+  const request = new Request(`http://dsh.internal${settingsHttp.SETTINGS_API}syncprojects`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ type: 'client-request', rpcId: 'catalog-read', method: 'dsh-personal-sync/syncprojects', payload: {} }) });
+  const response = await bridge.fetch('syncprojects', request), body = await response.json();
+  assert.equal(response.status, 200); assert.equal(body.rpcId, 'catalog-read'); assert.equal(body.result.ok, false);
+  assert.equal(body.result.error.code, 'SYNC_CATALOG_CHANGED'); assert.match(body.result.error.message, /重新打开选择器/);
+  assert.equal(JSON.stringify(body).includes('untrusted-catalog-secret'), false);
+});
+
 test('every retained native HTTP operation remains an exact streaming POST RPC with correlated dispatch', async () => {
   const calls = [], routes = [];
   const service = Object.fromEntries(publicActions.map(action => [action, async (...args) => {
@@ -223,7 +233,7 @@ test('every retained native HTTP operation remains an exact streaming POST RPC w
   }]));
   const bridge = settingsHttp.createSettingsHttp(service);
   settingsHttp.registerSettingsRoutes({ connection: { fetch: { register: value => routes.push(value) } } }, bridge);
-  assert.equal(routes.length, 26);
+  assert.equal(routes.length, 33);
   try {
     for (const [index, action] of publicActions.entries()) {
       const route = routes[index], url = `http://dsh.internal${settingsHttp.SETTINGS_API}${action}`;

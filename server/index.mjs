@@ -14,16 +14,25 @@ import { readStableFile } from '../src/files.mjs';
 import { projectFolderMetadata } from '../src/client.mjs';
 import { createSyncStore } from './sync-store.mjs';
 import { createSyncHttp } from './sync-http.mjs';
+import { createLegacyProjectCatalog, createProjectCatalog } from './project-catalog.mjs';
 import { createDeviceAuth, validateDeviceAuthState } from './device-auth.mjs';
 
 const scrypt = promisify(scryptCallback);
-async function committedManifest(store, entry) {
+async function committedManifest(store, entry, metadataCache) {
   try {
     const filename = path.join(store.checkpointDir, `${sha256(Buffer.from(entry.id))}.json`);
     const { bytes } = await readStableFile(filename, MAX_MANIFEST_BYTES);
     if (sha256(bytes) !== entry.manifestSha256) throw new Error('Checkpoint integrity error');
+    // Reuse only display metadata for these exact CURRENT, hash-verified bytes.
+    // Full checkpoint reads still decode/validate; no TTL or stat-only shortcut.
+    const cached = metadataCache?.get(entry.projectId);
+    if (cached?.entry === entry) return cached.metadata;
     const manifest = validateManifest(JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)));
     if (manifest.id !== entry.id || manifest.projectId !== entry.projectId || manifest.deviceId !== entry.deviceId || manifest.parentId !== entry.parentId || manifest.createdAt !== entry.createdAt || manifest.files.length !== entry.fileCount || manifest.files.reduce((sum, file) => sum + file.size, 0) !== entry.totalBytes) throw new Error('Checkpoint index mismatch');
+    if (metadataCache) {
+      const metadata = Object.freeze({ ...projectFolderMetadata(manifest.sourceRoot), latestCheckpointId: manifest.id });
+      metadataCache.set(entry.projectId, { entry, metadata }); return metadata;
+    }
     return manifest;
   } catch { throw new Error('Checkpoint integrity error'); } // Corrupt storage is 500, not a reflected local-path validation error.
 }
@@ -291,7 +300,7 @@ function sendError(req, res, error) {
   const status = Number.isInteger(error.status) && error.status >= 400 && error.status < 600 ? error.status : 500;
   const message = status === 401 ? 'Unauthorized' : status === 404 ? 'Not found' : status >= 500 ? 'Internal server error' : error.message;
   const v2 = req.url?.startsWith('/v2/');
-  const safeCodes = new Set(['SYNC_PROJECT_CORRUPT', 'SYNC_HEAD_MISMATCH', 'SYNC_LEGACY_HEAD_MISMATCH', 'SYNC_MIGRATION_REQUIRED', 'SYNC_ALREADY_MIGRATED', 'SYNC_CLIENT_UPGRADE_REQUIRED', 'BAD_REQUEST']);
+  const safeCodes = new Set(['SYNC_PROJECT_CORRUPT', 'SYNC_HEAD_MISMATCH', 'SYNC_LEGACY_HEAD_MISMATCH', 'SYNC_MIGRATION_REQUIRED', 'SYNC_ALREADY_MIGRATED', 'SYNC_CLIENT_UPGRADE_REQUIRED', 'SYNC_CATALOG_CHANGED', 'BAD_REQUEST']);
   const code = safeCodes.has(error.code) ? error.code : status === 401 ? 'NOT_LOGGED_IN' : status === 429 ? 'RATE_LIMITED' : status === 409 ? 'SYNC_CONFLICT' : status >= 500 ? 'SERVER_UNAVAILABLE' : 'BAD_REQUEST';
   sendJson(req, res, status, { error: message, ...(v2 ? { code } : {}) });
 }
@@ -440,7 +449,12 @@ export async function createSyncServer(options = {}) {
     deviceAuth = createDeviceAuth({ store, tokenTtlMs, maxTokens, ...(options.refreshIdleMs === undefined ? {} : { refreshIdleMs: options.refreshIdleMs }), ...(options.refreshAbsoluteMs === undefined ? {} : { refreshAbsoluteMs: options.refreshAbsoluteMs }) });
     sync = await createSyncStore({ directory: path.join(store.root, 'sync-v2'), exclusive: task => store.exclusive(task), verifyBlob });
   } catch (error) { await store.release(); throw error; }
-  const syncHttp = createSyncHttp({ sync, store, readJson, sendJson, assertTokenStillValid, verifyBlob, headsFor });
+  // One latest summary per project, not per historical entry (the append index
+  // retains old entries, so a WeakMap keyed by entry would still grow by history).
+  const metadataCache = new Map();
+  const legacyCatalog = createLegacyProjectCatalog({ store, metadataFor: entry => committedManifest(store, entry, metadataCache) });
+  const projectCatalog = createProjectCatalog({ store, sync, legacy: legacyCatalog });
+  const syncHttp = createSyncHttp({ sync, store, readJson, sendJson, assertTokenStillValid, verifyBlob, headsFor, projectCatalog });
   const publicGrant = value => ({ ...value, expiresAt: new Date(value.expiresAt).toISOString(), refreshExpiresAt: new Date(value.refreshExpiresAt).toISOString(), absoluteExpiresAt: new Date(value.absoluteExpiresAt).toISOString(), serverId: store.state.serverId });
   let loginConcurrency = 0, closing = false, closingPromise;
   const active = new Set();
@@ -530,28 +544,9 @@ export async function createSyncServer(options = {}) {
     }
     if (pathname.startsWith('/v2/') && await syncHttp(req, res, url, token)) return;
     if (pathname === '/v1/projects' && req.method === 'GET') {
-      // Only the committed index is authoritative; never enumerate orphan manifests.
-      const projects = new Map(), latest = new Map();
-      const committed = store.state.checkpoints;
-      for (const entry of committed) {
-        const prior = projects.get(entry.projectId);
-        if (prior) { prior.checkpointCount++; if (Date.parse(entry.createdAt) > Date.parse(prior.latestCreatedAt)) prior.latestCreatedAt = entry.createdAt; }
-        else projects.set(entry.projectId, { projectId: entry.projectId, checkpointCount: 1, latestCreatedAt: entry.createdAt });
-        latest.set(entry.projectId, entry); // Append order is commit order; timestamps do not choose a branch.
-      }
-      let partial = false;
-      for (const [projectId, entry] of latest) {
-        try {
-          const manifest = await committedManifest(store, entry);
-          Object.assign(projects.get(projectId), projectFolderMetadata(manifest.sourceRoot), { latestCheckpointId: manifest.id });
-        } catch {
-          // An unavailable project is not permission to present an older snapshot,
-          // and must not prevent browsing unrelated, verified projects.
-          projects.delete(projectId); partial = true;
-        }
-      }
+      const page = await legacyCatalog.list();
       assertTokenStillValid(token, store.state);
-      sendJson(req, res, 200, { projects: [...projects.values()].sort((a, b) => a.projectId.localeCompare(b.projectId, 'en')), ...(partial ? { partial: true } : {}) }); return;
+      sendJson(req, res, 200, page); return;
     }
     if (pathname === '/v1/checkpoints' && req.method === 'GET') {
       const projectId = validateId(url.searchParams.get('projectId'));

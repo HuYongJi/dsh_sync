@@ -1149,6 +1149,17 @@ export function createController(ctx, initialConfig, { exportSessions = exportPr
       const handle = setImmediate(() => { scheduled.delete(handle); if (!stopped) void controller.tick().catch(() => {}); });
       scheduled.add(handle); return { scheduled: true };
     },
+    // Read-only account projection for v2 admission and the current account UI.
+    // Legacy queue/recovery inventories are not authentication evidence: do not
+    // decode them on every catalog response or account-status poll.
+    async accountStatus() {
+      await ready(); await store.init();
+      let loggedIn = false, expiresAt, identity, reauthRequired = true;
+      try { reauthRequired = await requiresReauthentication() || (await store.config())?.reauthRequired === true; } catch {}
+      try { const record = await account(); identity = record; expiresAt = record.expiresAt; loggedIn = Number.isFinite(Date.parse(expiresAt)) && Date.parse(expiresAt) > Date.now(); } catch {}
+      const authState = reauthRequired ? 'reauth-required' : loggedIn ? (identity.refreshToken ? 'renewable' : 'legacy') : 'signed-out';
+      return { server: config.server, username: config.username, loggedIn, reauthRequired, authState, ...(expiresAt ? { expiresAt } : {}), running: Boolean(updateRunning || active || batchRunning || scheduled.size || recoveryTask || downloadTask) };
+    },
     async status() {
       await ready(); await store.init(); await loadRecoveryHistory();
       const epoch = generation, pending = (await store.pending()).length;

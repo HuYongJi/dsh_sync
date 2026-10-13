@@ -10,19 +10,20 @@ import { createSessionSync } from './session-sync.mjs';
 import { createSyncEngine } from '../src/sync-engine.mjs';
 import { scanSyncProject, verifySyncRoot, syncRootIdentity, readSyncFile, createSyncApplier, DEFAULT_SYNC_QUOTA } from '../src/sync-local.mjs';
 import { canonicalJson, validateSyncManifest, validateSyncPath, validateFileState, fileStateEqual, referencedBlobs, syncManifestDigest } from '../src/sync-protocol.mjs';
-import { readExclusionPolicy } from '../src/snapshot.mjs';
+import { readExclusionPolicy, validateRestoreDestination } from '../src/snapshot.mjs';
+import { createSyncOnboarding, validateOnboarding, onboardingProjection, ONBOARDING_ACTIONS } from './sync-onboarding.mjs';
 import { measureSyncStorage, bindingBudget, reserveSyncStorage } from '../src/sync-budget.mjs';
 import { probeSyncTree, probeSessionRevisions } from '../src/sync-probe.mjs';
 import { reconcileSync, resolveSyncConflict } from '../src/reconcile.mjs';
 import { syncFailure as failure, rootKey, within, fileState, accountIdentity, accountKey, projectLabel, planLegacyMigration, uniqueSibling, syncWorkspaceIdle } from './sync-planning.mjs';
 
-export const BIDIRECTIONAL_ACTIONS = Object.freeze(['syncstatus', 'syncprojects', 'pairplan', 'paircommit', 'syncpause', 'syncrun', 'syncconflicts', 'syncresolveplan', 'syncresolve', 'syncrecycle', 'syncrestoreplan', 'syncrestore', 'syncarchives', 'syncarchiveplan', 'syncarchiveimport', 'syncrepairplan', 'syncrepair', 'syncsettings']);
+export const BIDIRECTIONAL_ACTIONS = Object.freeze(['syncstatus', 'syncprojects', 'pairplan', 'paircommit', 'syncpause', 'syncrun', 'syncconflicts', 'syncresolveplan', 'syncresolve', 'syncrecycle', 'syncrestoreplan', 'syncrestore', 'syncarchives', 'syncarchiveplan', 'syncarchiveimport', 'syncrepairplan', 'syncrepair', 'syncsettings', ...ONBOARDING_ACTIONS]);
 const MAX_BINDINGS = 200, MAX_OPERATIONS = 1000, PLAN_TTL = 15 * 60_000;
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const exact = (value, keys) => object(value) && Object.keys(value).every(key => keys.includes(key));
 const requireValue = value => { if (!value) throw failure('BAD_REQUEST'); };
 const validWorkspace = value => typeof value === 'string' && value.length > 0 && value.length <= 256 && !/[\x00-\x1f\x7f]/.test(value);
-const safeCodes = new Set(['BAD_REQUEST', 'BUSY', 'CONFIG_CONFLICT', 'ACCOUNT_BOUND', 'ACCOUNT_MISMATCH', 'NOT_LOGGED_IN', 'PROJECT_UNAVAILABLE', 'PROJECTS_UNAVAILABLE', 'PROJECT_NOT_SELECTED', 'SETTINGS_CORRUPT', 'SETTINGS_FAILED', 'DISPOSED', 'RATE_LIMITED', 'SERVER_UNAVAILABLE', 'UPDATE_RESTART_REQUIRED', 'SYNC_PLAN_EXPIRED', 'SYNC_PLAN_CHANGED', 'SYNC_MANAGED_PROJECT', 'SYNC_CLIENT_UPGRADE_REQUIRED', 'SYNC_MIGRATION_REQUIRED', 'SYNC_LEGACY_HEAD_MISMATCH', 'SYNC_HEAD_MISMATCH', 'SYNC_ROOT_CHANGED', 'SYNC_POLICY_CHANGED', 'SYNC_LOCAL_CHANGED', 'SYNC_QUOTA', 'SYNC_INTEGRITY', 'SYNC_PROJECT_CORRUPT', 'SYNC_METADATA_UNSAFE', 'SYNC_VOLUME_CHANGED', 'SYNC_NOT_IDLE', 'SYNC_BINDING_MISMATCH', 'SYNC_JOURNAL_CORRUPT', 'SYNC_STRUCTURAL_CONFLICT', 'SYNC_UNTRACKED_DELETE', 'SYNC_REMOTE_BLOB_MISSING', 'SYNC_APPLY_INCOMPLETE', 'SYNC_CONFLICT_CHANGED', 'SYNC_CANCELLED', 'SYNC_REPLAN_REQUIRED', 'SYNC_DESTINATION_UNAVAILABLE', 'SYNC_ARCHIVES_UNSUPPORTED', 'SYNC_ARCHIVES_SKIPPED', 'SYNC_IMPORT_UNCERTAIN', 'SYNC_IMPORT_SKIPPED', 'SYNC_IMPORT_UNATTACHED', 'SYNC_REPAIR_INCOMPLETE', 'SYNC_REPAIR_UNAVAILABLE', 'SYNC_REPAIR_CHANGED', 'SYNC_REPAIR_EXPIRED', 'SYNC_COMMIT_UNCERTAIN', 'SYNC_REQUEST_CONFLICT']);
+const safeCodes = new Set(['BAD_REQUEST', 'BUSY', 'CONFIG_CONFLICT', 'ACCOUNT_BOUND', 'ACCOUNT_MISMATCH', 'NOT_LOGGED_IN', 'PROJECT_UNAVAILABLE', 'PROJECTS_UNAVAILABLE', 'PROJECT_NOT_SELECTED', 'SETTINGS_CORRUPT', 'SETTINGS_FAILED', 'DISPOSED', 'RATE_LIMITED', 'SERVER_UNAVAILABLE', 'UPDATE_RESTART_REQUIRED', 'SYNC_PLAN_EXPIRED', 'SYNC_PLAN_CHANGED', 'SYNC_MANAGED_PROJECT', 'SYNC_CLIENT_UPGRADE_REQUIRED', 'SYNC_MIGRATION_REQUIRED', 'SYNC_LEGACY_HEAD_MISMATCH', 'SYNC_HEAD_MISMATCH', 'SYNC_ROOT_CHANGED', 'SYNC_POLICY_CHANGED', 'SYNC_LOCAL_CHANGED', 'SYNC_QUOTA', 'SYNC_INTEGRITY', 'SYNC_PROJECT_CORRUPT', 'SYNC_METADATA_UNSAFE', 'SYNC_VOLUME_CHANGED', 'SYNC_NOT_IDLE', 'SYNC_BINDING_MISMATCH', 'SYNC_JOURNAL_CORRUPT', 'SYNC_STRUCTURAL_CONFLICT', 'SYNC_UNTRACKED_DELETE', 'SYNC_REMOTE_BLOB_MISSING', 'SYNC_APPLY_INCOMPLETE', 'SYNC_CONFLICT_CHANGED', 'SYNC_CANCELLED', 'SYNC_REPLAN_REQUIRED', 'SYNC_DESTINATION_UNAVAILABLE', 'SYNC_ARCHIVES_UNSUPPORTED', 'SYNC_ARCHIVES_SKIPPED', 'SYNC_IMPORT_UNCERTAIN', 'SYNC_IMPORT_SKIPPED', 'SYNC_IMPORT_UNATTACHED', 'SYNC_REPAIR_INCOMPLETE', 'SYNC_REPAIR_UNAVAILABLE', 'SYNC_REPAIR_CHANGED', 'SYNC_REPAIR_EXPIRED', 'SYNC_COMMIT_UNCERTAIN', 'SYNC_REQUEST_CONFLICT', 'SYNC_CATALOG_CHANGED', 'DIRECTORY_PICKER_UNAVAILABLE', 'DIRECTORY_PICKER_FAILED', 'DIRECTORY_PICKER_EXPIRED', 'DESTINATION_CHANGED', 'BAD_DESTINATION', 'DESTINATION_EXISTS', 'PROTECTED_DESTINATION', 'PROJECT_REGISTRATION_UNCERTAIN', 'CLOUD_PROJECT_EMPTY']);
 const codeOf = error => safeCodes.has(error?.code) ? error.code : error?.httpStatus === 401 ? 'NOT_LOGGED_IN' : error?.name === 'AbortError' || error?.name === 'TimeoutError' ? 'SYNC_CANCELLED' : error?.message === 'fetch failed' ? 'SERVER_UNAVAILABLE' : 'SETTINGS_FAILED';
 const compare = (a, b) => canonicalJson(a) === canonicalJson(b);
 const nowIso = () => new Date().toISOString();
@@ -41,8 +42,9 @@ function safeSummary(value) { return Object.fromEntries(['upload', 'download', '
 /** Adds opt-in same-directory operations WITHOUT broadening legacy restore or
  * upload consent. Only this Host owns path/account/grant/plan authority.
  */
-export function withBidirectionalSync(ctx, controller, legacy, { profileDir, dshHome, isIdle = root => syncWorkspaceIdle(ctx, root), now = Date.now, random = Math.random, enableWatchers = true, planTtlMs = PLAN_TTL, sessionAdapter } = {}) {
+export function withBidirectionalSync(ctx, controller, legacy, { profileDir, dshHome, isIdle = root => syncWorkspaceIdle(ctx, root), now = Date.now, random = Math.random, enableWatchers = true, planTtlMs = PLAN_TTL, sessionAdapter, onboardingFault } = {}) {
   requireValue(typeof profileDir === 'string' && path.isAbsolute(profileDir));
+  const accountStatus = () => legacy.accountStatus ? legacy.accountStatus() : legacy.status();
   const scope = sha256(rootKey(profileDir)).slice(0, 24), directory = controller.store.directory;
   const filename = path.join(directory, `bidirectional-${scope}.json`), intentDirectory = path.join(directory, `bidirectional-intents-${scope}`);
   const protectedRoots = [...new Set([profileDir, dshHome, directory].filter(Boolean).map(value => path.resolve(value)))];
@@ -55,18 +57,19 @@ export function withBidirectionalSync(ctx, controller, legacy, { profileDir, dsh
     maxCacheBytes: Number.MAX_SAFE_INTEGER, beforeCacheWrite: ({ bytes, check, signal }) => reserveShared(bytes, { check, signal }) });
   const empty = () => ({ version: 2, revision: 0, account: null, capability: 'unknown', quotaBytes: DEFAULT_SYNC_QUOTA, bindings: [], operations: [] });
   function validateConfig(input) {
-    requireValue(exact(input, ['version', 'revision', 'account', 'capability', 'quotaBytes', 'bindings', 'operations']) && input.version === 2 && Number.isSafeInteger(input.revision) && input.revision >= 0 && ['unknown', 'supported', 'upgrade-required'].includes(input.capability));
+    requireValue(exact(input, ['version', 'revision', 'account', 'capability', 'quotaBytes', 'bindings', 'operations', 'onboarding']) && input.version === 2 && Number.isSafeInteger(input.revision) && input.revision >= 0 && ['unknown', 'supported', 'upgrade-required'].includes(input.capability));
     requireValue(Number.isSafeInteger(input.quotaBytes) && input.quotaBytes > 0 && Array.isArray(input.bindings) && input.bindings.length <= MAX_BINDINGS && Array.isArray(input.operations) && input.operations.length <= MAX_OPERATIONS);
     const account = input.account === null ? null : normalizeIdentity(input.account), ids = new Set(), workspaceIds = new Set(), projectIds = new Set();
     const bindings = input.bindings.map(item => {
-      requireValue(exact(item, ['id', 'workspaceId', 'projectId', 'label', 'root', 'rootIdentity', 'enabled', 'identity', 'enrolling', 'legacyQueueIds', 'authorizedEpochs']) && validWorkspace(item.workspaceId) && typeof item.label === 'string' && item.label.length <= 200 && typeof item.root === 'string' && path.isAbsolute(item.root) && typeof item.enabled === 'boolean' && typeof item.enrolling === 'boolean');
+      requireValue(exact(item, ['id', 'workspaceId', 'projectId', 'label', 'root', 'rootIdentity', 'enabled', 'identity', 'enrolling', 'legacyQueueIds', 'authorizedEpochs', 'genesisPending']) && validWorkspace(item.workspaceId) && typeof item.label === 'string' && item.label.length <= 200 && typeof item.root === 'string' && path.isAbsolute(item.root) && typeof item.enabled === 'boolean' && typeof item.enrolling === 'boolean');
       validateId(item.id); validateId(item.projectId);
       requireValue(!ids.has(item.id) && !workspaceIds.has(item.workspaceId) && !projectIds.has(item.projectId)); ids.add(item.id); workspaceIds.add(item.workspaceId); projectIds.add(item.projectId);
       const identity = normalizeIdentity(item.identity); requireValue(account && accountKey(identity) === accountKey(account));
       const authorizedEpochs = item.authorizedEpochs ?? [identity.authorizationEpoch];
       requireValue(Array.isArray(authorizedEpochs) && authorizedEpochs.length > 0 && authorizedEpochs.length <= 1000 && authorizedEpochs.every(epoch => Number.isSafeInteger(epoch) && epoch >= 0 && epoch <= identity.authorizationEpoch) && new Set(authorizedEpochs).size === authorizedEpochs.length && authorizedEpochs.includes(identity.authorizationEpoch));
+      requireValue(item.genesisPending === undefined || typeof item.genesisPending === 'boolean');
       const legacyQueueIds = item.legacyQueueIds ?? []; requireValue(Array.isArray(legacyQueueIds) && legacyQueueIds.length <= 100); legacyQueueIds.forEach(validateId);
-      return { id: item.id, workspaceId: item.workspaceId, projectId: item.projectId, label: projectLabel(item.label), root: path.resolve(item.root), rootIdentity: rootRecord(item.rootIdentity, item.root), enabled: item.enabled, identity, enrolling: item.enrolling, legacyQueueIds, authorizedEpochs: [...authorizedEpochs] };
+      return { id: item.id, workspaceId: item.workspaceId, projectId: item.projectId, label: projectLabel(item.label), root: path.resolve(item.root), rootIdentity: rootRecord(item.rootIdentity, item.root), enabled: item.enabled, identity, enrolling: item.enrolling, legacyQueueIds, authorizedEpochs: [...authorizedEpochs], ...(item.genesisPending === undefined ? {} : { genesisPending: item.genesisPending }) };
     });
     const requests = new Set();
     const operations = input.operations.map(item => {
@@ -77,7 +80,9 @@ export function withBidirectionalSync(ctx, controller, legacy, { profileDir, dsh
       if (item.sessionIds !== undefined) { requireValue(Array.isArray(item.sessionIds) && item.sessionIds.length <= 20_000 && new Set(item.sessionIds).size === item.sessionIds.length); item.sessionIds.forEach(validateId); }
       return { ...item, account: normalizeIdentity(item.account), ...(item.errorCode ? { errorCode: safeCodes.has(item.errorCode) ? item.errorCode : 'SETTINGS_FAILED' } : {}) };
     });
-    return { version: 2, revision: input.revision, account, capability: input.capability, quotaBytes: input.quotaBytes, bindings, operations };
+    const onboarding = validateOnboarding(input.onboarding, { normalizeIdentity, rootRecord, safeCodes });
+    requireValue(onboarding.every(batch => account && accountKey(batch.account) === accountKey(account) && !operations.some(operation => operation.id === batch.id)));
+    return { version: 2, revision: input.revision, account, capability: input.capability, quotaBytes: input.quotaBytes, bindings, operations, ...(input.onboarding ? { onboarding } : {}) };
   }
   async function load() {
     if (disposed) throw failure('DISPOSED');
@@ -92,7 +97,8 @@ export function withBidirectionalSync(ctx, controller, legacy, { profileDir, dsh
   async function usage(config, context = {}) {
     await context.check?.(); life.signal.throwIfAborted();
     const signal = context.signal ? AbortSignal.any([life.signal, context.signal]) : life.signal;
-    const value = await measureSyncStorage({ stateDir: directory, bindings: config.bindings, signal });
+    const unregistered = (config.onboarding ?? []).filter(batch => batch.kind === 'clone').flatMap(batch => batch.items).filter(item => item.rootIdentity && !config.bindings.some(binding => binding.id === item.bindingId)).map(item => ({ id: item.bindingId, root: item.root, rootIdentity: item.rootIdentity }));
+    const value = await measureSyncStorage({ stateDir: directory, bindings: [...config.bindings, ...unregistered], signal });
     await context.check?.();
     storageSnapshot = { limitBytes: config.quotaBytes, verified: value.complete, ...(value.complete ? { usedBytes: value.bytes } : {}) };
     return value;
@@ -123,18 +129,20 @@ export function withBidirectionalSync(ctx, controller, legacy, { profileDir, dsh
     if (roots.some(item => within(key, rootKey(item)))) throw failure('PROJECT_UNAVAILABLE');
     return roots.filter(item => within(rootKey(item), key)).map(item => path.relative(root, item).split(path.sep).join('/'));
   }
-  async function workspace(id) {
+  async function workspace(id, suppliedConfig) {
     requireValue(validWorkspace(id)); const item = registry().get(id);
     if (!item || typeof item.path !== 'string' || !path.isAbsolute(item.path)) throw failure('PROJECT_UNAVAILABLE');
-    const root = path.resolve(item.path); await exclusions(root); await assertNoSymlinks(root);
+    const root = path.resolve(item.path);
+    if ((suppliedConfig ?? await load()).onboarding?.some(batch => batch.kind === 'clone' && batch.items.some(value => value.state !== 'succeeded' && (within(rootKey(root), rootKey(value.root)) || within(rootKey(value.root), rootKey(root)))))) throw failure('SYNC_APPLY_INCOMPLETE');
+    await exclusions(root); await assertNoSymlinks(root);
     if (!(await fs.lstat(root)).isDirectory()) throw failure('PROJECT_UNAVAILABLE');
     return { id, root, label: projectLabel(item.title || path.basename(root)) };
   }
   async function workspaces() {
-    const rows = [], items = registry().list(); requireValue(Array.isArray(items));
+    const rows = [], items = registry().list(), config = await load(); requireValue(Array.isArray(items));
     for (const item of items.slice(0, MAX_BINDINGS)) {
       if (!validWorkspace(item.id) || typeof item.path !== 'string' || !path.isAbsolute(item.path)) continue;
-      let available = true; try { await workspace(item.id); } catch { available = false; }
+      let available = true; try { await workspace(item.id, config); } catch { available = false; }
       rows.push({ id: item.id, root: path.resolve(item.path), label: projectLabel(item.title || path.basename(item.path)), available });
     }
     return rows;
@@ -145,13 +153,13 @@ export function withBidirectionalSync(ctx, controller, legacy, { profileDir, dsh
     serverId ||= config.account?.serverId;
     if (!serverId) throw failure('SYNC_CLIENT_UPGRADE_REQUIRED');
     const value = accountIdentity(grant, serverId);
-    if (config.account && (config.bindings.length || config.operations.length) && accountKey(config.account) !== accountKey(value)) throw failure('ACCOUNT_BOUND');
+    if (config.account && (config.bindings.length || config.operations.length || config.onboarding?.length) && accountKey(config.account) !== accountKey(value)) throw failure('ACCOUNT_BOUND');
     return value;
   }
   async function payloadIdentity(input, fields, { allowSignedOut = false } = {}) {
     requireValue(exact(input, ['revision', 'server', 'username', ...fields]) && Number.isSafeInteger(input.revision) && input.revision >= 0 && typeof input.server === 'string' && typeof input.username === 'string');
     requireValue(validateServerUrl(input.server) === input.server);
-    const config = await load(), base = await legacy.status();
+    const config = await load(), base = await accountStatus();
     if (config.revision !== input.revision) throw failure('CONFIG_CONFLICT');
     if (input.server !== base.server || input.username !== base.username) throw failure('ACCOUNT_MISMATCH');
     if (!base.loggedIn && !allowSignedOut) throw failure('NOT_LOGGED_IN');
@@ -164,8 +172,9 @@ export function withBidirectionalSync(ctx, controller, legacy, { profileDir, dsh
   async function resolutionReady(binding, context = {}, quotaBytes) {
     if ((await engineFor(binding, context, { quotaBytes }).status()).phase) throw failure('SYNC_APPLY_INCOMPLETE');
   }
-  async function admitBinding(binding, { identity: expected, allowPaused = false, allowReauthorize = false, nextIdentity } = {}) {
+  async function admitBinding(binding, { identity: expected, allowPaused = false, allowReauthorize = false, allowGenesis = false, nextIdentity } = {}) {
     life.signal.throwIfAborted(); const config = await load(), saved = bindingFor(config, binding.id);
+    if (saved.genesisPending && !allowGenesis) throw failure('SYNC_COMMIT_UNCERTAIN');
     if (!allowPaused && !saved.enabled) throw failure('PROJECT_NOT_SELECTED');
     if (saved.workspaceId !== binding.workspaceId || saved.projectId !== binding.projectId || rootKey(saved.root) !== rootKey(binding.root) || !compare(saved.rootIdentity, binding.rootIdentity)) throw failure('SYNC_BINDING_MISMATCH');
     const currentWorkspace = await workspace(saved.workspaceId);
@@ -181,7 +190,7 @@ export function withBidirectionalSync(ctx, controller, legacy, { profileDir, dsh
   function engineFor(binding, context = {}, options = {}) {
     return createSyncEngine({ directory, bindingId: binding.id, projectId: binding.projectId, root: binding.root, accountIdentity: binding.identity, quotaBytes: options.quotaBytes ?? DEFAULT_SYNC_QUOTA,
       signal: context.signal ?? life.signal, isIdle: () => isIdle(binding.root), getExcludedPaths: () => exclusions(binding.root), captureArchives: options => sessionSync.captureArchives(options),
-      getClient: async () => { const config = await load(); return clientFor(await controller.syncAccount(), config, context.signal ?? life.signal); },
+      getClient: options.getClient ?? (async () => { const config = await load(); return clientFor(await controller.syncAccount(), config, context.signal ?? life.signal); }),
       check: async event => {
         if (context.bindingId && context.bindingId !== binding.id) throw failure('SYNC_BINDING_MISMATCH');
         await context.check?.();
@@ -260,6 +269,7 @@ export function withBidirectionalSync(ctx, controller, legacy, { profileDir, dsh
   }
   async function accept(config, input, descriptor, binding) {
     validateId(input.requestId);
+    if (config.onboarding?.some(batch => batch.id === input.requestId)) throw failure('SYNC_REQUEST_CONFLICT');
     const digest = sha256(canonicalJson(input)), prior = config.operations.find(item => item.id === input.requestId);
     if (prior) { if (prior.inputHash !== digest || accountKey(prior.account) !== accountKey(descriptor.account)) throw failure('SYNC_PLAN_CHANGED'); return config; }
     if (config.operations.length >= MAX_OPERATIONS) throw failure('SYNC_QUOTA');
@@ -445,11 +455,82 @@ export function withBidirectionalSync(ctx, controller, legacy, { profileDir, dsh
       } catch { /* Unsupported watching falls back to bounded periodic scans. */ }
     }
   }
+  async function onboardingRoots({ ownedItemId } = {}) {
+    const config = await load(), values = [...await allProtected(), ...registry().list().map(item => item.path), ...controller.config.projects.map(item => item.root), ...config.bindings.map(item => item.root), ...(config.onboarding ?? []).flatMap(batch => batch.items).filter(item => item.id !== ownedItemId).map(item => item.root)];
+    // Retained unselected legacy mappings still protect their old roots. These
+    // reads happen only during explicit onboarding, not on catalog/status polls.
+    if (legacy.filename && await exists(legacy.filename)) {
+      const retained = await json(legacy.filename, 1024 * 1024);
+      if (!Array.isArray(retained.bindings)) throw failure('SETTINGS_CORRUPT');
+      values.push(...retained.bindings.map(item => item.root));
+    }
+    return [...new Set(values.filter(value => typeof value === 'string' && path.isAbsolute(value)))];
+  }
+  async function admitOnboardingParent(parent) {
+    const key = rootKey(parent);
+    const sensitive = new Set(['.dsh', '.dsh-sync', '.ssh', '.aws', '.azure', '.gnupg', '.credentials', 'node_modules']);
+    if (path.basename(parent).startsWith('.') || parent.split(/[\\/]/).some(part => sensitive.has(part.toLowerCase()))) throw failure('PROTECTED_DESTINATION');
+    for (const root of await onboardingRoots()) {
+      if (within(key, rootKey(root))) throw failure('PROTECTED_DESTINATION');
+      try { if (within(key, rootKey(await fs.realpath(root)))) throw failure('PROTECTED_DESTINATION'); }
+      catch (error) { if (error.code !== 'ENOENT') throw error; }
+    }
+  }
+  const onboarding = createSyncOnboarding(ctx, { controller, load, save, payloadIdentity, identityFor, clientFor, putPlan, getPlan, planBinding, intentPath, reserveShared, workspace, policyFor, exclusions, registry, isIdle, life, now, codeOf, fault: onboardingFault,
+    scanPreview: async (root, projectId, identity, check, signal) => scanSyncProject({ root, projectId, deviceId: identity.deviceId, signal, check, excludedPaths: await exclusions(root), putBlob: async () => {} }),
+    admitParent: admitOnboardingParent,
+    admitDestination: async (root, options) => validateRestoreDestination(root, await onboardingRoots(options)),
+    async bootstrap(item, context, options) {
+      const config = await load(), quotaBytes = bindingBudget({ limit: config.quotaBytes, usage: await usage(config, context), bindingId: item.bindingId });
+      if (quotaBytes <= 0) throw failure('SYNC_QUOTA');
+      const engine = createSyncEngine({ directory, bindingId: item.bindingId, projectId: item.projectId, root: item.root, accountIdentity: item.identity, signal: context.signal, quotaBytes, isIdle: () => isIdle(item.root), getExcludedPaths: () => exclusions(item.root), check: context.check, getClient: async () => clientFor(await controller.syncAccount(), await load(), context.signal) });
+      try { return await engine.bootstrap(options); } finally { storageSnapshot = null; }
+    },
+    async publish(item, identity, context) {
+      await context.check(); const local = await workspace(item.workspaceId); await verifySyncRoot(item.rootIdentity);
+      if (rootKey(local.root) !== rootKey(item.root)) throw failure('SYNC_ROOT_CHANGED');
+      const captured = await scanSyncProject({ root: item.root, projectId: item.projectId, deviceId: identity.deviceId, signal: context.signal, check: context.check, excludedPaths: await exclusions(item.root), putBlob: async () => {} });
+      if (captured.policyHash !== item.policyHash || scanDigest(captured) !== item.localDigest) throw failure('SYNC_PLAN_CHANGED');
+      const binding = { id: item.bindingId, workspaceId: item.workspaceId, projectId: item.projectId, root: item.root, label: item.label, rootIdentity: item.rootIdentity, enabled: true, enrolling: true, genesisPending: true, identity, legacyQueueIds: [], authorizedEpochs: [identity.authorizationEpoch] };
+      await legacy.pauseLegacyWorkspace?.(item.workspaceId); await context.check();
+      let config = await load();
+      if (config.bindings.some(value => value.workspaceId === binding.workspaceId || value.projectId === binding.projectId || within(rootKey(value.root), rootKey(binding.root)) || within(rootKey(binding.root), rootKey(value.root)))) throw failure('SYNC_MANAGED_PROJECT');
+      await save({ ...config, revision: config.revision + 1, bindings: [...config.bindings, binding] });
+      const scoped = { ...context, bindingId: binding.id, check: async () => { await context.check(); await admitBinding(binding, { allowGenesis: true }); } };
+      // A publish selection authorizes a NEW cloud project, never adoption of a
+      // surprise head/legacy history at its newly allocated ID (including CAS races).
+      const client = clientFor(context.identity, config, context.signal); let ownedHead;
+      const fresh = new Proxy(client, { get(target, property) {
+        if (property === 'syncHead') return async projectId => { const head = await target.syncHead(projectId); if (head && (!ownedHead || !headMatches(head, ownedHead))) throw failure('SYNC_HEAD_MISMATCH'); return head; };
+        if (property === 'legacyHeads') return async projectId => { const value = await target.legacyHeads(projectId); if (value.heads.length || value.checkpointCount) throw failure('SYNC_MIGRATION_REQUIRED'); return value; };
+        if (property === 'commitSync') return async request => { if (request.expectedHeadId !== null || request.expectedHeadRevision !== 0) throw failure('SYNC_HEAD_MISMATCH'); return ownedHead = await target.commitSync(request); };
+        const value = target[property]; return typeof value === 'function' ? value.bind(target) : value;
+      } });
+      let result;
+      try { result = await (await budgetedEngine(binding, scoped, { getClient: async () => fresh })).run(); }
+      catch (error) { result = { state: 'blocked', errorCode: codeOf(error) }; }
+      config = await load(); const saved = bindingFor(config, binding.id);
+      const provedGenesis = ownedHead && ownedHead.revision === 1 && headMatches(result.head, ownedHead);
+      if (!result.head && ['SYNC_HEAD_MISMATCH', 'SYNC_MIGRATION_REQUIRED'].includes(result.errorCode)) config.bindings = config.bindings.filter(value => value.id !== binding.id);
+      else if (provedGenesis) { saved.genesisPending = false; saved.enrolling = false; saved.enabled = ['synced', 'conflicted', 'deferred'].includes(result.state); }
+      else {
+        // Offline/deferred/unknown first publication is NOT an ordinary pairing.
+        // Its durable genesis fence survives restart, resume and old pair APIs.
+        // Preserve the engine's receipt/proposal journal for explicit inspection;
+        // never switch an unproved create-only consent into general reconciliation.
+        saved.genesisPending = true; saved.enrolling = true; saved.enabled = false;
+        result = { ...result, state: result.state === 'uncertain' ? 'uncertain' : 'blocked', errorCode: 'SYNC_COMMIT_UNCERTAIN' };
+      }
+      await save(config); storageSnapshot = null; return result;
+    },
+  });
   const service = {
     ...legacy,
+    status: accountStatus,
+    ...onboarding.actions,
     async syncstatus(input = {}) {
       requireValue(exact(input, []));
-      const config = await load(), base = await legacy.status(); let grant;
+      const config = await load(), base = await accountStatus(); let grant;
       try { grant = await controller.syncAccount(); } catch {}
       const compatible = !config.account || config.account.server === base.server && config.account.username === base.username && (!grant || config.account.deviceId === grant.deviceId);
       const bindings = [];
@@ -465,6 +546,7 @@ export function withBidirectionalSync(ctx, controller, legacy, { profileDir, dsh
         }
         if (!authorized) state = { ...state, state: base.loggedIn ? 'paused' : 'needs-login' };
         else if (!binding.enabled) state = { ...state, state: 'paused' };
+        if (binding.genesisPending) state = { ...state, state: 'blocked', errorCode: 'SYNC_COMMIT_UNCERTAIN' };
         if (authorized && !base.running) try {
           const cached = recycleCounts.get(binding.id);
           if (cached && now() - cached.at < 300_000) recycleCount = cached.count;
@@ -484,7 +566,7 @@ export function withBidirectionalSync(ctx, controller, legacy, { profileDir, dsh
         return { id, kind, state: expiredImport ? 'failed' : state, bindingId, ...(expiredImport ? { errorCode: 'SYNC_IMPORT_UNCERTAIN' } : errorCode ? { errorCode } : {}),
           ...Object.fromEntries(['importedCount', 'skippedCount', 'failedCount', 'sessionIds'].filter(key => item[key] !== undefined).map(key => [key, item[key]])) };
       }) : [];
-      return { revision: config.revision, server: base.server, username: base.username, loggedIn: base.loggedIn, capability: compatible ? config.capability : 'unknown', running: base.running || workers.size > 0, workspaces: await workspaces(), bindings, operations, storage: compatible && storageSnapshot?.limitBytes === config.quotaBytes ? { ...storageSnapshot } : { limitBytes: config.quotaBytes, verified: false } };
+      return { revision: config.revision, server: base.server, username: base.username, loggedIn: base.loggedIn, capability: compatible ? config.capability : 'unknown', running: base.running || workers.size > 0 || onboarding.running, workspaces: await workspaces(), bindings, operations, onboarding: compatible ? onboardingProjection(config.onboarding ?? []) : [], storage: compatible && storageSnapshot?.limitBytes === config.quotaBytes ? { ...storageSnapshot } : { limitBytes: config.quotaBytes, verified: false } };
     },
     async syncsettings(input) {
       await payloadIdentity(input, ['quotaBytes']);
@@ -501,21 +583,18 @@ export function withBidirectionalSync(ctx, controller, legacy, { profileDir, dsh
     async syncprojects(input, signal) {
       await payloadIdentity(input, []);
       return controller.runSyncOperation(async context => {
-        let config = await payloadIdentity(input, []), client = clientFor(context.identity, config, context.signal);
-        if (!(await client.supportsV2())) { await context.check(); await save({ ...config, capability: 'upgrade-required' }); throw failure('SYNC_CLIENT_UPGRADE_REQUIRED'); }
-        const identity = await identityFor(context.identity, config, client); await context.check();
-        config = await load(); await save({ ...config, account: config.bindings.length || config.operations.length ? config.account : identity, capability: 'supported' });
-        const projects = [], seen = new Set(); let cursor = null, partial = false;
-        for (let pages = 0; pages < 10; pages++) {
-          const page = await client.syncProjects({ limit: 100, cursor }); await context.check();
-          for (const row of page.projects) { if (row.corrupt) { partial = true; continue; } seen.add(row.projectId); projects.push({ projectId: row.projectId, label: row.label, legacy: false }); }
-          cursor = page.nextCursor; if (!cursor) break;
+        let config = await payloadIdentity(input, []); const client = clientFor(context.identity, config, context.signal);
+        let capabilities;
+        try { capabilities = await client.capabilities(); }
+        catch (error) {
+          if (![404, 405].includes(error.httpStatus)) throw error;
+          await context.check(); await save({ ...config, capability: 'upgrade-required' }); throw failure('SYNC_CLIENT_UPGRADE_REQUIRED');
         }
-        if (cursor) partial = true;
-        const old = await client.projects(); await context.check(); partial ||= old.partial === true;
-        for (const row of old.projects) if (!seen.has(row.projectId)) projects.push({ projectId: row.projectId, label: row.label ?? row.projectId, legacy: true,
-          checkpointCount: row.checkpointCount, latestCreatedAt: row.latestCreatedAt, ...(row.sourceRoot === undefined ? {} : { sourceRoot: row.sourceRoot }) });
-        return { projects: projects.slice(0, 1000), ...(partial || projects.length > 1000 ? { partial: true } : {}) };
+        const identity = await identityFor({ ...context.identity, serverId: capabilities.serverId }, config, client); await context.check();
+        config = await load(); await save({ ...config, account: config.bindings.length || config.operations.length || config.onboarding?.length ? config.account : identity, capability: 'supported' });
+        const result = await client.discoverProjects({ capabilities, check: context.check }); await context.check();
+        return { projects: result.projects.map(row => ({ projectId: row.projectId, label: row.label, legacy: row.legacy,
+          ...(row.legacy ? { checkpointCount: row.checkpointCount, latestCreatedAt: row.latestCreatedAt, ...(row.sourceRoot === undefined ? {} : { sourceRoot: row.sourceRoot }) } : {}) })), ...(result.partial ? { partial: true } : {}) };
       }, { signal, checkBinding: () => payloadIdentity(input, []) });
     },
     async pairplan(input, signal) {
@@ -524,6 +603,7 @@ export function withBidirectionalSync(ctx, controller, legacy, { profileDir, dsh
       return controller.runSyncOperation(async context => {
         const config = await payloadIdentity(input, ['workspaceId', 'projectId', 'primaryLegacyId']), local = await workspace(input.workspaceId), projectId = input.projectId ?? `project-${randomUUID()}`;
         const existing = config.bindings.find(item => item.workspaceId === local.id || item.projectId === projectId);
+        if (existing?.genesisPending) throw failure('SYNC_COMMIT_UNCERTAIN');
         if (existing && (!existing.enrolling || existing.workspaceId !== local.id || existing.projectId !== projectId)) throw failure('SYNC_MANAGED_PROJECT');
         if (existing && config.operations.some(item => item.bindingId === existing.id && ['running', 'uncertain'].includes(item.state))) throw failure('SYNC_APPLY_INCOMPLETE');
         for (const item of config.bindings) if (item.id !== existing?.id && (within(rootKey(local.root), rootKey(item.root)) || within(rootKey(item.root), rootKey(local.root)))) throw failure('SYNC_MANAGED_PROJECT');
@@ -747,11 +827,12 @@ export function withBidirectionalSync(ctx, controller, legacy, { profileDir, dsh
     async tickBidirectional() {
       if (disposed || ticking || workers.size) return; ticking = true;
       try {
-        const config = await load(), base = await legacy.status();
+        const config = await load(), base = await accountStatus();
         if (!base.loggedIn) { refreshWatches({ ...config, bindings: [] }); return; }
-        if (base.running) return;
+        if (base.running || onboarding.running) return;
+        if (await onboarding.tick()) return;
         const grant = await controller.syncAccount();
-        const allowedBindings = config.bindings.filter(binding => binding.enabled && binding.identity.authorizationEpoch === (grant.authorizationEpoch ?? 0) && binding.identity.server === grant.server && binding.identity.username === grant.username && binding.identity.deviceId === grant.deviceId);
+        const allowedBindings = config.bindings.filter(binding => binding.enabled && !binding.genesisPending && binding.identity.authorizationEpoch === (grant.authorizationEpoch ?? 0) && binding.identity.server === grant.server && binding.identity.username === grant.username && binding.identity.deviceId === grant.deviceId);
         refreshWatches({ ...config, bindings: allowedBindings });
         for (const operation of config.operations) if (['running', 'uncertain'].includes(operation.state)) {
           const binding = config.bindings.find(item => item.id === operation.bindingId);
@@ -774,8 +855,8 @@ export function withBidirectionalSync(ctx, controller, legacy, { profileDir, dsh
         }
       } finally { ticking = false; }
     },
-    stopBidirectional() { disposed = true; life.abort(); for (const watcher of watches.values()) watcher.close(); watches.clear(); plans.clear(); },
-    async drainBidirectional() { await Promise.allSettled([...workers.values()]); },
+    stopBidirectional() { onboarding.stop(); disposed = true; life.abort(); for (const watcher of watches.values()) watcher.close(); watches.clear(); plans.clear(); },
+    async drainBidirectional() { await Promise.allSettled([...workers.values(), onboarding.drain()]); },
     // Test/diagnostic handle is a plugin-owned preference path, never a native profile path.
     bidirectionalFilename: filename,
   };
@@ -799,7 +880,7 @@ export function withBidirectionalSync(ctx, controller, legacy, { profileDir, dsh
   }
   controller.setAdditionalIdentityAdmission?.(async proposed => {
     const config = await load();
-    if (config.account && config.bindings.length && ['server', 'username', 'deviceId'].some(key => proposed[key] !== config.account[key])) throw failure('ACCOUNT_BOUND');
+    if (config.account && (config.bindings.length || config.onboarding?.length) && ['server', 'username', 'deviceId'].some(key => proposed[key] !== config.account[key])) throw failure('ACCOUNT_BOUND');
   });
   legacy.setWorkspaceSelectionGuard?.(async workspaceId => { if ((await load()).bindings.some(item => item.workspaceId === workspaceId)) throw failure('SYNC_MANAGED_PROJECT'); });
   return service;

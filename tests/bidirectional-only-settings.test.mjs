@@ -253,25 +253,26 @@ test('legacy autoSync true, selections, queue, recovery and unknown status data 
   assert.ok(actions(page).every(action => ['status', 'syncstatus'].includes(action)));
 });
 
-test('the sole project flow mounts and completes bidirectional preview/confirmation through the original panel', async t => {
+test('the sole bidirectional product publishes through a local-only picker and explicit batch confirmation', async t => {
+  const summary = { upload: 1, download: 0, delete: 0, conflicts: 0, blocked: 0 };
+  const item = { workspaceId: workspace.id, projectId: 'new-cloud', label: workspace.label, root: workspace.root, summary };
   const page = setup(t, { handle(call, env) {
-    if (call.action === 'syncprojects') return ok({ projects: [] });
-    if (call.action === 'pairplan') return ok({ plan: { id: 'pair-plan', root: workspace.root, projectId: 'new-cloud', label: workspace.label, expiresAt: new Date(Date.now() + 60000).toISOString(), summary: { upload: 1, download: 0, delete: 0, conflicts: 0, blocked: 0 } } });
-    if (call.action === 'paircommit') { env.synced = syncStatus({ operations: [{ id: call.payload.requestId, kind: 'pair', state: 'succeeded' }] }); return ok({ accepted: true, operationId: call.payload.requestId }); }
+    if (call.action === 'syncpublishplan') return ok({ plan: { id: 'publish-plan', items: [item], expiresAt: new Date(Date.now() + 60000).toISOString(), summary } });
+    if (call.action === 'syncpublishcommit') { env.synced = syncStatus({ onboarding: [{ id: call.payload.requestId, kind: 'publish', state: 'succeeded', at: new Date().toISOString(), items: [{ ...item, id: 'published-one', state: 'succeeded', phase: 'complete' }] }] }); return ok({ accepted: true, operationId: call.payload.requestId }); }
   } });
-  await page.flush(); button(page.tree(), '配对项目').props.onClick(); await page.flush();
-  let dialog = modal(page.tree(), '配对同步项目');
+  await page.flush(); button(page.tree(), '本地项目→同步到云端').props.onClick(); await page.flush();
+  let dialog = modal(page.tree(), '同步本地项目到云端');
   assert.equal(checkbox(dialog, workspace.label).props.checked, false);
-  assert.equal(checkbox(dialog, '创建新的云端项目').props.checked, false);
+  assert.equal(nodes(dialog).some(node => node.props?.['aria-label'] === '云端项目列表'), false);
   checkbox(dialog, workspace.label).props.onChange(true);
-  checkbox(modal(page.tree(), '配对同步项目'), '创建新的云端项目').props.onChange(true);
+  assert.ok(actions(page).every(action => ['status', 'syncstatus'].includes(action)));
   button(page.tree(), '预览变更').props.onClick(); await page.flush();
   dialog = modal(page.tree(), '确认启用双向同步'); assert.equal(dialog.props.open, true);
-  assert.equal(actions(page).includes('paircommit'), false);
+  assert.equal(actions(page).includes('syncpublishcommit'), false);
   const confirm = button(dialog, '确认并启用').props.onClick; confirm(); confirm(); await page.flush();
-  assert.equal(actions(page).filter(action => action === 'paircommit').length, 1);
-  assert.ok(actions(page).includes('pairplan'));
-  assert.ok(actions(page).every(action => ['status', 'syncstatus', 'syncprojects', 'pairplan', 'paircommit'].includes(action)));
+  assert.equal(actions(page).filter(action => action === 'syncpublishcommit').length, 1);
+  assert.ok(actions(page).includes('syncpublishplan'));
+  assert.ok(actions(page).every(action => ['status', 'syncstatus', 'syncpublishplan', 'syncpublishcommit'].includes(action)));
   noLegacySurface(page.tree());
 });
 

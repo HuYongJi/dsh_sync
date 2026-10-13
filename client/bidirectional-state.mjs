@@ -1,6 +1,9 @@
 // Framework-free v2 GUI state. The authenticated DSH Connection is the only carrier.
-export const BIDIRECTIONAL_ACTIONS = Object.freeze(['syncstatus', 'syncprojects', 'pairplan', 'paircommit', 'syncpause', 'syncrun', 'syncconflicts', 'syncresolveplan', 'syncresolve', 'syncrecycle', 'syncrestoreplan', 'syncrestore', 'syncarchives', 'syncarchiveplan', 'syncarchiveimport', 'syncrepairplan', 'syncrepair', 'syncsettings']);
-const WRITE_ACTIONS = new Set(['paircommit', 'syncrun', 'syncpause', 'syncresolve', 'syncrestore', 'syncarchiveimport', 'syncrepair', 'syncsettings']);
+export const BIDIRECTIONAL_ACTIONS = Object.freeze(['syncstatus', 'syncprojects', 'syncclonepick', 'syncclonebrowse', 'synccloneselect', 'synccloneplan', 'syncclonecommit', 'syncpublishplan', 'syncpublishcommit', 'pairplan', 'paircommit', 'syncpause', 'syncrun', 'syncconflicts', 'syncresolveplan', 'syncresolve', 'syncrecycle', 'syncrestoreplan', 'syncrestore', 'syncarchives', 'syncarchiveplan', 'syncarchiveimport', 'syncrepairplan', 'syncrepair', 'syncsettings']);
+const WRITE_ACTIONS = new Set(['syncclonecommit', 'syncpublishcommit', 'paircommit', 'syncrun', 'syncpause', 'syncresolve', 'syncrestore', 'syncarchiveimport', 'syncrepair', 'syncsettings']);
+export const MAX_ONBOARDING_PROJECTS = 20;
+const isOnboarding = kind => kind === 'clone' || kind === 'publish';
+const onboardingKind = action => ({ syncclonecommit: 'clone', syncpublishcommit: 'publish' })[action];
 export const STORAGE_GIB = 1024 ** 3;
 export const MAX_STORAGE_GIB = 1024;
 const REPAIR_CODES = new Set(['SYNC_LOCAL_CHANGED', 'SYNC_REPLAN_REQUIRED', 'SYNC_APPLY_INCOMPLETE', 'SYNC_REPAIR_INCOMPLETE']);
@@ -35,6 +38,14 @@ const MESSAGES = Object.freeze({
   SYNC_APPLY_INCOMPLETE: '本机应用尚未完成，请核对任务结果', SYNC_CONFLICT_CHANGED: '冲突已变化，请重新选择',
   SYNC_CANCELLED: '操作已停止，已完成内容与回收副本保留', SYNC_REPLAN_REQUIRED: '中断的事务需要核对，未自动重复写入',
   SYNC_DESTINATION_UNAVAILABLE: '无法规划安全的新副本路径',
+  SYNC_BATCH_LIMIT: '每次最多选择20个项目', SYNC_BATCH_SELECTION_REQUIRED: '请至少选择一个项目',
+  SYNC_PICKER_UNAVAILABLE: '宿主目录选择不可用，请检查宿主权限后重试', SYNC_DESTINATION_REQUIRED: '请在宿主选择父目录',
+  SYNC_DESTINATION_EXPIRED: '父目录选择已过期，请重新选择', SYNC_REGISTRATION_UNCERTAIN: '工作区注册结果未确认，仅核对状态，不要向同一目录重复提交',
+  DIRECTORY_PICKER_UNAVAILABLE: '宿主目录选择不可用，请检查宿主权限后重试', DIRECTORY_PICKER_FAILED: '宿主目录读取失败，请重新选择父目录',
+  DIRECTORY_PICKER_EXPIRED: '宿主目录选择已过期，请重新选择父目录', BAD_DESTINATION: '父目录位置不安全，请在宿主重新选择',
+  DESTINATION_CHANGED: '父目录已变化，请重新选择并预览', DESTINATION_EXISTS: '目标位置已存在，请重新选择父目录并预览',
+  CLOUD_PROJECT_EMPTY: '云端项目没有可同步的内容，请选择其他项目', PROJECT_REGISTRATION_UNCERTAIN: '工作区注册结果未确认，仅核对状态，不要向同一目录重复提交',
+  PROTECTED_DESTINATION: '此目录受保护，请在宿主选择其他父目录', SYNC_CATALOG_CHANGED: '云端列表已变化，请刷新列表后重新选择',
   SYNC_ARCHIVES_UNSUPPORTED: '此宿主仅支持文件同步，会话归档暂不可用', SYNC_ARCHIVES_SKIPPED: '部分会话归档已延后，文件同步不受影响',
   SYNC_IMPORT_UNCERTAIN: '部分会话可能已写入，请核对新会话 ID，不要重复导入', SYNC_IMPORT_SKIPPED: '部分会话不支持安全导入，已跳过',
   SYNC_IMPORT_UNATTACHED: '会话已写入但未关联项目，请核对新会话 ID，不要重复导入',
@@ -50,6 +61,7 @@ const DEFINITE = new Set(['NOT_DEPLOYED', 'AUTH_REQUIRED', 'FORBIDDEN', 'NOT_LOG
 // uncertain for writes: a mapped display code is NOT proof of no side effects.
 for (const code of ['SYNC_PLAN_CHANGED', 'SYNC_MANAGED_PROJECT', 'SYNC_CLIENT_UPGRADE_REQUIRED', 'SYNC_MIGRATION_REQUIRED', 'SYNC_ROOT_CHANGED', 'SYNC_POLICY_CHANGED', 'SYNC_LOCAL_CHANGED', 'SYNC_QUOTA', 'SYNC_METADATA_UNSAFE', 'SYNC_VOLUME_CHANGED', 'SYNC_NOT_IDLE', 'SYNC_BINDING_MISMATCH', 'SYNC_STRUCTURAL_CONFLICT', 'SYNC_CONFLICT_CHANGED', 'SYNC_DESTINATION_UNAVAILABLE', 'ACCOUNT_BOUND', 'PROJECT_UNAVAILABLE', 'PROJECTS_UNAVAILABLE', 'PROJECT_NOT_SELECTED', 'REQUEST_TOO_LARGE', 'UNSUPPORTED_MEDIA_TYPE']) DEFINITE.add(code);
 DEFINITE.add('SYNC_ARCHIVES_UNSUPPORTED');
+for (const code of ['DIRECTORY_PICKER_UNAVAILABLE', 'DIRECTORY_PICKER_FAILED', 'DIRECTORY_PICKER_EXPIRED', 'BAD_DESTINATION', 'DESTINATION_CHANGED', 'DESTINATION_EXISTS', 'CLOUD_PROJECT_EMPTY', 'PROTECTED_DESTINATION', 'SYNC_CATALOG_CHANGED']) DEFINITE.add(code);
 const BINDING_STATES = ['idle', 'scanning', 'offline', 'uploading', 'applying', 'deferred', 'conflicted', 'blocked', 'uncertain', 'synced', 'paused', 'needs-login'];
 const OP_STATES = ['running', 'succeeded', 'failed', 'uncertain'];
 const OP_KINDS = ['pair', 'run', 'sync', 'resolve', 'restore', 'import', 'repair', 'paircommit', 'syncrun', 'syncresolve', 'syncrestore', 'syncarchiveimport', 'syncrepair'];
@@ -68,7 +80,12 @@ const relative = value => text(value, 1024) && !/[\\:]/.test(value) && value.spl
 const accountEqual = (a, b) => Boolean(a && b && a.server === b.server && a.username === b.username);
 const identityEqual = (a, b) => accountEqual(a, b) && a.revision === b.revision;
 const identityOf = value => freeze({ revision: value.revision, server: value.server, username: value.username });
-const hostUncertain = status => Boolean(status?.operations.some(item => item.state === 'uncertain') || status?.bindings.some(item => item.state === 'uncertain'));
+// A terminal onboarding result consumes the original intent even if an individual
+// registration remains unknown. Preserve that readonly result, not a global lock
+// on unrelated healthy projects. Missing receipts and active ambiguity still lock.
+const terminalOnboarding = batch => ['succeeded', 'partial', 'failed', 'uncertain'].includes(batch.state) && batch.items.every(item => ['succeeded', 'failed', 'uncertain'].includes(item.state));
+const uncertainOnboarding = batch => batch.state === 'uncertain' || batch.items.some(item => item.state === 'uncertain');
+const hostUncertain = status => Boolean(status?.operations.some(item => item.state === 'uncertain') || status?.bindings.some(item => item.state === 'uncertain') || status?.onboarding.some(batch => !terminalOnboarding(batch) && uncertainOnboarding(batch)));
 const operationKinds = { paircommit: ['pair', 'paircommit'], syncrun: ['run', 'sync', 'syncrun'], syncresolve: ['resolve', 'syncresolve'], syncrestore: ['restore', 'syncrestore'], syncarchiveimport: ['import', 'syncarchiveimport'], syncrepair: ['repair', 'syncrepair'] };
 const errorCode = value => typeof value === 'string' && Object.hasOwn(MESSAGES, value) ? value : 'SYNC_FAILED';
 export class BidirectionalClientError extends Error {
@@ -112,6 +129,69 @@ function importResult(value) {
   return result;
 }
 
+const BATCH_STATES = ['running', 'succeeded', 'partial', 'failed', 'uncertain'];
+const ITEM_STATES = ['pending', 'running', 'succeeded', 'failed', 'uncertain'];
+const BATCH_PHASES = ['pending', 'accepted', 'mkdir-started', 'root-owned', 'migration-committing', 'migration-complete', 'downloading', 'downloaded', 'registering', 'registered', 'publishing', 'paired', 'complete', 'interrupted'];
+function safeRoot(value) {
+  if (!absolute(value)) return false;
+  const normalized = value.replaceAll('\\', '/'), windows = /^[A-Za-z]:|^\\\\/.test(value);
+  if (windows && (/[<>"|?*]/u.test(value) || normalized.slice(/^[A-Za-z]:/.test(value) ? 2 : 0).includes(':'))) return false;
+  return !windows || normalized.split('/').every(part => !part || !/[. ]$/.test(part));
+}
+function freshChild(parent, root) {
+  if (!safeRoot(parent) || !safeRoot(root)) return false;
+  const prefix = `${pathKey(parent)}/`, target = pathKey(root);
+  return target.startsWith(prefix) && target.length > prefix.length && !target.slice(prefix.length).includes('/');
+}
+function expiry(value, now) {
+  const result = typeof value === 'number' ? value : typeof value === 'string' ? Date.parse(value) : NaN;
+  check(Number.isSafeInteger(result) && result > 0);
+  if (result <= now()) fail('SYNC_PLAN_EXPIRED');
+  return result;
+}
+function syncSummary(value) {
+  check(record(value)); const result = {};
+  for (const key of ['upload', 'download', 'delete', 'conflicts', 'blocked']) { check(integer(value[key])); result[key] = value[key]; }
+  return freeze(result);
+}
+function batchSummary(value, items) {
+  const result = syncSummary(value);
+  for (const key of Object.keys(result)) check(result[key] === items.reduce((sum, item) => sum + item.summary[key], 0));
+  return result;
+}
+function parseOnboarding(value) {
+  return rows(value, batch => {
+    check(id(batch.id) && isOnboarding(batch.kind) && BATCH_STATES.includes(batch.state) && date(batch.at));
+    check(batch.parent === undefined || (batch.kind === 'clone' && safeRoot(batch.parent)));
+    const items = rows(batch.items, item => {
+      check(id(item.id) && text(item.label, 1024) && safeRoot(item.root) && ITEM_STATES.includes(item.state) && typeof item.phase === 'string' && /^[a-z0-9][a-z0-9-]{0,63}$/.test(item.phase));
+      check(item.projectId === undefined || id(item.projectId)); check(item.workspaceId === undefined || opaque(item.workspaceId)); check(item.bindingId === undefined || id(item.bindingId));
+      if (batch.parent !== undefined) check(freshChild(batch.parent, item.root));
+      return { id: item.id, label: item.label, root: item.root, state: item.state, phase: BATCH_PHASES.includes(item.phase) ? item.phase : 'unknown',
+        ...(item.projectId === undefined ? {} : { projectId: item.projectId }), ...(item.workspaceId === undefined ? {} : { workspaceId: item.workspaceId }), ...(item.bindingId === undefined ? {} : { bindingId: item.bindingId }), ...optionalError(item.errorCode) };
+    }, MAX_ONBOARDING_PROJECTS);
+    check(items.length > 0 && new Set(items.map(item => pathKey(item.root))).size === items.length);
+    if (batch.state === 'succeeded') check(items.every(item => item.state === 'succeeded'));
+    if (['succeeded', 'partial', 'failed'].includes(batch.state)) check(!items.some(item => ['pending', 'running'].includes(item.state)));
+    return { id: batch.id, kind: batch.kind, state: batch.state, at: batch.at, ...(batch.parent === undefined ? {} : { parent: batch.parent }), items };
+  }, 100);
+}
+function parseBrowser(value) {
+  check(record(value) && id(value.id) && safeRoot(value.path) && id(value.currentId) && typeof value.selectable === 'boolean' && typeof value.truncated === 'boolean');
+  const parseNode = item => { check(id(item.id) && text(item.label, 1024)); return { id: item.id, label: item.label }; };
+  return freeze({ id: value.id, path: value.path, currentId: value.currentId, crumbs: rows(value.crumbs, parseNode, 256), directories: rows(value.directories, parseNode, 2000), selectable: value.selectable, truncated: value.truncated });
+}
+function parseDestination(value, projectIds, now, workspaces) {
+  check(record(value) && id(value.id) && safeRoot(value.parent));
+  const items = rows(value.items, item => {
+    check(id(item.projectId) && projectIds.includes(item.projectId) && text(item.label, 1024) && freshChild(value.parent, item.root));
+    check(!workspaces.some(workspace => pathKey(workspace.root) === pathKey(item.root)));
+    return { projectId: item.projectId, label: item.label, root: item.root };
+  }, MAX_ONBOARDING_PROJECTS);
+  check(items.length === projectIds.length && items.length > 0 && new Set(items.map(item => pathKey(item.root))).size === items.length);
+  return freeze({ id: value.id, parent: value.parent, expiresAt: expiry(value.expiresAt, now), items });
+}
+
 /** Deep allowlist: credentials, arbitrary exception bodies and unknown DTO fields never survive. */
 export function parseSyncStatus(value) {
   check(record(value) && integer(value.revision) && typeof value.loggedIn === 'boolean');
@@ -132,7 +212,7 @@ export function parseSyncStatus(value) {
     check(id(item.id) && OP_STATES.includes(item.state) && (item.bindingId === undefined || id(item.bindingId)) && (item.requestId === undefined || id(item.requestId)));
     return { id: item.id, kind: OP_KINDS.includes(item.kind) ? item.kind : 'unknown', state: item.state, ...(item.bindingId === undefined ? {} : { bindingId: item.bindingId }), ...(item.requestId === undefined ? {} : { requestId: item.requestId }), ...importResult(item), ...optionalError(item.errorCode) };
   });
-  return freeze({ revision: value.revision, server, username, loggedIn: value.loggedIn, capability, running: value.running === true, workspaces, bindings, operations, ...(value.storage === undefined ? {} : { storage: parseStorage(value.storage) }), ...(value.warning === undefined ? {} : { warning: errorCode(value.warning) }) });
+  return freeze({ revision: value.revision, server, username, loggedIn: value.loggedIn, capability, running: value.running === true, workspaces, bindings, operations, onboarding: parseOnboarding(value.onboarding ?? []), ...(value.storage === undefined ? {} : { storage: parseStorage(value.storage) }), ...(value.warning === undefined ? {} : { warning: errorCode(value.warning) }) });
 }
 export function parseSyncProjects(value) {
   check(record(value) && (value.partial === undefined || typeof value.partial === 'boolean'));
@@ -187,12 +267,16 @@ function uuid(crypto) {
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value ?? '')) fail('BAD_REQUEST_ID');
   return value;
 }
-const emptyProjects = () => freeze({ items: freeze([]), loaded: false, partial: false, identity: null });
+const emptyProjects = () => freeze({ items: freeze([]), loaded: false, partial: false, identity: null, loadedAt: 0 });
 
 /**
  * Controller lifecycle: subscribe/getSnapshot, watch()->stop, refresh, dispose,
  * setIdentity({server,username,loggedIn}) (never a legacy revision).
- * Pair: openPair/loadProjects/selectWorkspace(id)/selectProject(id|null)/
+ * Onboarding: openPublish (local only) / openClone (explicit cached discovery),
+ * selectOnboarding(id,checked), planPublish or pickCloneParent/browseCloneParent/
+ * selectCloneParent/selectCloneLegacy/planClone, then confirmPublish/confirmClone.
+ * Exact plans authorize independent batches, never all-or-nothing rollback.
+ * Pair (internal compatibility only): openPair/loadProjects/selectWorkspace(id)/selectProject(id|null)/
  * selectLegacy(id)/planPair/confirmPair(exactPlan). null explicitly creates cloud;
  * undefined clears cloud selection, '' clears workspace. No automatic selection.
  * Daily: setEnabled(bindingId,boolean), run(bindingId).
@@ -213,6 +297,7 @@ export function createBidirectionalController(connection, options = {}) {
   const setTimer = options.setTimeout ?? globalThis.setTimeout.bind(globalThis), clearTimer = options.clearTimeout ?? globalThis.clearTimeout.bind(globalThis);
   const now = options.now ?? Date.now, activePollMs = Math.max(1000, options.activePollMs ?? 3000), idlePollMs = Math.max(10000, options.idlePollMs ?? 10000), timeoutMs = Math.max(1000, options.timeoutMs ?? 60000);
   const maxPollErrors = Math.max(1, options.maxPollErrors ?? 3), maxUncertainChecks = Math.max(1, options.maxUncertainChecks ?? 10);
+  const projectCacheMs = Math.min(30000, Math.max(0, options.projectCacheMs ?? 30000));
   let state = freeze({ status: null, ready: false, refreshing: false, busy: null, error: null, notice: '', projects: emptyProjects(), dialog: null, pending: freeze([]), uncertain: false, pollStopped: false });
   let external = null, disposed = false, watchers = 0, readAllowed = true, pollTimer, expiryTimer, refreshAbort, dialogAbort, refreshGeneration = 0, dialogGeneration = 0, failures = 0, uncertainChecks = 0, pauseSequence = 0;
   const listeners = new Set(), attemptedImports = new Map();
@@ -249,7 +334,7 @@ export function createBidirectionalController(connection, options = {}) {
     const stopped = failures >= maxPollErrors || ((state.pending.length > 0 || state.uncertain) && uncertainChecks >= maxUncertainChecks);
     if (state.pollStopped !== stopped) emit({ pollStopped: stopped });
     if (disposed || !watchers || !readAllowed || state.busy || state.refreshing || stopped) return;
-    const active = state.pending.length > 0 || state.status?.running || state.status?.operations.some(item => ['running', 'uncertain'].includes(item.state)) || state.status?.bindings.some(item => ['scanning', 'uploading', 'applying'].includes(item.state));
+    const active = state.pending.length > 0 || state.uncertain || state.status?.running || state.status?.onboarding.some(item => item.state === 'running') || state.status?.operations.some(item => ['running', 'uncertain'].includes(item.state)) || state.status?.bindings.some(item => ['scanning', 'uploading', 'applying'].includes(item.state));
     const enabled = state.status?.bindings.some(item => item.enabled);
     if (!active && (!enabled || !state.status?.loggedIn || !accountVisible())) return;
     pollTimer = setTimer(() => { pollTimer = undefined; void refresh({ automatic: true }); }, active ? activePollMs : idlePollMs); pollTimer?.unref?.();
@@ -273,7 +358,7 @@ export function createBidirectionalController(connection, options = {}) {
   }
   function invalidateAuthority(stale = true) {
     cancelDialogRead(); clearExpiry();
-    if (state.dialog) patchDialog({ plan: null, identity: null, stale, stage: ['progress', 'uncertain'].includes(state.dialog.stage) ? state.dialog.stage : 'choose' });
+    if (state.dialog) patchDialog({ plan: null, identity: null, stale, ...(isOnboarding(state.dialog.kind) ? { selectedIds: freeze([]), browser: null, destination: null, legacyChoices: freeze([]), primaryLegacyIds: freeze([]) } : {}), stage: ['progress', 'uncertain'].includes(state.dialog.stage) ? state.dialog.stage : 'choose' });
     emit({ projects: freeze({ ...state.projects, loaded: false, identity: null }) });
   }
   function acceptStatus(status) {
@@ -293,6 +378,20 @@ export function createBidirectionalController(connection, options = {}) {
         if (status.revision > item.identity.revision && status.storage?.limitBytes === item.quotaBytes) { notice = '存储上限已保存；不会自动删除内容'; continue; }
         pending.push(item); continue;
       }
+      const batchKind = onboardingKind(item.action);
+      if (batchKind) {
+        // Batch IDs are the original client request IDs, including after a lost ACK.
+        // Never correlate by project/path or invent a replacement request.
+        const batch = status.onboarding.find(row => row.id === item.requestId && row.kind === batchKind);
+        if (!batch) { pending.push(uncertainChecks >= maxUncertainChecks ? freeze({ ...item, uncertain: true }) : item); continue; }
+        if (state.dialog?.requestId === item.requestId && state.dialog.kind === batchKind) patchDialog({ operationId: batch.id, batch });
+        if (terminalOnboarding(batch)) {
+          notice = uncertainOnboarding(batch) ? '部分项目结果仍未确认，不会重复提交；其他项目可独立操作' : batch.state === 'succeeded' ? '各项目已独立完成，已启用双向同步' : batch.state === 'partial' ? '部分项目完成；失败项目未回滚已完成项目，请逐项核对' : '项目未完成，请逐项核对；不会自动重试';
+          continue;
+        }
+        pending.push(freeze({ ...item, operationId: batch.id, uncertain: uncertainOnboarding(batch) }));
+        continue;
+      }
       const operation = status.operations.find(op => (op.id === item.requestId || op.requestId === item.requestId) && operationKinds[item.action]?.includes(op.kind) && (!item.bindingId || !op.bindingId || op.bindingId === item.bindingId));
       if (!operation) { pending.push(uncertainChecks >= maxUncertainChecks ? freeze({ ...item, uncertain: true }) : item); continue; }
       if (state.dialog?.requestId === item.requestId) patchDialog({ operationId: operation.id });
@@ -304,16 +403,20 @@ export function createBidirectionalController(connection, options = {}) {
       pending.push(freeze({ ...item, operationId: operation.id, uncertain: operation.state === 'uncertain' }));
     }
     const uncertain = pending.some(item => item.uncertain) || hostUncertain(status);
-    const observedPending = pending.length > 0 && pending.every(item => item.operationId && status.operations.some(op => op.id === item.operationId && op.state === 'running'));
+    const observedPending = pending.length > 0 && pending.every(item => item.operationId && (onboardingKind(item.action) ? status.onboarding.some(batch => batch.id === item.requestId && batch.kind === onboardingKind(item.action) && batch.state === 'running') : status.operations.some(op => op.id === item.operationId && op.state === 'running')));
     if (!uncertain && (!pending.length || observedPending)) uncertainChecks = 0;
     const error = uncertain ? publicError(new BidirectionalClientError('SYNC_UNCERTAIN')) : state.error?.code === 'SYNC_UNCERTAIN' ? null : state.error;
     emit({ status, ready: !external || (accountEqual(external, status) && external.loggedIn === status.loggedIn), pending: freeze(pending), uncertain, notice, error });
+    if (isOnboarding(state.dialog?.kind) && state.dialog.requestId) {
+      const batch = status.onboarding.find(item => item.id === state.dialog.requestId && item.kind === state.dialog.kind);
+      if (batch) patchDialog({ batch, identity: identityOf(status), stale: false, error: null, stage: uncertainOnboarding(batch) ? 'uncertain' : 'progress' });
+    }
     if (state.dialog?.kind === 'archives') {
       const items = guardedArchives(state.dialog.items, identityOf(status), state.dialog.bindingId);
       patchDialog({ items, ...(state.dialog.stage === 'choose' && !items.some(item => item.id === state.dialog.selectedId && item.state === 'available') ? { selectedId: '' } : {}) });
     }
     if (state.dialog?.kind === 'repair' && state.dialog.plan && !canRepairBinding(status.bindings.find(item => item.id === state.dialog.bindingId))) { clearExpiry(); patchDialog({ plan: null, stage: 'choose', stale: true }); }
-    if (state.dialog?.stage === 'uncertain' && !uncertain) patchDialog({ stage: 'progress', error: null });
+    if (state.dialog?.stage === 'uncertain' && !uncertain && !(isOnboarding(state.dialog.kind) && state.dialog.batch && uncertainOnboarding(state.dialog.batch))) patchDialog({ stage: 'progress', error: null });
   }
   async function refresh({ automatic = false } = {}) {
     if (disposed || (automatic && !readAllowed) || WRITE_ACTIONS.has(state.busy)) return false;
@@ -346,30 +449,38 @@ export function createBidirectionalController(connection, options = {}) {
     } catch { external = freeze({ server: '', username: '', loggedIn: false }); cancelRefresh(); invalidateAuthority(); emit({ ready: false, dialog: null, error: publicError(new BidirectionalClientError('ACCOUNT_MISMATCH')) }); return false; }
   }
   async function dialogRead(action, payload, accept) {
-    if (!ready({ discovery: action === 'syncprojects' }) || !state.dialog) return false;
+    if (!ready({ discovery: action === 'syncprojects' || ['syncpublishplan', 'syncclonepick', 'syncclonebrowse', 'synccloneselect', 'synccloneplan'].includes(action) }) || !state.dialog) return false;
     clearPoll(); cancelDialogRead(); const generation = dialogGeneration, abort = new AbortController(), bound = identityOf(state.status), dialog = state.dialog;
     dialogAbort = abort; emit({ busy: action }); patchDialog({ error: null });
     try {
       const value = await call(action, { ...bound, ...payload }, abort);
       if (disposed || generation !== dialogGeneration || !state.dialog || state.dialog.kind !== dialog.kind || !identityEqual(bound, state.status) || !accountVisible()) return false;
       accept(value, bound); return true;
-    } catch (error) { if (!disposed && generation === dialogGeneration) patchDialog({ plan: null, stage: 'choose', error: publicError(error) }); return false; }
+    } catch (error) {
+      if (!disposed && generation === dialogGeneration) {
+        const stage = dialog.kind === 'clone' && state.dialog?.browser && ['syncclonebrowse', 'synccloneselect'].includes(action) ? 'folder' : dialog.kind === 'clone' && state.dialog?.destination && action === 'synccloneplan' ? (state.dialog.legacyChoices.length ? 'legacy' : 'destination') : 'choose';
+        patchDialog({ plan: null, stage, error: publicError(error) });
+      }
+      return false;
+    }
     finally { if (!disposed && generation === dialogGeneration) { dialogAbort = undefined; emit({ busy: null }); expirePlan(); queuePoll(); } }
   }
-  async function loadProjects() {
+  async function loadProjects({ force = true } = {}) {
+    const kind = state.dialog?.kind;
+    if (!['pair', 'clone'].includes(kind) || (kind === 'clone' && ['progress', 'uncertain'].includes(state.dialog.stage)) || !ready({ discovery: true })) return false;
+    if (kind === 'clone' && !force && state.projects.loaded && identityEqual(state.projects.identity, state.status) && now() - state.projects.loadedAt < projectCacheMs) return true;
+    const needsStatus = kind === 'pair' || state.status.capability !== 'supported';
     const pending = dialogRead('syncprojects', {}, (value, identity) => {
-      const parsed = parseSyncProjects(value); emit({ projects: freeze({ items: parsed.projects, loaded: true, partial: parsed.partial, identity }) });
-      patchDialog({ identity, stale: false, ...(state.dialog.projectId && !parsed.projects.some(item => item.projectId === state.dialog.projectId) ? { projectChoice: '', projectId: null } : {}) });
+      const parsed = parseSyncProjects(value); emit({ projects: freeze({ items: parsed.projects, loaded: true, partial: parsed.partial, identity, loadedAt: now() }) });
+      patchDialog({ identity, stale: false, plan: null, ...(kind === 'clone' ? { selectedIds: freeze(state.dialog.selectedIds.filter(projectId => parsed.projects.some(item => item.projectId === projectId) && !state.status.bindings.some(item => item.projectId === projectId))), browser: null, destination: null, legacyChoices: freeze([]), primaryLegacyIds: freeze([]), stage: 'choose' } : {}), ...(state.dialog.projectId && !parsed.projects.some(item => item.projectId === state.dialog.projectId) ? { projectChoice: '', projectId: null } : {}) });
     });
     const generation = dialogGeneration, loaded = await pending;
-    if (disposed || !readAllowed || generation !== dialogGeneration || state.dialog?.kind !== 'pair') return false;
-    // syncstatus is deliberately local-only. Only this explicit cloud catalog
-    // probe discovers/upgrades capability; then read its freshly persisted result.
+    if (disposed || !readAllowed || generation !== dialogGeneration || state.dialog?.kind !== kind) return false;
+    // Catalog discovery is explicit. Known capability avoids a redundant status read;
+    // first discovery must reconcile Host's newly persisted capability, not guess it.
     const unsupported = ['SYNC_CLIENT_UPGRADE_REQUIRED', 'SYNC_UPGRADE_REQUIRED', 'SYNC_UNSUPPORTED'].includes(state.dialog.error?.code);
-    if (loaded || unsupported) {
-      const refreshed = await refresh({ automatic: true });
-      if (!refreshed || !state.dialog || state.dialog.kind !== 'pair') return false;
-      // A probe bound to an older revision cannot authorize selections/plans.
+    if ((loaded && needsStatus) || unsupported) {
+      if (!await refresh({ automatic: true }) || state.dialog?.kind !== kind) return false;
       if (!state.projects.loaded || !identityEqual(state.projects.identity, state.status)) return false;
     }
     return loaded;
@@ -378,6 +489,122 @@ export function createBidirectionalController(connection, options = {}) {
     if (!ready({ discovery: true })) return false;
     closeDialog(); emit({ dialog: freeze({ kind: 'pair', stage: 'choose', identity: identityOf(state.status), stale: false, workspaceId: '', projectChoice: '', projectId: null, primaryLegacyId: null, legacyChoices: freeze([]), plan: null, error: null }) });
     return loadProjects();
+  }
+  function openOnboarding(kind) {
+    if (!ready({ discovery: true })) return false;
+    closeDialog(); emit({ dialog: freeze({ kind, stage: 'choose', identity: identityOf(state.status), stale: false, selectedIds: freeze([]), browser: null, destination: null, legacyChoices: freeze([]), primaryLegacyIds: freeze([]), plan: null, batch: null, error: null, message: '' }) });
+    return true;
+  }
+  function openPublish() { return openOnboarding('publish'); }
+  async function openClone() { return openOnboarding('clone') ? loadProjects({ force: false }) : false; }
+  const availableWorkspace = workspaceId => state.status?.workspaces.find(row => row.id === workspaceId && row.available && !state.status.bindings.some(binding => binding.workspaceId === row.id));
+  function selectOnboarding(value, checked) {
+    const dialog = state.dialog;
+    if (!isOnboarding(dialog?.kind) || dialog.stage !== 'choose' || dialog.stale || !identityEqual(dialog.identity, state.status) || !ready({ discovery: true }) || typeof checked !== 'boolean') return false;
+    if (dialog.kind === 'publish' ? !availableWorkspace(value) : !state.projects.loaded || !identityEqual(state.projects.identity, state.status) || !state.projects.items.some(row => row.projectId === value) || state.status.bindings.some(row => row.projectId === value)) return false;
+    const selectedIds = dialog.selectedIds.filter(item => item !== value);
+    if (checked) selectedIds.push(value);
+    if (selectedIds.length > MAX_ONBOARDING_PROJECTS) return report('SYNC_BATCH_LIMIT', true);
+    clearExpiry(); patchDialog({ selectedIds: freeze(selectedIds), plan: null, browser: null, destination: null, legacyChoices: freeze([]), primaryLegacyIds: freeze([]), error: null, message: '' });
+    return true;
+  }
+  function validOnboarding(kind) {
+    const dialog = state.dialog;
+    if (dialog?.kind !== kind || !ready({ discovery: true }) || ['progress', 'uncertain'].includes(dialog.stage)) return false;
+    if (dialog.stale || !identityEqual(dialog.identity, state.status)) return report('SYNC_REFRESH_REQUIRED', true);
+    if (!dialog.selectedIds.length) return report('SYNC_BATCH_SELECTION_REQUIRED', true);
+    if (dialog.selectedIds.length > MAX_ONBOARDING_PROJECTS) return report('SYNC_BATCH_LIMIT', true);
+    return true;
+  }
+  async function planPublish() {
+    if (!validOnboarding('publish')) return false;
+    const dialog = state.dialog, needsStatus = state.status.capability !== 'supported';
+    const workspaces = dialog.selectedIds.map(availableWorkspace);
+    if (workspaces.some(item => !item)) return report('SYNC_PROJECT_UNAVAILABLE', true);
+    const result = await dialogRead('syncpublishplan', { workspaceIds: [...dialog.selectedIds] }, (value, identity) => {
+      check(record(value) && record(value.plan)); const source = value.plan;
+      check(id(source.id));
+      const items = rows(source.items, item => {
+        const workspace = workspaces.find(row => row.id === item.workspaceId);
+        check(workspace && id(item.projectId) && text(item.label, 1024) && safeRoot(item.root) && pathKey(item.root) === pathKey(workspace.root));
+        check(!state.status.bindings.some(row => row.projectId === item.projectId) && !state.projects.items.some(row => row.projectId === item.projectId));
+        return { workspaceId: workspace.id, projectId: item.projectId, label: item.label, root: item.root, summary: syncSummary(item.summary) };
+      }, MAX_ONBOARDING_PROJECTS);
+      check(items.length === workspaces.length && new Set(items.map(item => item.workspaceId)).size === items.length && new Set(items.map(item => pathKey(item.root))).size === items.length);
+      patchDialog({ stage: 'review', stale: false, plan: freeze({ kind: 'publish', id: source.id, expiresAt: expiry(source.expiresAt, now), identity, items, summary: batchSummary(source.summary, items) }) });
+    });
+    if (!result || !needsStatus) return result;
+    const plan = state.dialog?.plan;
+    return await refresh({ automatic: true }) && state.dialog?.plan === plan && identityEqual(plan?.identity, state.status) && state.status.capability === 'supported';
+  }
+  function acceptDestination(value, identity) {
+    check(record(value));
+    const alternatives = [value.cancelled === true, value.browser !== undefined, value.destination !== undefined].filter(Boolean).length;
+    check(alternatives === 1);
+    if (value.cancelled === true) { patchDialog({ stage: 'choose', browser: null, destination: null, plan: null, message: '已取消目录选择，尚未创建目录或工作区。' }); return; }
+    if (value.browser !== undefined) { patchDialog({ identity, browser: parseBrowser(value.browser), destination: null, plan: null, stage: 'folder', message: '' }); return; }
+    const destination = parseDestination(value.destination, state.dialog.selectedIds, now, state.status.workspaces);
+    patchDialog({ identity, browser: null, destination, plan: null, stage: 'destination', message: '' });
+  }
+  async function pickCloneParent() {
+    if (!validOnboarding('clone')) return false;
+    if (!state.projects.loaded || !identityEqual(state.projects.identity, state.status)) return report('SYNC_REFRESH_REQUIRED', true);
+    clearExpiry(); patchDialog({ browser: null, destination: null, plan: null, legacyChoices: freeze([]), primaryLegacyIds: freeze([]), message: '' });
+    return dialogRead('syncclonepick', { projectIds: [...state.dialog.selectedIds] }, acceptDestination);
+  }
+  async function browseCloneParent(nodeId) {
+    if (!validOnboarding('clone')) return false;
+    const browser = state.dialog.browser;
+    if (!browser || ![...browser.crumbs, ...browser.directories].some(item => item.id === nodeId)) return false;
+    return dialogRead('syncclonebrowse', { browserId: browser.id, nodeId }, acceptDestination);
+  }
+  async function selectCloneParent() {
+    if (!validOnboarding('clone')) return false;
+    const browser = state.dialog.browser;
+    if (!browser?.selectable) return report('SYNC_DESTINATION_UNAVAILABLE', true);
+    return dialogRead('synccloneselect', { browserId: browser.id, nodeId: browser.currentId }, (value, identity) => {
+      if (record(value?.destination)) check(safeRoot(value.destination.parent) && pathKey(value.destination.parent) === pathKey(browser.path));
+      acceptDestination(value, identity);
+    });
+  }
+  function selectCloneLegacy(projectId, checkpointId) {
+    if (!validOnboarding('clone') || state.dialog.stage !== 'legacy') return false;
+    if (!state.dialog.legacyChoices.some(row => row.projectId === projectId && row.heads.some(head => head.id === checkpointId))) return false;
+    patchDialog({ primaryLegacyIds: freeze([...state.dialog.primaryLegacyIds.filter(row => row.projectId !== projectId), freeze({ projectId, checkpointId })]), error: null }); return true;
+  }
+  async function planClone() {
+    if (!validOnboarding('clone')) return false;
+    const dialog = state.dialog, destination = dialog.destination;
+    if (!destination) return report('SYNC_DESTINATION_REQUIRED', true);
+    if (destination.expiresAt <= now()) { patchDialog({ destination: null, browser: null, plan: null, stage: 'choose' }); return report('SYNC_DESTINATION_EXPIRED', true); }
+    if (dialog.legacyChoices.some(row => !dialog.primaryLegacyIds.some(choice => choice.projectId === row.projectId))) return report('SYNC_BATCH_SELECTION_REQUIRED', true);
+    return dialogRead('synccloneplan', { destinationId: destination.id, ...(dialog.primaryLegacyIds.length ? { primaryLegacyIds: dialog.primaryLegacyIds } : {}) }, (value, identity) => {
+      check(record(value));
+      if (value.requiresLegacyChoice === true) {
+        check(!value.plan);
+        const choices = rows(value.choices, item => {
+          check(dialog.selectedIds.includes(item.projectId) && text(item.label, 1024));
+          const heads = rows(item.heads, head => { check(id(head.id) && text(head.label, 1024)); return { id: head.id, label: head.label }; }, 256);
+          check(heads.length > 1); return { projectId: item.projectId, label: item.label, heads };
+        }, MAX_ONBOARDING_PROJECTS);
+        check(choices.length > 0); patchDialog({ legacyChoices: choices, primaryLegacyIds: freeze([]), plan: null, stage: 'legacy' }); return;
+      }
+      const source = value.plan; check(record(source) && id(source.id) && safeRoot(source.parent) && pathKey(source.parent) === pathKey(destination.parent));
+      const items = rows(source.items, item => {
+        const target = destination.items.find(row => row.projectId === item.projectId);
+        check(target && text(item.label, 1024) && freshChild(source.parent, item.root) && pathKey(item.root) === pathKey(target.root) && typeof item.migrationRequired === 'boolean');
+        const summary = syncSummary(item.summary); check(summary.upload === 0 && summary.delete === 0);
+        return { projectId: target.projectId, label: item.label, root: item.root, summary, migrationRequired: item.migrationRequired };
+      }, MAX_ONBOARDING_PROJECTS);
+      check(items.length === destination.items.length);
+      patchDialog({ stage: 'review', plan: freeze({ kind: 'clone', id: source.id, identity, expiresAt: expiry(source.expiresAt, now), parent: source.parent, items, summary: batchSummary(source.summary, items) }) });
+    });
+  }
+  function openOnboardingStatus(batchId) {
+    if (disposed || !state.ready || !accountVisible() || state.busy || !state.status?.loggedIn) return false;
+    const batch = state.status.onboarding.find(item => item.id === batchId);
+    if (!batch) return false;
+    closeDialog(); emit({ dialog: freeze({ kind: batch.kind, stage: uncertainOnboarding(batch) ? 'uncertain' : 'progress', identity: identityOf(state.status), stale: false, requestId: batch.id, operationId: batch.id, batch, plan: null, error: null }) }); return true;
   }
   function editDialog(patch) {
     if (!ready() || !state.dialog || ['progress', 'uncertain'].includes(state.dialog.stage)) return false;
@@ -431,12 +658,16 @@ export function createBidirectionalController(connection, options = {}) {
     });
   }
   async function reloadDialog() {
-    if (!state.dialog || state.busy) return false;
+    if (!state.dialog || state.busy || ['progress', 'uncertain'].includes(state.dialog.stage)) return false;
     const kind = state.dialog.kind, bindingId = state.dialog.bindingId;
     // A stale revision must first be replaced by syncstatus; retrying a catalog
     // read with the rejected old revision would strand the wizard in a loop.
     if (!await refresh() || state.dialog?.kind !== kind || state.dialog.bindingId !== bindingId) return false;
     if (kind === 'repair') { patchDialog({ identity: identityOf(state.status), stale: false, plan: null, stage: 'choose', error: null }); return true; }
+    if (isOnboarding(kind)) {
+      patchDialog({ identity: identityOf(state.status), stale: false, ...(kind === 'publish' ? { selectedIds: freeze(state.dialog.selectedIds.filter(value => availableWorkspace(value))) } : {}), browser: null, destination: null, legacyChoices: freeze([]), primaryLegacyIds: freeze([]), plan: null, stage: 'choose', error: null, message: '' });
+      return kind === 'clone' ? loadProjects({ force: true }) : true;
+    }
     return kind === 'pair' ? loadProjects() : loadItems();
   }
   function selectItem(kind, value) {
@@ -512,7 +743,7 @@ export function createBidirectionalController(connection, options = {}) {
     const pending = freeze({ localId, action, identity, requestId: requestId ?? null, operationId: null, ...(bindingId ? { bindingId } : {}), ...(plan?.kind === 'archives' ? { archiveId: plan.archiveId } : {}), ...(enabled === undefined ? {} : { enabled }), ...(quotaBytes === undefined ? {} : { quotaBytes }), uncertain: false });
     if (plan?.kind === 'archives') attemptedImports.set(archiveKey(identity, bindingId, plan.archiveId), freeze({ state: 'uncertain', requestId }));
     emit({ busy: action, refreshing: false, error: null, pending: freeze([...state.pending, pending]) });
-    if (plan) patchDialog({ plan: null, error: null, requestId, ...(plan.kind === 'archives' ? { items: guardedArchives(state.dialog.items, identity, bindingId) } : {}) });
+    if (plan) patchDialog({ plan: null, error: null, requestId, ...(isOnboarding(plan.kind) ? { submittedItems: plan.items, parent: plan.parent, stage: 'progress' } : {}), ...(plan.kind === 'archives' ? { items: guardedArchives(state.dialog.items, identity, bindingId) } : {}) });
     let accepted = false;
     try {
       const value = await call(action, { ...identity, ...payload }, new AbortController());
@@ -551,7 +782,9 @@ export function createBidirectionalController(connection, options = {}) {
   }
   async function confirm(kind, action, plan) {
     if (!plan || state.dialog?.kind !== kind || state.dialog.plan !== plan || !ready()) return false;
-    if (kind === 'pair' && plan.summary.blocked > 0) return report('SYNC_BLOCKED', true);
+    if ((kind === 'pair' || isOnboarding(kind)) && plan.summary.blocked > 0) return report('SYNC_BLOCKED', true);
+    if (kind === 'publish' && plan.items.some(item => { const workspace = availableWorkspace(item.workspaceId); return !workspace || pathKey(workspace.root) !== pathKey(item.root); })) return report('SYNC_ROOT_CHANGED', true);
+    if (kind === 'clone' && plan.items.some(item => state.status.workspaces.some(workspace => pathKey(workspace.root) === pathKey(item.root)))) return report('SYNC_DESTINATION_EXISTS', true);
     if (plan.bindingId) {
       const binding = state.status.bindings.find(item => item.id === plan.bindingId);
       if (!binding || pathKey(binding.root) !== pathKey(plan.root)) return report('SYNC_ROOT_CHANGED', true);
@@ -575,7 +808,10 @@ export function createBidirectionalController(connection, options = {}) {
     try { return await write('syncrun', { bindingId, requestId: uuid(options.crypto ?? globalThis.crypto) }, { bindingId }); }
     catch (error) { return report(error); }
   }
-  function back() { if (!state.dialog || state.busy || state.uncertain || ['progress', 'uncertain'].includes(state.dialog.stage)) return false; clearExpiry(); patchDialog({ plan: null, stage: 'choose', error: null }); return true; }
+  function back() {
+    if (!state.dialog || state.busy || state.uncertain || ['progress', 'uncertain'].includes(state.dialog.stage)) return false;
+    clearExpiry(); patchDialog({ plan: null, stage: 'choose', error: null, ...(isOnboarding(state.dialog.kind) ? { browser: null, destination: null, legacyChoices: freeze([]), primaryLegacyIds: freeze([]), message: '' } : {}) }); return true;
+  }
   function closeDialog() { cancelDialogRead(); clearExpiry(); emit({ dialog: null }); queuePoll(); }
   function watch() {
     if (disposed) return () => {};
@@ -589,6 +825,8 @@ export function createBidirectionalController(connection, options = {}) {
   }
   function dispose() { if (disposed) return; readAllowed = false; clearPoll(); clearExpiry(); cancelRefresh(); cancelDialogRead(); disposed = true; listeners.clear(); }
   return freeze({ subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener); }, getSnapshot: () => state, watch, refresh, dispose, setIdentity,
+    openPublish, openClone, selectOnboarding, planPublish, pickCloneParent, browseCloneParent, selectCloneParent, selectCloneLegacy, planClone, openOnboardingStatus,
+    confirmPublish: plan => confirm('publish', 'syncpublishcommit', plan), confirmClone: plan => confirm('clone', 'syncclonecommit', plan),
     openPair, loadProjects, selectWorkspace, selectProject, selectLegacy, planPair, confirmPair: plan => confirm('pair', 'paircommit', plan),
     setEnabled, setStorageLimit, run, openConflicts: bindingId => openItems('conflicts', bindingId), selectConflict: value => selectItem('conflicts', value), setConflictChoice,
     planResolution: () => planItem('conflicts'), confirmResolution: plan => confirm('conflicts', 'syncresolve', plan),

@@ -17,7 +17,7 @@ function routeId(raw) { try { return validateId(decodeURIComponent(raw)); } catc
 /** Exact authenticated v2 routes. Uses the SAME writer lock as legacy commits and
  * revocation. This adapter never relaxes restoration or accepts local paths.
  */
-export function createSyncHttp({ sync, store, readJson, sendJson, assertTokenStillValid, verifyBlob, headsFor }) {
+export function createSyncHttp({ sync, store, readJson, sendJson, assertTokenStillValid, verifyBlob, headsFor, projectCatalog }) {
   const checked = token => assertTokenStillValid(token, store.state);
   const legacyHeads = id => headsFor(store.state, id);
   async function send(req, res, token, value, status = 200) { checked(token); sendJson(req, res, status, value); return true; }
@@ -25,20 +25,16 @@ export function createSyncHttp({ sync, store, readJson, sendJson, assertTokenSti
     const pathname = url.pathname;
     if (pathname === '/v2/capabilities' && req.method === 'GET') {
       queryFields(url, []);
-      return send(req, res, token, { protocol: 2, serverId: store.state.serverId, maxPageSize: MAX_SYNC_PAGE_SIZE, maxBlobBytes: MAX_BLOB_BYTES, bidirectional: true, recoverableDeletes: true });
+      return send(req, res, token, { protocol: 2, serverId: store.state.serverId, maxPageSize: MAX_SYNC_PAGE_SIZE, maxBlobBytes: MAX_BLOB_BYTES, bidirectional: true, recoverableDeletes: true, projectCatalog: true });
+    }
+    if (pathname === '/v2/project-catalog' && req.method === 'GET') {
+      queryFields(url, ['limit', 'cursor']);
+      return send(req, res, token, await projectCatalog.page({ limit: integer(url.searchParams, 'limit', 100), cursor: url.searchParams.get('cursor') }));
     }
     if (pathname === '/v2/projects' && req.method === 'GET') {
       queryFields(url, ['limit', 'cursor']);
-      const page = await sync.list({ limit: integer(url.searchParams, 'limit', 100), cursor: url.searchParams.get('cursor') });
-      const projects = [];
-      for (const row of page.projects) {
-        if (row.corrupt) { projects.push(row); continue; }
-        try {
-          const manifest = await sync.getCheckpoint(row.projectId, row.id);
-          projects.push({ ...row, label: manifest.label ?? row.projectId, conflicts: manifest.conflicts.length, fileCount: manifest.files.length });
-        } catch { projects.push({ projectId: row.projectId, corrupt: true }); }
-      }
-      return send(req, res, token, { projects, nextCursor: page.nextCursor });
+      const page = await sync.list({ limit: integer(url.searchParams, 'limit', 100), cursor: url.searchParams.get('cursor'), summaries: true });
+      return send(req, res, token, page);
     }
     if (pathname === '/v2/blobs/missing' && req.method === 'POST') {
       queryFields(url, []);

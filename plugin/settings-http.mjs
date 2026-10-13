@@ -33,6 +33,7 @@ const messages = Object.freeze({
   SYNC_QUOTA: '同步存储达到安全上限，请检查回收副本和队列',
   SYNC_INTEGRITY: '内容校验失败，未覆盖本机文件',
   SYNC_PROJECT_CORRUPT: '云端项目校验失败，请检查服务器存储',
+  SYNC_CATALOG_CHANGED: '云端项目列表在加载期间变化，请重新打开选择器',
   SYNC_METADATA_UNSAFE: '同步元数据路径不安全，已停止写入',
   SYNC_VOLUME_CHANGED: '项目包含不同磁盘的挂载点，已停止写入',
   SYNC_NOT_IDLE: '项目任务正在运行，等待空闲后应用更新',

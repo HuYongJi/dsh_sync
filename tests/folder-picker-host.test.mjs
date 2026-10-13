@@ -174,7 +174,7 @@ test('internal picker caps fail and expire safely while legacy picker RPCs remai
   const child = path.join(f.parent, 'child'); await fs.mkdir(child); f.setCapability({ kind: 'browse', list: async () => listing(f.parent, [child]) });
   await assert.rejects(f.choose(), { code: 'DIRECTORY_PICKER_FAILED' });
   const routes = []; registerSettingsRoutes({ connection: { fetch: { register: value => routes.push(value) } } }, f.bridge);
-  assert.equal(routes.length, 26); assert.ok(routes.every(route => route.methods.length === 1 && route.methods[0] === 'POST' && route.requestBody === 'streaming'));
+  assert.equal(routes.length, 33); assert.ok(routes.every(route => route.methods.length === 1 && route.methods[0] === 'POST' && route.requestBody === 'streaming'));
   for (const action of ['destinationpick', 'destinationbrowse', 'destinationselect']) {
     assert.equal(routes.some(route => route.path === SETTINGS_API + action), false);
     assert.equal((await f.bridge.fetch(action, new Request(`http://dsh.internal${SETTINGS_API}${action}`))).status, 404);

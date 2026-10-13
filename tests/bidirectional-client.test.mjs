@@ -28,14 +28,30 @@ function clock() {
   return { jobs, now: () => current, advance(ms) { current += ms; }, setTimeout(fn, ms) { jobs.set(++next, { fn, ms }); return next; }, clearTimeout(key) { jobs.delete(key); }, run(ms) { const entry = [...jobs].find(([, job]) => job.ms === ms); assert.ok(entry, `missing timer ${ms}`); jobs.delete(entry[0]); entry[1].fn(); } };
 }
 function fixture(t, custom, options = {}) {
-  const calls = [], time = clock(); let current = status(), sequence = 0, planSequence = 0;
-  const makePlan = (root, fields) => ({ plan: { id: `plan-${++planSequence}`, expiresAt: new Date(time.now() + 60000).toISOString(), root, ...fields } });
+  const calls = [], time = clock(), plans = new Map(); let current = status(), sequence = 0, planSequence = 0, destination;
+  const makePlan = (root, fields) => { const plan = { id: `plan-${++planSequence}`, expiresAt: new Date(time.now() + 60000).toISOString(), root, ...fields }; plans.set(plan.id, plan); return { plan }; };
+  const aggregate = items => Object.fromEntries(['upload', 'download', 'delete', 'conflicts', 'blocked'].map(key => [key, items.reduce((sum, item) => sum + item.summary[key], 0)]));
   const env = { get current() { return current; }, set current(value) { current = value; }, time, makePlan };
   function base(call) {
     const body = call.payload;
     if (call.action === 'syncstatus') return ok(current);
     if (call.action === 'syncprojects') return ok({ projects: catalog });
     if (call.action === 'pairplan') return ok(makePlan(workspaces.find(row => row.id === body.workspaceId).root, { projectId: body.projectId ?? 'cloud-new', label: '预览项目', summary: { upload: 2, download: 3, delete: 1, conflicts: 1, blocked: 0 } }));
+    if (call.action === 'syncpublishplan') {
+      current = { ...current, capability: 'supported' };
+      const items = body.workspaceIds.map((workspaceId, index) => ({ workspaceId, projectId: `fresh-${index}`, label: workspaces.find(row => row.id === workspaceId).label, root: workspaces.find(row => row.id === workspaceId).root, summary: { upload: 2, download: 0, delete: 0, conflicts: 0, blocked: 0 } }));
+      return ok(makePlan(undefined, { items, summary: aggregate(items) }));
+    }
+    if (call.action === 'syncclonepick') {
+      destination = { id: 'destination-one', parent: 'E:\\synthetic-new', expiresAt: time.now() + 60000, items: body.projectIds.map(projectId => ({ projectId, label: projectId, root: `E:\\synthetic-new\\${projectId}` })) };
+      return ok({ destination });
+    }
+    if (call.action === 'synccloneplan') { const items = destination.items.map(item => ({ ...item, migrationRequired: true, summary: { upload: 0, download: 3, delete: 0, conflicts: 1, blocked: 0 } })); return ok(makePlan(undefined, { parent: destination.parent, items, summary: aggregate(items) })); }
+    if (['syncclonecommit', 'syncpublishcommit'].includes(call.action)) {
+      const plan = plans.get(body.planId), kind = call.action === 'syncclonecommit' ? 'clone' : 'publish';
+      current = { ...current, onboarding: [{ id: body.requestId, kind, state: 'running', at: new Date(time.now()).toISOString(), ...(plan.parent ? { parent: plan.parent } : {}), items: plan.items.map((item, index) => ({ ...item, id: `item-${index}`, state: 'pending', phase: 'pending' })) }] };
+      return ok({ accepted: true, operationId: body.requestId });
+    }
     if (call.action === 'syncconflicts') return ok({ conflicts });
     if (call.action === 'syncrecycle') return ok({ items: recycled });
     if (call.action === 'syncarchives') return ok({ archives: archiveRows, counts: { total: 3, imported: 1, uncertain: 1 } });
@@ -547,8 +563,8 @@ function page(t, custom, account = identity) {
   t.after(() => react.unmount()); return { ...f, ...react, props, tree: () => react.render(Component, props), get authCalls() { return authCalls; } };
 }
 async function mount(p) { p.tree(); p.mount(); await settle(); p.tree(); p.mount(); await settle(); }
-async function openPair(p) { await mount(p); button(p.tree(), '配对项目').props.onClick(); await settle(); }
-async function selectPair(p) { await openPair(p); checkbox(modal(p), '待配对项目').props.onChange(true); checkbox(modal(p), '创建新的云端项目').props.onChange(true); button(modal(p), '预览变更').props.onClick(); await settle(); }
+async function openClone(p) { await mount(p); button(p.tree(), '云端项目→同步到本地').props.onClick(); await settle(); }
+async function selectPublish(p) { await mount(p); button(p.tree(), '本地项目→同步到云端').props.onClick(); checkbox(modal(p), '待配对项目').props.onChange(true); button(modal(p), '预览变更').props.onClick(); await settle(); }
 
 test('cloud project metadata remains optional, readonly, validated and deeply allowlisted', async t => {
   const row = { ...catalog[1], sourceRoot: 'E:\\synthetic\\archived', checkpointCount: 3, latestCreatedAt: '2026-01-02T03:04:05.000Z' };
@@ -568,7 +584,7 @@ test('cloud choices use separate full-width rows with neutral labels, source hin
     { projectId: 'cloud-source-b', label: 'source', legacy: true, sourceRoot: 'E:\\synthetic\\original-b\\source', checkpointCount: 4 },
     { projectId: 'cloud-current', label: '当前项目', legacy: false },
   ];
-  const p = page(t, (call, base) => call.action === 'syncprojects' ? ok({ projects: rows }) : base(call)); await openPair(p);
+  const p = page(t, (call, base) => call.action === 'syncprojects' ? ok({ projects: rows }) : base(call)); await openClone(p);
   let list = nodes(modal(p)).find(node => node.props?.['aria-label'] === '云端项目列表');
   assert.equal(list.props.style.display, 'flex'); assert.equal(list.props.style.flexDirection, 'column');
   assert.equal(list.props.children.length, 3); assert.ok(list.props.children.every(row => row.type === 'div' && row.props.style.width === '100%' && row.props.style.minWidth === 0));
@@ -588,9 +604,11 @@ test('cloud choices use separate full-width rows with neutral labels, source hin
 
 test('pairing historical data discloses its write-fence consequence only in explicit review', async t => {
   const rows = [{ projectId: 'historical-project', label: '现有云端项目', legacy: true }];
-  const p = page(t, (call, base) => call.action === 'syncprojects' ? ok({ projects: rows }) : base(call)); await openPair(p);
-  checkbox(modal(p), '待配对项目').props.onChange(true); checkbox(modal(p), '现有云端项目').props.onChange(true);
+  const p = page(t, (call, base) => call.action === 'syncprojects' ? ok({ projects: rows }) : base(call)); await openClone(p);
+  checkbox(modal(p), '现有云端项目').props.onChange(true);
   assert.doesNotMatch(renderedText(modal(p)), /旧版|单向上传/);
+  assert.equal(nodes(modal(p)).some(row => row.props?.['aria-label'] === '本机工作区列表'), false);
+  button(modal(p), '选择宿主父目录').props.onClick(); await settle();
   button(modal(p), '预览变更').props.onClick(); await settle();
   assert.match(renderedText(modal(p)), /历史内容会保留/);
   assert.match(renderedText(modal(p)), /旧客户端将不能再向此项目追加备份/);
@@ -602,7 +620,7 @@ test('native panel starts compact and inert, delegates login and never stores se
   assert.equal(modal(p).props.open, false); assert.equal(nodes(p.tree()).some(row => row.type === 'native:Input'), false);
   assert.ok(p.calls.every(call => call.action === 'syncstatus')); assert.match(renderedText(p.tree()), /双向同步|不自动清理/);
   const signedOut = page(t, (call, base) => call.action === 'syncstatus' ? ok(status({ loggedIn: false })) : base(call), { ...identity, loggedIn: false }); await mount(signedOut);
-  button(signedOut.tree(), '前往登录').props.onClick(); assert.equal(signedOut.authCalls, 1); assert.equal(button(signedOut.tree(), '配对项目').props.disabled, true);
+  button(signedOut.tree(), '前往登录').props.onClick(); assert.equal(signedOut.authCalls, 1); assert.equal(button(signedOut.tree(), '本地项目→同步到云端').props.disabled, true);
   assert.equal(signedOut.calls.some(call => call.action === 'login'), false);
 });
 
@@ -671,7 +689,7 @@ test('native partial import failure displays new IDs/counts after closing and ne
   });
   p.env.current = status({ bindings: [archiveBinding] }); await mount(p); button(p.tree(), '会话').props.onClick(); await settle(); checkbox(modal(p), archiveRows[0].label).props.onChange(true); button(modal(p), '预览导入').props.onClick(); await settle(); button(modal(p), '确认导入新会话').props.onClick(); await settle();
   assert.match(renderedText(modal(p)), /已导入 2 · 跳过 1 · 失败 1/); assert.match(renderedText(modal(p)), /created-one/); assert.match(renderedText(modal(p)), /created-two/); assert.match(renderedText(modal(p)), /不要重复导入/); assert.doesNotMatch(renderedText(modal(p)), /untrusted-secret/);
-  modal(p).props.onClose(); assert.match(renderedText(p.tree()), /created-one/); assert.equal(button(p.tree(), '配对项目').props.disabled, false);
+  modal(p).props.onClose(); assert.match(renderedText(p.tree()), /created-one/); assert.equal(button(p.tree(), '本地项目→同步到云端').props.disabled, false);
   button(p.tree(), '会话').props.onClick(); await settle(); assert.equal(nodes(modal(p)).filter(row => row.type === 'native:Checkbox').length, 0); assert.equal(button(modal(p), '预览导入').props.disabled, true);
   assert.equal(p.calls.filter(call => call.action === 'syncarchiveimport').length, 1);
 });
@@ -704,9 +722,9 @@ test('fresh same-account revocation requests parent readonly auth refresh once a
   for (let index = 0; index < 2; ++index) { button(p.tree(), '刷新状态').props.onClick(); await settle(); p.tree(); p.mount(); await settle(); }
   assert.equal(p.authCalls, 1); button(p.tree(), '重新登录').props.onClick(); assert.equal(p.authCalls, 2);
   assert.equal(p.calls.some(call => ['login', 'password'].includes(call.action)), false);
-  const changed = page(t); await selectPair(changed); const oldConfirm = button(modal(changed), '确认并启用').props.onClick;
+  const changed = page(t); await selectPublish(changed); const oldConfirm = button(modal(changed), '确认并启用').props.onClick;
   changed.env.current = status({ server: 'https://other.example.test', loggedIn: false }); button(changed.tree(), '刷新状态').props.onClick(); await settle(); changed.tree(); changed.mount(); await settle(); oldConfirm(); await settle();
-  assert.equal(changed.authCalls, 0); assert.equal(changed.calls.some(call => call.action === 'paircommit'), false);
+  assert.equal(changed.authCalls, 0); assert.equal(changed.calls.some(call => call.action === 'syncpublishcommit'), false);
 });
 
 test('confirmed same-account revocation still requests readonly auth recovery while an earlier write is uncertain', async t => {
@@ -724,30 +742,31 @@ test('failed readonly parent auth callback never loops and explicit relogin CTA 
   button(p.tree(), '重新登录').props.onClick(); await settle(); assert.equal(callbacks, 2); assert.equal(p.calls.some(call => call.action === 'login'), false);
 });
 
-test('native first-run and upgraded-server buttons explicitly discover capability without mount probes', async t => {
-  const p = page(t, (call, base, env) => { if (call.action === 'syncprojects') env.current = { ...env.current, capability: 'supported' }; return base(call); });
-  p.env.current = status({ capability: 'unknown', bindings: [] }); await mount(p);
-  assert.ok(p.calls.every(call => call.action === 'syncstatus')); assert.equal(button(p.tree(), '连接项目').props.disabled, false);
-  button(p.tree(), '连接项目').props.onClick(); await settle(); assert.equal(modal(p).props.open, true);
-  assert.equal(button(p.tree(), '配对项目').props.disabled, false); assert.equal(p.calls.filter(call => call.action === 'syncprojects').length, 1);
-  checkbox(modal(p), '待配对项目').props.onChange(true); checkbox(modal(p), '创建新的云端项目').props.onChange(true);
+test('native first-run publish negotiates only on preview and cloud discovery remains explicit', async t => {
+  const p = page(t); p.env.current = status({ capability: 'unknown', bindings: [] }); await mount(p);
+  assert.ok(p.calls.every(call => call.action === 'syncstatus')); assert.equal(button(p.tree(), '本地项目→同步到云端').props.disabled, false);
+  button(p.tree(), '本地项目→同步到云端').props.onClick(); await settle(); assert.equal(modal(p).props.open, true);
+  checkbox(modal(p), '待配对项目').props.onChange(true); assert.ok(p.calls.every(call => call.action === 'syncstatus'));
   button(modal(p), '预览变更').props.onClick(); await settle(); assert.equal(modal(p).props.title, '确认启用双向同步');
+  assert.equal(button(modal(p), '确认并启用').props.disabled, false); assert.equal(p.calls.some(call => call.action === 'syncprojects'), false);
   const old = page(t, (call, base) => call.action === 'syncprojects' ? failure('SYNC_CLIENT_UPGRADE_REQUIRED') : base(call)); old.env.current = status({ capability: 'upgrade-required' }); await mount(old);
-  assert.equal(button(old.tree(), '重新检查连接').props.disabled, false); button(old.tree(), '重新检查连接').props.onClick(); await settle();
+  assert.equal(button(old.tree(), '云端项目→同步到本地').props.disabled, false); button(old.tree(), '云端项目→同步到本地').props.onClick(); await settle();
   assert.match(renderedText(modal(old)), /升级同步服务器和各端插件/); assert.equal(button(modal(old), '刷新列表').props.disabled, false);
 });
 
-test('native wizard shows two explicit lists, no preselection, read-only counts/root then final enable', async t => {
-  const p = page(t); await openPair(p);
+test('native publish wizard shows one checkbox inventory, readonly counts/root then final enable', async t => {
+  const p = page(t); await mount(p); button(p.tree(), '本地项目→同步到云端').props.onClick();
   assert.equal(nodes(modal(p)).filter(row => row.type === 'native:Checkbox' && row.props.checked).length, 0);
   assert.equal(button(modal(p), '预览变更').props.disabled, true);
-  assert.equal(nodes(modal(p)).filter(row => row.type === 'native:Input').length, 2);
-  checkbox(modal(p), '待配对项目').props.onChange(true); checkbox(modal(p), '创建新的云端项目').props.onChange(true);
+  assert.equal(nodes(modal(p)).filter(row => row.type === 'native:Input').length, 1);
+  assert.equal(nodes(modal(p)).some(row => row.props?.['aria-label'] === '云端项目列表'), false);
+  checkbox(modal(p), '待配对项目').props.onChange(true);
   button(modal(p), '预览变更').props.onClick(); await settle(); assert.equal(modal(p).props.title, '确认启用双向同步');
-  assert.ok(renderedText(modal(p)).includes(workspaces[1].root)); assert.match(renderedText(modal(p)), /上传 2 · 下载 3 · 删除 1 · 冲突 1 · 阻止 0/); assert.match(renderedText(modal(p)), /会话日志仅归档/);
-  assert.equal(p.calls.some(call => call.action === 'paircommit'), false);
-  const submit = button(modal(p), '确认并启用').props.onClick; submit(); submit(); await settle(); assert.equal(p.calls.filter(call => call.action === 'paircommit').length, 1);
-  assert.equal(p.calls.find(call => call.action === 'paircommit').payload.revision, 7); assert.equal(modal(p).props.title, '核对同步结果');
+  assert.ok(renderedText(modal(p)).includes(workspaces[1].root)); assert.match(renderedText(modal(p)), /上传 2 · 下载 0 · 删除 0 · 冲突 0 · 阻止 0/); assert.match(renderedText(modal(p)), /会话日志仅归档/);
+  assert.equal(p.calls.some(call => call.action === 'syncpublishcommit'), false);
+  const submit = button(modal(p), '确认并启用').props.onClick; submit(); submit(); await settle(); assert.equal(p.calls.filter(call => call.action === 'syncpublishcommit').length, 1);
+  assert.equal(p.calls.find(call => call.action === 'syncpublishcommit').payload.revision, 7); assert.equal(modal(p).props.title, '核对同步结果');
+  assert.equal(p.calls.some(call => ['syncprojects', 'pairplan', 'paircommit'].includes(call.action)), false);
   modal(p).props.onClose(); assert.equal(modal(p).props.open, false); assert.equal(p.calls.some(call => /cancel/.test(call.action)), false);
 });
 
@@ -763,11 +782,11 @@ test('native pause acts immediately, no Save button; conflict preserve-both and 
 });
 
 test('native definite rejection remains actionable; stale account handler cannot write', async t => {
-  const rejected = page(t, (call, base) => call.action === 'paircommit' ? failure('BUSY') : base(call)); await selectPair(rejected); button(modal(rejected), '确认并启用').props.onClick(); await settle();
-  assert.equal(modal(rejected).props.title, '配对同步项目'); assert.equal(button(modal(rejected), '预览变更').props.disabled, false); assert.match(renderedText(modal(rejected)), /稍后重试/); assert.doesNotMatch(renderedText(modal(rejected)), /untrusted-secret/);
-  const stale = page(t); await selectPair(stale); const handler = button(modal(stale), '确认并启用').props.onClick;
+  const rejected = page(t, (call, base) => call.action === 'syncpublishcommit' ? failure('BUSY') : base(call)); await selectPublish(rejected); button(modal(rejected), '确认并启用').props.onClick(); await settle();
+  assert.equal(modal(rejected).props.title, '同步本地项目到云端'); assert.equal(button(modal(rejected), '预览变更').props.disabled, false); assert.match(renderedText(modal(rejected)), /稍后重试/); assert.doesNotMatch(renderedText(modal(rejected)), /untrusted-secret/);
+  const stale = page(t); await selectPublish(stale); const handler = button(modal(stale), '确认并启用').props.onClick;
   stale.props.identity = { ...identity, username: 'different' }; stale.tree(); handler(); await settle();
-  assert.equal(stale.calls.some(call => call.action === 'paircommit'), false);
+  assert.equal(stale.calls.some(call => call.action === 'syncpublishcommit'), false);
 });
 
 test('native large pairing list remains searchable beyond the bounded first page', async t => {
@@ -780,13 +799,13 @@ test('native large pairing list remains searchable beyond the bounded first page
 
 test('native effect remount keeps read watcher alive without an extra write or disposed controller', async t => {
   const p = page(t); await mount(p); p.remountEffects(); await settle();
-  assert.equal(button(p.tree(), '配对项目').props.disabled, false);
-  button(p.tree(), '配对项目').props.onClick(); await settle(); assert.equal(modal(p).props.open, true);
+  assert.equal(button(p.tree(), '本地项目→同步到云端').props.disabled, false);
+  button(p.tree(), '本地项目→同步到云端').props.onClick(); await settle(); assert.equal(modal(p).props.open, true);
   assert.ok(p.calls.every(call => ['syncstatus', 'syncprojects'].includes(call.action)));
 });
 
 test('native search is bounded and ordinary keyboard/IME editing never selects or submits', async t => {
-  const p = page(t, (call, base) => call.action === 'syncprojects' ? ok({ projects: Array.from({ length: 150 }, (_, index) => ({ projectId: `project-${index}`, label: `项目 ${index}`, legacy: false })) }) : base(call)); await openPair(p);
+  const p = page(t, (call, base) => call.action === 'syncprojects' ? ok({ projects: Array.from({ length: 150 }, (_, index) => ({ projectId: `project-${index}`, label: `项目 ${index}`, legacy: false })) }) : base(call)); await openClone(p);
   assert.match(renderedText(modal(p)), /前100项/);
   const input = nodes(modal(p)).find(row => row.type === 'native:Input' && row.props['aria-label'] === '搜索云端项目');
   assert.equal(input.props.onKeyDown, undefined); input.props.onCompositionStart();

@@ -1,6 +1,6 @@
 {
   "name": "dsh-personal-sync",
-  "version": "0.10.0",
+  "version": "0.11.0",
   "description": "Local-first bidirectional project sync, safe session handoff and personal authentication for DeepSeek Harness",
   "repository": { "type": "git", "url": "git+https://github.com/HuYongJi/dsh_sync.git" },
   "homepage": "https://github.com/HuYongJi/dsh_sync#readme",

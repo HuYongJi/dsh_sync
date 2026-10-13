@@ -35,6 +35,9 @@ function publicHead(head) {
   const { projectId, id, revision, manifestDigest, recordHash } = head;
   return { projectId, id, revision, manifestDigest, recordHash };
 }
+function manifestSummary(manifest) {
+  return { label: manifest.label ?? manifest.projectId, conflicts: manifest.conflicts.length, fileCount: manifest.files.length };
+}
 function resultFor(entry) {
   const { projectId, id, revision, manifestDigest, requestId } = entry.record;
   return { projectId, id, revision, manifestDigest, recordHash: entry.hash, requestId };
@@ -127,7 +130,9 @@ async function publishHead(filename, text, committed) {
  *
  * Methods (all async):
  * head(projectId) -> null | {projectId,id,revision,manifestDigest,recordHash}
- * list({limit=100,cursor=null}) -> {projects:[head | {projectId,projectKey,corrupt:true}],nextCursor}
+ * list({limit=100,cursor=null,summaries=false}) -> {projects:[head | {projectId,projectKey,corrupt:true}],nextCursor}
+ * catalog() -> stable immutable key index for the current in-memory generation
+ * summary(projectKey) -> current-byte-verified head + display summary | corrupt row
  * changes(projectId,{afterRevision=0,untilRevision?,limit=100})
  *   -> {changes:[receipt + parentId,deviceId,policyRevision,migration],untilRevision,nextAfterRevision}
  * getCheckpoint(projectId,id) -> manifest (404 if not committed)
@@ -151,11 +156,13 @@ export async function createSyncStore({ directory, exclusive, verifyBlob } = {})
   if (typeof directory !== 'string' || !directory || typeof exclusive !== 'function' || typeof verifyBlob !== 'function') throw new TypeError('directory, global exclusive callback and verifyBlob callback are required');
   const root = path.resolve(directory), projectDirectory = path.join(root, 'projects');
   const projects = new Map(), writing = new Set();
+  let catalogIndex;
+  function setProject(key, project) { projects.set(key, project); catalogIndex = undefined; }
   const directoryFor = key => path.join(projectDirectory, key);
   const headPath = key => path.join(directoryFor(key), 'head.json');
   const recordPath = (key, hash) => path.join(directoryFor(key), 'records', `${hash}.json`);
   const manifestPath = (key, id, hash) => path.join(directoryFor(key), 'manifests', `${projectKey(id)}-${hash}.json`);
-  function failProject(key, id) { projects.set(key, { key, projectId: id ?? projects.get(key)?.projectId ?? null, corrupt: true }); throw corrupt(); }
+  function failProject(key, id) { setProject(key, { key, projectId: id ?? projects.get(key)?.projectId ?? null, corrupt: true }); throw corrupt(); }
   async function verifyManifestBlobs(manifest, checked = new Map()) {
     for (const file of referencedBlobs(manifest)) {
       if (checked.get(file.hash) === file.size) continue;
@@ -177,7 +184,7 @@ export async function createSyncStore({ directory, exclusive, verifyBlob } = {})
     try { pointer = await readCanonical(headPath(key), MAX_HEAD_BYTES); }
     catch (error) { if (error.code === 'ENOENT') return null; throw error; }
     const head = validateHead(pointer.value, key), records = [], byId = new Map(), byRequest = new Map(), visited = new Set(), checked = new Map();
-    let hash = head.recordHash, child = null, childManifest = null;
+    let hash = head.recordHash, child = null, childManifest = null, summary;
     while (hash !== null) {
       if (visited.has(hash)) throw corrupt(); visited.add(hash);
       const { value } = await readCanonical(recordPath(key, hash), MAX_RECORD_BYTES, hash);
@@ -188,6 +195,7 @@ export async function createSyncStore({ directory, exclusive, verifyBlob } = {})
         validateSyncTransition(manifest, childManifest, { resolutions: child.resolutions });
       } else if (record.revision !== head.revision || record.id !== head.id || record.manifestDigest !== head.manifestDigest) throw corrupt();
       await verifyManifestBlobs(manifest, checked);
+      if (!child) summary = manifestSummary(manifest);
       const entry = { hash, record, deviceId: manifest.deviceId, policyRevision: manifest.policyRevision };
       records.push(entry); byId.set(record.id, entry); byRequest.set(record.requestId, entry);
       child = record; childManifest = manifest; hash = record.previousRecordHash;
@@ -195,7 +203,7 @@ export async function createSyncStore({ directory, exclusive, verifyBlob } = {})
     validateSyncTransition(null, childManifest, { resolutions: child.resolutions });
     if (records.length !== head.revision) throw corrupt();
     records.reverse();
-    return { key, projectId: head.projectId, head, headText: pointer.text, records, byId, byRequest, corrupt: false };
+    return { key, projectId: head.projectId, head, headText: pointer.text, records, byId, byRequest, summary, corrupt: false };
   }
   // Isolate corruption to the hashed project, including a head that cannot reveal its id.
   await exclusive(async () => {
@@ -224,7 +232,7 @@ export async function createSyncStore({ directory, exclusive, verifyBlob } = {})
       }
       if (!observed) {
         const loaded = await openProject(key);
-        if (loaded) projects.set(key, loaded);
+        if (loaded) setProject(key, loaded);
         return loaded;
       }
       if (pointer.text !== observed.headText) return failProject(key, id);
@@ -246,10 +254,50 @@ export async function createSyncStore({ directory, exclusive, verifyBlob } = {})
   }
   function pageLimit(limit = 100) { assert(Number.isSafeInteger(limit) && limit > 0 && limit <= MAX_SYNC_PAGE_SIZE, 'Invalid page limit'); return limit; }
   async function head(id) { const project = await projectFor(id); return project ? publicHead(project.head) : null; }
-  async function list({ limit = 100, cursor = null } = {}) {
+  function catalog() {
+    // Replaced only when a validated project generation (or corruption marker)
+    // changes. Consumers can bind pagination to object identity without persisting
+    // another index or weakening the authoritative on-disk chain.
+    catalogIndex ??= Object.freeze([...projects.keys()].sort(compare).map(key => Object.freeze({ key, projectId: projects.get(key).projectId })));
+    return catalogIndex;
+  }
+  async function summary(key) {
+    validateBlobHash(key);
+    let project = projects.get(key);
+    if (!project) throw problem(404, 'Project not found');
+    if (!project.corrupt) {
+      try {
+        project = await projectFor(project.projectId);
+        const entry = project.records.at(-1);
+        // The full record/manifest and all historical references were validated
+        // at open/commit. Check CURRENT bytes against those exact validated hashes
+        // on every browse; do not trust timestamps, TTLs or cached file existence.
+        // Digest equality permits reusing only the small validated display summary.
+        for (const [filename, hash, limit] of [
+          [recordPath(key, entry.hash), entry.hash, MAX_RECORD_BYTES],
+          [manifestPath(key, entry.record.id, entry.record.manifestDigest), entry.record.manifestDigest, MAX_MANIFEST_BYTES],
+        ]) {
+          const { bytes } = await readStableFile(filename, limit);
+          if (sha256(bytes) !== hash) throw corrupt();
+        }
+        return { ...publicHead(project.head), ...project.summary };
+      } catch {
+        try { failProject(key, project?.projectId); } catch {}
+        project = projects.get(key);
+      }
+    }
+    return { projectId: project.projectId, projectKey: key, corrupt: true };
+  }
+  async function list({ limit = 100, cursor = null, summaries = false } = {}) {
     pageLimit(limit); if (cursor !== null) validateBlobHash(cursor);
-    const keys = [...projects.keys()].filter(key => cursor === null || key > cursor).sort(compare), selected = keys.slice(0, limit), items = [];
+    const index = catalog(); let start = 0, end = index.length;
+    if (cursor !== null) while (start < end) {
+      const middle = Math.floor((start + end) / 2);
+      if (index[middle].key <= cursor) start = middle + 1; else end = middle;
+    }
+    const selected = index.slice(start, start + limit).map(item => item.key), items = [];
     for (const key of selected) {
+      if (summaries) { items.push(await summary(key)); continue; }
       let project = projects.get(key);
       if (!project.corrupt) {
         try { project = await projectFor(project.projectId); } catch { project = projects.get(key); }
@@ -257,7 +305,7 @@ export async function createSyncStore({ directory, exclusive, verifyBlob } = {})
       if (project.corrupt) items.push({ projectId: project.projectId, projectKey: key, corrupt: true });
       else items.push(publicHead(project.head));
     }
-    return { projects: items, nextCursor: keys.length > selected.length ? selected.at(-1) : null };
+    return { projects: items, nextCursor: start + selected.length < index.length ? selected.at(-1) : null };
   }
   async function changes(id, { afterRevision = 0, untilRevision, limit = 100 } = {}) {
     pageLimit(limit); revision(afterRevision, 'after revision');
@@ -321,7 +369,7 @@ export async function createSyncStore({ directory, exclusive, verifyBlob } = {})
       const pointer = { version: 2, projectId: manifest.projectId, id: manifest.id, revision: record.revision, manifestDigest, recordHash }, pointerText = canonicalJson(pointer);
       const entry = { hash: recordHash, record, deviceId: manifest.deviceId, policyRevision: manifest.policyRevision };
       const next = {
-        key, projectId: manifest.projectId, head: pointer, headText: pointerText, corrupt: false,
+        key, projectId: manifest.projectId, head: pointer, headText: pointerText, summary: manifestSummary(manifest), corrupt: false,
         records: [...(project?.records ?? []), entry], byId: new Map(project?.byId), byRequest: new Map(project?.byRequest),
       };
       next.byId.set(manifest.id, entry); next.byRequest.set(request.requestId, entry);
@@ -332,13 +380,13 @@ export async function createSyncStore({ directory, exclusive, verifyBlob } = {})
         await immutableWrite(manifestPath(key, manifest.id, manifestDigest), manifestText);
         await immutableWrite(recordPath(key, recordHash), recordText);
         await recheckAuth();
-        await publishHead(headPath(key), pointerText, () => projects.set(key, next));
+        await publishHead(headPath(key), pointerText, () => setProject(key, next));
       } finally { writing.delete(key); }
       return resultFor(entry);
     });
   }
   return Object.freeze({
-    head, list, changes, getCheckpoint, receipt,
+    head, list, changes, getCheckpoint, receipt, catalog, summary,
     commit: (request, trusted) => mutate(request, trusted, false),
     migrate: (request, trusted) => mutate(request, trusted, true),
   });

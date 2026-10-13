@@ -217,6 +217,14 @@ export function createSettingsService(ctx, controller, { profileDir, dshHome, pi
       const workspace = registry().get(selected.workspaceId);
       if (!workspace || typeof workspace.path !== 'string' || rootKey(workspace.path) !== rootKey(mapping.root) || !(await available(mapping.root))) throw settingsFailure('PROJECT_UNAVAILABLE', '项目目录已失效或变更，不会上传旧队列');
     },
+    // Host-only lean identity read; legacy .status() below keeps its historical
+    // compatibility shape. No project inventory or pending-manifest scan here.
+    async accountStatus() {
+      await initialize();
+      const snapshot = preferences, state = await controller.accountStatus();
+      if (snapshot.revision !== preferences.revision || snapshot.server !== preferences.server || snapshot.username !== preferences.username) throw settingsFailure('CONFIG_CONFLICT', '设置已变更');
+      return { revision: snapshot.revision, server: snapshot.server || '', username: snapshot.username || '', loggedIn: state.loggedIn, ...(state.expiresAt ? { expiresAt: state.expiresAt } : {}), ...(state.authState ? { authState: state.authState } : {}), reauthRequired: state.reauthRequired === true, running: state.running };
+    },
     async status() {
       await initialize();
       const snapshot = preferences, projects = await projectRows(), state = await controller.status();

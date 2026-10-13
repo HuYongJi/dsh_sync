@@ -1,4 +1,4 @@
-import { createBidirectionalController, bidirectionalMessage, canRepairBinding, STORAGE_GIB, MAX_STORAGE_GIB } from './bidirectional-state.mjs';
+import { createBidirectionalController, bidirectionalMessage, canRepairBinding, STORAGE_GIB, MAX_STORAGE_GIB, MAX_ONBOARDING_PROJECTS } from './bidirectional-state.mjs';
 
 /** Native DSH React/controls are injected; this module imports no React, fetch, or storage. */
 export function createBidirectionalPanel(React, { Button, Input, Checkbox, Switch, Modal }) {
@@ -68,7 +68,8 @@ export function createBidirectionalPanel(React, { Button, Input, Checkbox, Switc
     const locked = !state.ready || !identityMatches || Boolean(state.busy) || state.refreshing || state.uncertain;
     const canDiscover = !locked && loggedIn;
     const canAct = canDiscover && status.capability === 'supported';
-    const discoveryLabel = status?.capability === 'supported' ? '配对项目' : status?.capability === 'upgrade-required' ? '重新检查连接' : '连接项目';
+    const onboarding = ['clone', 'publish'].includes(dialog?.kind);
+    const selectedCount = dialog?.selectedIds?.length ?? 0;
     const storage = status?.storage, configuredGiB = storage ? storage.limitBytes / STORAGE_GIB : undefined;
     const quotaValue = quotaDraft?.value ?? (Number.isInteger(configuredGiB) && configuredGiB >= 1 && configuredGiB <= MAX_STORAGE_GIB ? String(configuredGiB) : '');
     const quotaValid = typeof quotaValue === 'string' && /^[1-9][0-9]{0,3}$/.test(quotaValue) && Number(quotaValue) <= MAX_STORAGE_GIB;
@@ -111,14 +112,14 @@ export function createBidirectionalPanel(React, { Button, Input, Checkbox, Switc
     for (const row of state.projects.items) { const key = row.label.normalize('NFC').toLocaleLowerCase(); projectNames.set(key, (projectNames.get(key) ?? 0) + 1); }
     const duplicateProject = row => projectNames.get(row.label.normalize('NFC').toLocaleLowerCase()) > 1;
     const items = dialog?.items?.filter(row => matches(row, itemSearch)) ?? [], selected = dialog?.items?.find(row => row.id === dialog.selectedId), plan = dialog?.plan;
-    const titles = { pair: '配对同步项目', conflicts: '处理文件冲突', recycle: '本机回收站', archives: '会话归档', repair: '核对中断事务' };
-    const reviewTitles = { pair: '确认启用双向同步', conflicts: '确认处理冲突', recycle: '确认恢复文件', archives: '确认导入安全会话', repair: '确认修复中断事务' };
-    const title = dialog?.stage === 'review' ? reviewTitles[dialog.kind] : dialog?.stage === 'legacy' ? '选择云端主要版本' : ['progress', 'uncertain'].includes(dialog?.stage) ? '核对同步结果' : titles[dialog?.kind] ?? '本机回收站';
+    const titles = { publish: '同步本地项目到云端', clone: '同步云端项目到本地', conflicts: '处理文件冲突', recycle: '本机回收站', archives: '会话归档', repair: '核对中断事务' };
+    const reviewTitles = { publish: '确认启用双向同步', clone: '确认启用双向同步', conflicts: '确认处理冲突', recycle: '确认恢复文件', archives: '确认导入安全会话', repair: '确认修复中断事务' };
+    const title = dialog?.stage === 'review' ? reviewTitles[dialog.kind] : dialog?.stage === 'legacy' ? '选择云端主要版本' : dialog?.stage === 'folder' ? '选择宿主父目录' : dialog?.stage === 'destination' ? '确认新建位置' : ['progress', 'uncertain'].includes(dialog?.stage) ? '核对同步结果' : titles[dialog?.kind] ?? '本机回收站';
     const repairReady = canAct && canRepairBinding(binding) && !dialog?.stale;
     const planReady = Boolean(canAct && plan && plan.expiresAt > Date.now() && (dialog.kind !== 'archives' || plan.eligibility === 'unchecked') && (dialog.kind !== 'repair' || repairReady));
     const itemReady = Boolean(canAct && selected && !dialog?.stale && (dialog.kind !== 'archives' || selected.state === 'available'));
-    const confirmations = { pair: controller.confirmPair, conflicts: controller.confirmResolution, recycle: controller.confirmRestore, archives: controller.confirmArchiveImport, repair: controller.confirmRepair };
-    const previews = { pair: controller.planPair, conflicts: controller.planResolution, recycle: controller.planRestore, archives: controller.planArchiveImport, repair: controller.planRepair };
+    const confirmations = { publish: controller.confirmPublish, clone: controller.confirmClone, conflicts: controller.confirmResolution, recycle: controller.confirmRestore, archives: controller.confirmArchiveImport, repair: controller.confirmRepair };
+    const previews = { publish: controller.planPublish, clone: controller.planClone, conflicts: controller.planResolution, recycle: controller.planRestore, archives: controller.planArchiveImport, repair: controller.planRepair };
     const confirm = () => act(() => confirmations[dialog.kind](plan));
     const planAction = () => act(() => previews[dialog.kind]());
     const idsView = ids => {
@@ -132,28 +133,49 @@ export function createBidirectionalPanel(React, { Button, Input, Checkbox, Switc
       body(operationLabel(item.state)),
       ['import', 'syncarchiveimport'].includes(item.kind) && h('div', { style: styles.column }, body(`已导入 ${item.importedCount ?? '未确认'} · 跳过 ${item.skippedCount ?? '未确认'} · 失败 ${item.failedCount ?? '未确认'}`), idsView(item.sessionIds)),
       item.errorCode && body(bidirectionalMessage(item.errorCode), { role: 'alert', style: { ...styles.body, ...styles.warning } }));
+    const batchView = batch => h('div', { key: batch.id, style: styles.column, 'data-onboarding-id': batch.id },
+      body(({ running: '各项目独立处理中', succeeded: '全部项目已完成', partial: '部分项目已完成', failed: '项目未完成', uncertain: '结果未确认，仅核对原请求' })[batch.state], { role: 'status', 'aria-live': 'polite' }),
+      body('每个项目独立执行；失败不会回滚已完成项目，不会自动重试。'),
+      batch.parent && root(`宿主父目录：${batch.parent}`),
+      h('div', { style: styles.list, 'aria-label': '各项目同步结果' }, ...batch.items.map(item => h('div', { key: item.id, style: styles.item, 'data-onboarding-item': item.id },
+        h('strong', null, item.label), root(item.root),
+        body(({ pending: '等待处理', running: '处理中', succeeded: '已完成', failed: '未完成', uncertain: '结果未确认' })[item.state], { role: 'status' }),
+        body(({ accepted: '宿主已接收', 'mkdir-started': '创建全新子目录', 'root-owned': '已确认新目录', 'migration-committing': '保留历史并迁移', 'migration-complete': '历史迁移已完成', downloading: '同步文件到本地', downloaded: '文件已同步到本地', registering: '注册新工作区', registered: '新工作区已注册', publishing: '创建云端项目并同步', paired: '双向同步已启用', complete: '本项目处理完成', interrupted: '处理已中断，请核对状态' })[item.phase] ?? '以宿主核对结果为准'),
+        item.errorCode && body(bidirectionalMessage(item.errorCode), { role: 'alert', style: { ...styles.body, ...styles.warning } }),
+        item.state === 'uncertain' && body('可能已创建目录或注册工作区。不要向同一位置重复提交，仅核对原请求。', { role: 'status' })))));
     const modalFooter = dialog && h('div', { style: styles.between },
       h(Button, { type: 'button', variant: 'ghost', onClick: close }, '关闭'),
       h('div', { style: styles.row },
-        dialog.stage === 'review' && h(Button, { type: 'button', variant: 'ghost', disabled: Boolean(state.busy), onClick: () => controller.back() }, '返回修改'),
-        ['choose', 'legacy'].includes(dialog.stage) && h(Button, { type: 'button', variant: 'outline', disabled: Boolean(state.busy) || state.refreshing || state.uncertain || !identity?.loggedIn, onClick: () => act(() => controller.reloadDialog()) }, dialog.kind === 'repair' ? '刷新状态' : '刷新列表'),
-        ['choose', 'legacy'].includes(dialog.stage) && h(Button, { type: 'button', variant: 'primary', disabled: dialog.kind === 'pair' ? !canAct || !dialog.workspaceId || !dialog.projectChoice || !state.projects.loaded || (dialog.legacyChoices.length > 0 && !dialog.primaryLegacyId) : dialog.kind === 'repair' ? !repairReady : !itemReady, onClick: planAction }, dialog.kind === 'archives' ? '预览导入' : '预览变更'),
-        dialog.stage === 'review' && h(Button, { type: 'button', variant: 'primary', disabled: !planReady || (dialog.kind === 'pair' && plan?.summary.blocked > 0), onClick: confirm }, ({ pair: '确认并启用', conflicts: '确认处理', recycle: '确认恢复', archives: '确认导入新会话', repair: '确认修复并继续' })[dialog.kind]),
+        (dialog.stage === 'review' || (onboarding && ['folder', 'destination', 'legacy'].includes(dialog.stage))) && h(Button, { type: 'button', variant: 'ghost', disabled: Boolean(state.busy) || state.uncertain, onClick: () => controller.back() }, '返回修改'),
+        dialog.stage === 'choose' && h(Button, { type: 'button', variant: 'outline', disabled: Boolean(state.busy) || state.refreshing || state.uncertain || !identity?.loggedIn, onClick: () => act(() => controller.reloadDialog()) }, dialog.kind === 'repair' ? '刷新状态' : '刷新列表'),
+        dialog.stage === 'choose' && dialog.kind === 'clone' && h(Button, { type: 'button', variant: 'primary', disabled: !canDiscover || dialog.stale || !selectedCount || !state.projects.loaded, onClick: () => act(() => controller.pickCloneParent()) }, '选择宿主父目录'),
+        dialog.stage === 'folder' && h(Button, { type: 'button', variant: 'primary', disabled: !canDiscover || !dialog.browser?.selectable || dialog.stale, onClick: () => act(() => controller.selectCloneParent()) }, '使用此父目录'),
+        ['destination', 'legacy'].includes(dialog.stage) && h(Button, { type: 'button', variant: 'outline', disabled: !canDiscover || dialog.stale, onClick: () => act(() => controller.pickCloneParent()) }, '重新选择父目录'),
+        ((dialog.stage === 'choose' && dialog.kind !== 'clone') || ['destination', 'legacy'].includes(dialog.stage)) && h(Button, { type: 'button', variant: 'primary', disabled: onboarding ? !canDiscover || dialog.stale || !selectedCount || (dialog.kind === 'clone' && (!dialog.destination || dialog.legacyChoices.some(row => !dialog.primaryLegacyIds.some(choice => choice.projectId === row.projectId)))) : dialog.kind === 'repair' ? !repairReady : !itemReady, onClick: planAction }, dialog.kind === 'archives' ? '预览导入' : '预览变更'),
+        dialog.stage === 'review' && h(Button, { type: 'button', variant: 'primary', disabled: !planReady || (onboarding && plan?.summary.blocked > 0), onClick: confirm }, ({ publish: '确认并启用', clone: '确认并启用', conflicts: '确认处理', recycle: '确认恢复', archives: '确认导入新会话', repair: '确认修复并继续' })[dialog.kind]),
         ['progress', 'uncertain'].includes(dialog.stage) && h(Button, { type: 'button', variant: 'outline', disabled: Boolean(state.busy) || state.refreshing, onClick: () => act(() => controller.refresh()) }, '核对状态')));
     return h('section', { style: styles.card, 'aria-labelledby': `${id}-title`, 'aria-busy': state.refreshing || Boolean(state.busy), 'data-personal-sync': 'bidirectional' },
       h('div', { style: styles.between }, h('h3', { id: `${id}-title`, style: styles.heading }, '双向同步'),
-        h('div', { style: styles.row },
-          h(Button, { type: 'button', variant: 'ghost', ref: refreshFocus, disabled: state.refreshing || Boolean(state.busy), onClick: () => act(() => controller.refresh()) }, state.refreshing ? '读取中…' : '刷新状态'),
-          h(Button, { type: 'button', variant: 'outline', disabled: !canDiscover, onClick: () => start(() => controller.openPair()) }, discoveryLabel))),
-      body('配对前先预览，确认后才启用；不会自动选择工作区。'),
+        h(Button, { type: 'button', variant: 'ghost', ref: refreshFocus, disabled: state.refreshing || Boolean(state.busy), onClick: () => act(() => controller.refresh()) }, state.refreshing ? '读取中…' : '刷新状态')),
+      body('一个双向同步：首次选择方向并预览，明确确认后持续双向同步。每批最多20个项目。'),
+      h('div', { style: styles.grid, 'aria-label': '添加双向同步项目' },
+        h('div', { style: styles.column, 'data-onboarding-entry': 'publish' },
+          h(Button, { type: 'button', variant: 'outline', disabled: !canDiscover, onClick: () => start(() => controller.openPublish()) }, '本地项目→同步到云端'),
+          body(`本地项目${identityMatches && status ? ` ${status.workspaces.length} 个` : ''} · 点击后选择；各自创建新的云端项目。`)),
+        h('div', { style: styles.column, 'data-onboarding-entry': 'clone' },
+          h(Button, { type: 'button', variant: 'outline', disabled: !canDiscover, onClick: () => start(() => controller.openClone()) }, '云端项目→同步到本地'),
+          body('点击后读取云端列表；选择一个宿主父目录，各自新建子目录与工作区。'))),
       (!identity?.loggedIn || rejectedSavedIdentity) && h('div', { style: styles.row }, body(rejectedSavedIdentity ? '同步授权已失效，请重新登录；不会自动重发凭据。' : '请先在账号卡片登录。'), h(Button, { type: 'button', variant: 'outline', onClick: requestAuthentication }, rejectedSavedIdentity ? '重新登录' : '前往登录')),
       identity?.loggedIn && status?.capability === 'upgrade-required' && body('请升级同步服务器后使用双向同步。已有云端数据会保留，不会自动启用同步。', { role: 'status', style: { ...styles.body, ...styles.warning } }),
       identity?.loggedIn && (!state.ready || !identityMatches) && body(state.refreshing ? '正在核对账号状态…' : '状态尚未确认，请刷新。', { role: 'status' }),
-      loggedIn && state.ready && status.capability === 'unknown' && body('点击“连接项目”检查服务器能力；打开页面或刷新状态不会连接云端。', { role: 'status' }),
+      loggedIn && state.ready && status.capability === 'unknown' && body('打开本地选择器不读取云端列表；只有打开云端选择器或明确预览时才连接云端。', { role: 'status' }),
       state.error && body(state.error.message, { role: 'alert', style: { ...styles.body, ...styles.warning } }),
       state.notice && body(state.notice, { role: 'status', 'aria-live': 'polite' }),
       state.pollStopped && body('自动核对已停止；可手动刷新，不会重发未确认的写入。', { role: 'status' }),
       identityMatches && status?.warning && body(bidirectionalMessage(status.warning), { role: 'status', style: styles.warning }),
+      identityMatches && status?.onboarding.length > 0 && h('details', { 'aria-label': '最近添加结果' }, h('summary', { style: styles.body }, `最近添加结果（${status.onboarding.length} 批）`),
+        ...status.onboarding.slice(-10).reverse().map(batch => h('div', { key: batch.id, style: styles.item }, body(`${batch.kind === 'clone' ? '云端→本地' : '本地→云端'} · ${batch.items.length} 个项目 · ${({ running: '处理中', succeeded: '已完成', partial: '部分完成', failed: '未完成', uncertain: '结果未确认' })[batch.state]}`),
+          h(Button, { type: 'button', variant: 'ghost', disabled: Boolean(state.busy) || !state.ready, 'aria-label': `查看 ${batch.items.length} 个项目的批次结果 ${batch.id}`, onClick: () => start(() => controller.openOnboardingStatus(batch.id)) }, '查看批次结果')))),
       identityMatches && status?.bindings.length === 0 && body('尚未配对项目'),
       identityMatches && status?.bindings.length > 20 && search(bindingSearch, setBindingSearch, '搜索已配对项目'),
       identityMatches && status?.bindings.length > 0 && visibleBindings.length === 0 && body('没有匹配的配对项目'),
@@ -190,25 +212,38 @@ export function createBidirectionalPanel(React, { Button, Input, Checkbox, Switc
           body('仅调整本机共享软上限，不选择或上传项目、不清理内容，也不改变文件和清单的硬限制。'))),
       h(Modal, { open: Boolean(dialog), onClose: close, title, closeLabel: '关闭', footer: modalFooter, onKeyDownCapture: protectIme },
         dialog && h('div', { style: styles.column, ref: stageFocus, tabIndex: -1, ...(dialog.stage !== 'choose' ? { 'data-modal-autofocus': '' } : {}) },
-          dialog.kind === 'pair' && ['choose', 'legacy'].includes(dialog.stage) && h('div', { style: styles.column },
-            h('div', { style: styles.grid },
-              h('div', { style: styles.column }, h('h4', { style: styles.heading }, '本机工作区'), search(workspaceSearch, setWorkspaceSearch, '搜索本机工作区', true),
-                h('div', { style: styles.list, role: 'group', 'aria-label': '本机工作区列表' }, ...workspaces.slice(0, 100).map(row => h('div', { key: row.id, style: styles.item },
-                  h(Checkbox, { checked: dialog.workspaceId === row.id, label: row.label + (row.available ? '' : ' · 不可用'), disabled: !canAct || !row.available, onChange: selected => act(() => controller.selectWorkspace(selected ? row.id : '')) }), root(row.root)))),
-                !workspaces.length && body('没有匹配的工作区；请先在 DSH 中添加工作区。'), workspaces.length > 100 && body('仅显示前100项，请继续搜索。')),
-              h('div', { style: styles.column }, h('h4', { style: styles.heading }, '云端项目'), search(projectSearch, setProjectSearch, '搜索云端项目'),
-                h('div', { style: styles.projectOption, 'data-cloud-choice': 'new' },
-                  h(Checkbox, { checked: dialog.projectChoice === 'new', label: '创建新的云端项目', disabled: !canAct || !state.projects.loaded, onChange: selected => act(() => controller.selectProject(selected ? null : undefined)) }),
-                  root('新建独立项目，不覆盖已有备份。')),
-                h('div', { style: { ...styles.list, ...styles.column, gap: 8 }, role: 'group', 'aria-label': '云端项目列表' }, ...projects.slice(0, 100).map(row => h('div', { key: row.projectId, style: styles.projectOption, 'data-cloud-project-id': row.projectId },
-                  h(Checkbox, { checked: dialog.projectChoice === 'existing' && dialog.projectId === row.projectId, label: row.label, disabled: !canAct || !state.projects.loaded, onChange: selected => act(() => controller.selectProject(selected ? row.projectId : undefined)) }),
-                  row.sourceRoot && root(`来源：${row.sourceRoot}`),
-                  row.checkpointCount !== undefined && root(`已保存 ${row.checkpointCount} 个版本${row.latestCreatedAt ? ` · 最近 ${when(row.latestCreatedAt)}` : ''}`),
-                  duplicateProject(row) && h('details', null, h('summary', { style: styles.root }, '区分同名项目'), root(`项目标识：${row.projectId}`))))),
-                body('已有云端内容会保留；首次连接须预览并确认。'),
-                state.projects.loaded && !projects.length && body('暂无匹配的云端项目，可显式创建新项目。'), projects.length > 100 && body('仅显示前100项，请继续搜索。'), state.projects.partial && body('部分云端项目读取失败，请刷新核对。', { role: 'alert' }))),
-            dialog.legacyChoices.length > 0 && h('div', { style: styles.column, role: 'group', 'aria-label': '云端主要版本' }, body('这个项目保存过不同分支。请选择首次连接采用的主要版本，其余差异和历史内容仍保留，不会把缺少的文件当作删除指令。'),
-              ...dialog.legacyChoices.map(row => h('div', { key: row.id, style: styles.projectOption }, h(Checkbox, { checked: dialog.primaryLegacyId === row.id, label: row.label, disabled: !canAct, onChange: checked => { if (checked) act(() => controller.selectLegacy(row.id)); } }))))),
+          onboarding && dialog.stage === 'choose' && h('div', { style: styles.column },
+            body(`已选择 ${selectedCount} / ${MAX_ONBOARDING_PROJECTS} 个项目`, { role: 'status', 'aria-live': 'polite' }),
+            dialog.kind === 'publish' ? h('div', { style: styles.column },
+              body('每个本地项目创建新的独立云端项目；不关联已有云端项目。'), search(workspaceSearch, setWorkspaceSearch, '搜索本机工作区', true),
+              h('div', { style: styles.list, role: 'group', 'aria-label': '本机工作区列表' }, ...workspaces.slice(0, 100).map(row => {
+                const bound = status.bindings.some(binding => binding.workspaceId === row.id), checked = dialog.selectedIds.includes(row.id);
+                return h('div', { key: row.id, style: styles.item, 'data-local-workspace-id': row.id },
+                  h(Checkbox, { checked, label: row.label + (bound ? ' · 已启用双向同步' : row.available ? '' : ' · 不可用'), disabled: !canDiscover || dialog.stale || !row.available || bound || (!checked && selectedCount >= MAX_ONBOARDING_PROJECTS), onChange: selected => act(() => controller.selectOnboarding(row.id, selected)) }), root(row.root));
+              })),
+              !workspaces.length && body('没有匹配的工作区；请先在 DSH 中添加工作区。'), workspaces.length > 100 && body('仅显示前100项，请继续搜索。')) : h('div', { style: styles.column },
+              body('已有云端内容会保留；每个项目必须新建本地子目录和工作区，不关联已有工作区。'), search(projectSearch, setProjectSearch, '搜索云端项目', true),
+              h('div', { style: { ...styles.list, ...styles.column, gap: 8 }, role: 'group', 'aria-label': '云端项目列表' }, ...(state.projects.loaded ? projects : []).slice(0, 100).map(row => h('div', { key: row.projectId, style: styles.projectOption, 'data-cloud-project-id': row.projectId },
+                h(Checkbox, { checked: dialog.selectedIds.includes(row.projectId), label: row.label, disabled: !canDiscover || dialog.stale || !state.projects.loaded || status.bindings.some(binding => binding.projectId === row.projectId) || (!dialog.selectedIds.includes(row.projectId) && selectedCount >= MAX_ONBOARDING_PROJECTS), onChange: selected => act(() => controller.selectOnboarding(row.projectId, selected)) }),
+                status.bindings.some(binding => binding.projectId === row.projectId) && body('已在本机启用双向同步，请在已有配对中管理。'),
+                row.sourceRoot && root(`来源：${row.sourceRoot}`),
+                row.checkpointCount !== undefined && root(`已保存 ${row.checkpointCount} 个版本${row.latestCreatedAt ? ` · 最近 ${when(row.latestCreatedAt)}` : ''}`),
+                duplicateProject(row) && h('details', null, h('summary', { style: styles.root }, '区分同名项目'), root(`项目标识：${row.projectId}`))))),
+              state.projects.loaded && !projects.length && body('暂无匹配的云端项目。'), projects.length > 100 && body('仅显示前100项，请继续搜索。'), state.projects.partial && body('部分云端项目读取失败，请刷新核对。', { role: 'alert' }))),
+          dialog.kind === 'clone' && dialog.stage === 'folder' && dialog.browser && h('div', { style: styles.column },
+            body(`为 ${selectedCount} 个项目选择一个宿主父目录。浏览和选择均不创建目录。`), root(dialog.browser.path),
+            h('nav', { style: styles.row, 'aria-label': '宿主目录位置' }, ...dialog.browser.crumbs.map(node => h(Button, { key: node.id, type: 'button', variant: 'ghost', disabled: !canDiscover, onClick: () => act(() => controller.browseCloneParent(node.id)) }, node.label))),
+            search(itemSearch, setItemSearch, '筛选宿主子目录'),
+            h('div', { style: styles.list, 'aria-label': '宿主子目录列表' }, ...dialog.browser.directories.filter(node => matches(node, itemSearch)).slice(0, 100).map(node => h('div', { key: node.id, style: styles.item },
+              h(Button, { type: 'button', variant: 'outline', disabled: !canDiscover, 'aria-label': `进入宿主目录 ${node.label}`, onClick: () => act(() => controller.browseCloneParent(node.id)) }, node.label)))),
+            !dialog.browser.selectable && body('当前位置不可用，请进入可用目录或重新选择。', { role: 'status' }),
+            (dialog.browser.truncated || dialog.browser.directories.length > 100) && body('目录列表有数量限制；可筛选已返回目录或进入更具体的位置。')),
+          dialog.kind === 'clone' && ['destination', 'legacy'].includes(dialog.stage) && dialog.destination && h('div', { style: styles.column },
+            body('已选择宿主父目录（只读）：'), root(dialog.destination.parent), body('每个项目使用以下全新子目录；尚未创建目录或注册工作区。'),
+            h('div', { style: styles.list, 'aria-label': '计划新建目录' }, ...dialog.destination.items.map(item => h('div', { key: item.projectId, style: styles.item }, h('strong', null, item.label), root(item.root)))),
+            dialog.stage === 'legacy' && h('div', { style: styles.column, 'aria-label': '云端主要版本' }, body('以下项目存在不同分支，请逐项选择主要版本。其余差异和历史内容仍保留，不将缺少文件当作删除。'),
+              ...dialog.legacyChoices.map(project => h('div', { key: project.projectId, style: styles.column, role: 'group', 'aria-label': `${project.label} 的主要版本` }, h('strong', null, project.label),
+                ...project.heads.map(head => h(Checkbox, { key: head.id, checked: dialog.primaryLegacyIds.some(choice => choice.projectId === project.projectId && choice.checkpointId === head.id), label: head.label, disabled: !canDiscover, onChange: checked => { if (checked) act(() => controller.selectCloneLegacy(project.projectId, head.id)); } })))))),
           ['conflicts', 'recycle'].includes(dialog.kind) && dialog.stage === 'choose' && h('div', { style: styles.column },
             binding && h('div', null, body(binding.label), root(binding.root)), search(itemSearch, setItemSearch, dialog.kind === 'conflicts' ? '搜索冲突文件' : '搜索回收文件', true),
             dialog.kind === 'conflicts' && body('默认保留双方。先预览目标文件，再明确确认；不提供自动文本合并。'),
@@ -236,11 +271,15 @@ export function createBidirectionalPanel(React, { Button, Input, Checkbox, Switc
             body('预览与关闭窗口均不写入文件，修复不会丢弃旧备份。'),
             !canRepairBinding(binding) && body('当前状态不允许修复。请刷新核对，不会自动启用同步或修复根目录/授权异常。', { role: 'alert' })),
           dialog.stage === 'review' && plan && h('div', { style: styles.column },
-            dialog.kind === 'pair' && h('div', { style: styles.column }, body(plan.label), root(plan.root),
-              body(`上传 ${plan.summary.upload} · 下载 ${plan.summary.download} · 删除 ${plan.summary.delete} · 冲突 ${plan.summary.conflicts} · 阻止 ${plan.summary.blocked}`, { 'aria-label': '配对变更摘要' }),
+            onboarding && h('div', { style: styles.column },
+              body(`${plan.items.length} 个项目 · 确认后逐项启用持续双向同步；并非整批原子操作。`),
+              dialog.kind === 'clone' ? h('div', null, body('一个宿主父目录，每个项目创建全新子目录和工作区；不关联已有工作区。'), root(plan.parent)) : body('每个本地项目创建全新云端项目，再启用持续双向同步。'),
+              h('div', { style: styles.list, 'aria-label': '各项目变更预览' }, ...plan.items.map(item => h('div', { key: item.projectId, style: styles.item }, h('strong', null, item.label), root(item.root),
+                body(`上传 ${item.summary.upload} · 下载 ${item.summary.download} · 删除 ${item.summary.delete} · 冲突 ${item.summary.conflicts} · 阻止 ${item.summary.blocked}`),
+                item.migrationRequired && body('此项目的历史内容会保留。连接后以双向状态为准，旧客户端将不能再向此项目追加备份。')))),
+              body(`合计：上传 ${plan.summary.upload} · 下载 ${plan.summary.download} · 删除 ${plan.summary.delete} · 冲突 ${plan.summary.conflicts} · 阻止 ${plan.summary.blocked}`, { 'aria-label': '批次变更摘要' }),
               plan.summary.blocked > 0 && body('存在阻止项，不能启用。请返回处理后重新预览。', { role: 'alert' }),
-              body('确认后启用此配对的自动双向同步。未跟踪文件不会被当作删除；有冲突时保留副本。'),
-              state.projects.items.find(row => row.projectId === dialog.projectId)?.legacy && body('此项目的历史内容会保留。连接后以双向状态为准，旧客户端将不能再向此项目追加备份。')),
+              body('每个项目独立报告结果；部分失败不会回滚已完成的项目。未跟踪文件不视作删除，有冲突时保留副本。')),
             dialog.kind === 'conflicts' && h('div', { style: styles.column }, root(plan.root), body(plan.summary),
               body(`选择：${({ both: '保留双方', local: '本机版本', remote: '云端版本' })[plan.choice]}`),
               h('ul', { style: { ...styles.body, ...styles.list }, 'aria-label': '冲突处理目标' }, ...plan.paths.map((name, index) => h('li', { key: index }, name)))),
@@ -260,7 +299,10 @@ export function createBidirectionalPanel(React, { Button, Input, Checkbox, Switc
             body('预览不写入文件；只有下方明确确认才提交。')),
           ['progress', 'uncertain'].includes(dialog.stage) && h('div', { style: styles.column },
             body(dialog.stage === 'uncertain' ? '结果未确认，请核对状态；不会重发写入。' : '已提交至宿主，可关闭窗口。关闭不会取消已提交操作。', { role: 'status', 'aria-live': 'polite' }),
-            ...(status?.operations.filter(item => item.id === dialog.operationId || (dialog.bindingId && item.bindingId === dialog.bindingId)) ?? []).map(operationView)),
+            onboarding && (dialog.batch ? batchView(dialog.batch) : h('div', { style: styles.column }, body('宿主尚未返回逐项结果，仅核对原请求；不会自动生成新请求或重新提交。'),
+              h('div', { style: styles.list, 'aria-label': '等待核对的项目' }, ...(dialog.submittedItems ?? []).map(item => h('div', { key: item.projectId, style: styles.item }, h('strong', null, item.label), root(item.root), body('等待宿主确认')))))),
+            ...(!onboarding ? status?.operations.filter(item => item.id === dialog.operationId || (dialog.bindingId && item.bindingId === dialog.bindingId)) ?? [] : []).map(operationView)),
+          dialog.message && body(dialog.message, { role: 'status' }),
           dialog.stale && body('状态已变更，请刷新列表后重新预览。', { role: 'status' }),
           state.busy && body('处理中…', { role: 'status' }),
           dialog.error && body(dialog.error.message, { role: 'alert', style: { ...styles.body, ...styles.warning } }))));

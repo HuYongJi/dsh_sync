@@ -171,7 +171,7 @@ export class SyncEngine {
     return { version: VERSION, bindingId: this.bindingId, projectId: this.projectId, rootIdentity, accountIdentity: clone(this.accountIdentity), authorizationDigests: [sha256(canonicalJson(this.accountIdentity))], bases: [], capture: null, pending: null, remote: null, retired: [], resolutionReceipts: [], pendingRepair: null, repairReceipts: [], lastResult: { state: 'idle', pendingUpload: 0, pendingDownload: 0, conflicts: 0 } };
   }
   _validateState(input) {
-    if (!object(input) || !Object.keys(input).every(field => ['version', 'bindingId', 'projectId', 'rootIdentity', 'accountIdentity', 'authorizationDigests', 'bases', 'capture', 'pending', 'remote', 'retired', 'resolutionReceipts', 'pendingRepair', 'repairReceipts', 'lastResult', 'lastCheckedAt', 'lastSyncedAt'].includes(field))) throw fail('SYNC_JOURNAL_CORRUPT');
+    if (!object(input) || !Object.keys(input).every(field => ['version', 'bindingId', 'projectId', 'rootIdentity', 'accountIdentity', 'authorizationDigests', 'bases', 'capture', 'pending', 'remote', 'retired', 'resolutionReceipts', 'pendingRepair', 'repairReceipts', 'bootstrap', 'lastResult', 'lastCheckedAt', 'lastSyncedAt'].includes(field))) throw fail('SYNC_JOURNAL_CORRUPT');
     if (input.version !== VERSION || input.bindingId !== this.bindingId || input.projectId !== this.projectId || canonicalJson(input.accountIdentity) !== canonicalJson(this.accountIdentity)) throw fail('SYNC_BINDING_MISMATCH');
     rootRecord(input.rootIdentity, this.root); input.bases = baseRecords(input.bases);
     if (!Array.isArray(input.authorizationDigests) || input.authorizationDigests.length > 1000 || !input.authorizationDigests.includes(sha256(canonicalJson(this.accountIdentity)))) throw fail('SYNC_JOURNAL_CORRUPT');
@@ -212,6 +212,11 @@ export class SyncEngine {
       const repair = input.pendingRepair;
       validateId(repair.requestId); validateId(repair.planId); validateBlobHash(repair.planDigest); validateBlobHash(repair.identityDigest);
       if (repairIds.has(repair.requestId) || !input.pending || !Array.isArray(repair.steps) || repair.steps.length > MAX_SYNC_ENTRIES || repair.steps.some((step, index) => step.index !== index || !['pending', 'creating', 'restored', 'kept', 'ambiguous'].includes(step.phase))) throw fail('SYNC_JOURNAL_CORRUPT');
+    }
+    if (input.bootstrap !== undefined) {
+      const bootstrap = input.bootstrap;
+      if (!object(bootstrap) || Object.keys(bootstrap).some(field => !['requestId', 'digest', 'policyHash', 'phase'].includes(field)) || !['applying', 'completed'].includes(bootstrap.phase)) throw fail('SYNC_JOURNAL_CORRUPT');
+      validateId(bootstrap.requestId); validateBlobHash(bootstrap.digest); validateBlobHash(bootstrap.policyHash);
     }
     const result = input.lastResult;
     if (!['idle', 'scanning', 'offline', 'uploading', 'applying', 'deferred', 'conflicted', 'blocked', 'uncertain', 'synced'].includes(result.state) || ['pendingUpload', 'pendingDownload', 'conflicts'].some(field => !Number.isSafeInteger(result[field]) || result[field] < 0 || result[field] > 40_000) || result.errorCode !== undefined && !safeCodes.has(result.errorCode) && result.errorCode !== 'SYNC_FAILED') throw fail('SYNC_JOURNAL_CORRUPT');
@@ -547,12 +552,132 @@ export class SyncEngine {
     if (status === 'synced' && !pending && !remoteConflicts) this._state.lastSyncedAt = now();
     await this._save(); return this._public();
   }
+  async _refuseUnfinishedBootstrap() {
+    const filename = path.join(this.engineDirectory, 'bootstrap-fence.json');
+    if (!(await exists(filename))) return;
+    const marker = await readJson(filename);
+    if (!object(marker) || marker.version !== 1 || marker.bindingId !== this.bindingId || marker.projectId !== this.projectId) throw fail('SYNC_JOURNAL_CORRUPT');
+    validateId(marker.requestId); validateBlobHash(marker.digest);
+    if (!(await exists(this.filename))) throw fail('SYNC_APPLY_INCOMPLETE');
+    const state = this._validateState(await readJson(this.filename));
+    if (state.bootstrap?.phase !== 'completed' || state.bootstrap.digest !== marker.digest || state.bootstrap.requestId !== marker.requestId) throw fail('SYNC_APPLY_INCOMPLETE');
+  }
+  /** Materialize ONE consent-pinned cloud snapshot into a Host-exclusively-created
+   * root. Never capture local files/archives, reconcile, upload, or commit. An
+   * unfinished bootstrap fences normal run/preview even after process restart.
+   * The Host must durably own rootIdentity before calling this method, and must
+   * not publish a binding until this method and native registration both finish.
+   */
+  async bootstrap({ requestId, head: inputHead, manifest: inputManifest, rootIdentity }) {
+    if (this._active) throw fail('BUSY'); this._active = true;
+    try {
+      validateId(requestId);
+      const head = headRecord(inputHead, this.projectId), manifest = validateSyncManifest(inputManifest);
+      if (!head || head.id !== manifest.id || manifest.projectId !== this.projectId || head.manifestDigest !== syncManifestDigest(manifest)) throw fail('SYNC_INTEGRITY');
+      rootRecord(rootIdentity, this.root); await verifySyncRoot(rootIdentity);
+      const intent = { version: 1, requestId, head, manifest, rootIdentity, accountIdentity: this.accountIdentity };
+      const bytes = Buffer.from(canonicalJson(intent)), digest = sha256(bytes);
+      return await this.store.exclusive(async () => {
+        await this._check('bootstrap-admit');
+        // Admission rejects an existing ordinary engine BEFORE introducing a
+        // fence. Once accepted, this tiny immutable safety marker precedes even
+        // _load/_policy/quota/tree checks; failure cannot leave a capturable root.
+        if (await exists(this.filename)) {
+          const stored = this._validateState(await readJson(this.filename));
+          if (!stored.bootstrap && (stored.capture || stored.remote || stored.bases.length || stored.pending || stored.pendingRepair)) throw fail('SYNC_BINDING_MISMATCH');
+        }
+        const fence = Buffer.from(canonicalJson({ version: 1, bindingId: this.bindingId, projectId: this.projectId, requestId, digest }));
+        const fenceFile = path.join(this.engineDirectory, 'bootstrap-fence.json');
+        try { await writeNewFile(fenceFile, fence); }
+        catch (error) { if (error.code !== 'EEXIST' || !(await readStableFile(fenceFile, 4096)).bytes.equals(fence)) throw fail('SYNC_REQUEST_CONFLICT'); }
+        await this.fault('bootstrap-fenced', intent);
+        await this._load();
+        if (canonicalJson(this._state.rootIdentity) !== canonicalJson(rootIdentity)) throw fail('SYNC_ROOT_CHANGED');
+        const prior = this._state.bootstrap;
+        if (prior && (prior.requestId !== requestId || prior.digest !== digest)) throw fail('SYNC_REQUEST_CONFLICT');
+        if (!prior && (this._state.capture || this._state.remote || this._state.bases.length || this._state.pending || this._state.pendingRepair)) throw fail('SYNC_BINDING_MISMATCH');
+        const policy = await this._policy();
+        if (prior && prior.policyHash !== policy.fingerprint) throw fail('SYNC_POLICY_CHANGED');
+        const files = manifest.files.filter(file => !policy.isExcluded(file.path));
+        const conflicts = manifest.conflicts.filter(item => !policy.isExcluded(item.path));
+        const desired = new Map(files.map(file => [file.path, stateOf(file)])), directories = new Set();
+        for (const file of files) { let parent = path.posix.dirname(file.path); while (parent !== '.') { directories.add(parent); parent = path.posix.dirname(parent); } }
+        // Inventory first, before opening any user-created contents. Only paths
+        // already in the cloud manifest can ever be read here; nothing is spooled.
+        const verifyTree = async complete => {
+          const seen = new Set(); let count = 0;
+          const walk = async (directory, prefix = '') => {
+            await this._guard({ policyHash: policy.fingerprint }, 'bootstrap-verify', true);
+            await assertNoSymlinks(directory);
+            for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
+              if (++count > MAX_SYNC_ENTRIES * 4 + 10) throw fail('SYNC_QUOTA');
+              const relative = prefix ? `${prefix}/${entry.name}` : entry.name, target = path.join(directory, entry.name);
+              if (relative === '.dsh-sync' && this._state.bootstrap) {
+                await assertNoSymlinks(target);
+                if ((await fs.readdir(target)).some(name => name !== 'v2')) throw fail('SYNC_LOCAL_CHANGED');
+                const v2 = path.join(target, 'v2');
+                if (await exists(v2)) { await assertNoSymlinks(v2); if ((await fs.readdir(v2)).some(name => name !== this.bindingId)) throw fail('SYNC_LOCAL_CHANGED'); }
+                continue;
+              }
+              if (entry.isDirectory() && directories.has(relative)) { await walk(target, relative); continue; }
+              if (!entry.isFile() || !desired.has(relative)) throw fail('SYNC_LOCAL_CHANGED');
+              if (!equal(await readSyncFile(this.root, relative, desired.get(relative)), desired.get(relative))) throw fail('SYNC_LOCAL_CHANGED');
+              seen.add(relative);
+            }
+          };
+          await walk(this.root);
+          if (complete && seen.size !== files.length) throw fail('SYNC_LOCAL_CHANGED');
+          await this._guard({ policyHash: policy.fingerprint }, 'bootstrap-verified', true);
+        };
+        if (!prior) {
+          if ((await fs.readdir(this.root)).length) throw fail('SYNC_LOCAL_CHANGED');
+          await this._space(bytes.length);
+          const filename = path.join(this.engineDirectory, 'bootstrap.json');
+          try { await writeNewFile(filename, bytes); this._engineBytes += bytes.length; }
+          catch (error) { if (error.code !== 'EEXIST' || !(await readStableFile(filename, MAX_STATE_BYTES)).bytes.equals(bytes)) throw error; }
+          this._state.bootstrap = { requestId, digest, policyHash: policy.fingerprint, phase: 'applying' };
+          await this._save();
+        } else if (!(await readStableFile(path.join(this.engineDirectory, 'bootstrap.json'), MAX_STATE_BYTES)).bytes.equals(bytes)) throw fail('SYNC_JOURNAL_CORRUPT');
+        await verifyTree(prior?.phase === 'completed');
+        if (prior?.phase === 'completed') return this._public();
+        const client = await this._connect();
+        const remote = validateSyncManifest(await client.syncCheckpoint(this.projectId, head.id, head.manifestDigest));
+        if (syncManifestDigest(remote) !== head.manifestDigest) throw fail('SYNC_INTEGRITY');
+        await this._guard({ policyHash: policy.fingerprint }, 'bootstrap-download', true);
+        const descriptor = { policyHash: policy.fingerprint };
+        const applier = await this._applier(descriptor), getBlob = (hash, size) => this._getBlob(descriptor, hash, size);
+        await applier.preserveVariants(conflicts, getBlob);
+        await applier.prepare({ id: requestId, remoteReceipt: head, operations: files.map(file => ({ path: file.path, expected: null, desired: stateOf(file) })) }, getBlob);
+        await verifyTree(false);
+        const result = await applier.apply(requestId);
+        if (result.state !== 'applied') throw fail(result.errorCode || 'SYNC_APPLY_INCOMPLETE');
+        await applier.finalize(requestId);
+        await verifyTree(true); await this.fault('bootstrap-before-baseline', intent);
+        await verifyTree(true);
+        const active = new Map(conflicts.map(item => [item.path, item]));
+        this._state.bases = files.map(file => active.has(file.path)
+          ? { path: file.path, state: null, conflictId: active.get(file.path).id, preservedState: stateOf(file) }
+          : { path: file.path, state: stateOf(file) });
+        for (const conflict of conflicts) if (!desired.has(conflict.path)) this._state.bases.push({ path: conflict.path, state: null, conflictId: conflict.id, preservedState: null });
+        for (const tombstone of manifest.tombstones) if (!policy.isExcluded(tombstone.path) && !desired.has(tombstone.path) && !active.has(tombstone.path)) this._state.bases.push({ path: tombstone.path, state: null });
+        this._state.remote = { head, manifest }; this._state.lastCheckedAt = now();
+        this._state.bootstrap.phase = 'completed';
+        return await this._result(conflicts.length ? 'conflicted' : 'synced');
+      });
+    } catch (error) {
+      const code = safeCode(error);
+      if (this._state) try { await this._result('blocked', code); } catch { /* Durable applying marker remains a capture fence. */ }
+      throw fail(code);
+    } finally { this._active = false; }
+  }
   async preview() {
     if (this._active) throw fail('BUSY'); this._active = true;
     try {
       await this._check('preview');
       return await this.store.exclusive(async () => {
-        await this._load(); const scan = await this._capture({ archives: !this._state.pending?.receipt }); await this._connect(); const remote = await this._remote();
+        await this._refuseUnfinishedBootstrap(); await this._load();
+        if (this._state.bootstrap && this._state.bootstrap.phase !== 'completed') throw fail('SYNC_APPLY_INCOMPLETE');
+        const scan = await this._capture({ archives: !this._state.pending?.receipt }); await this._connect(); const remote = await this._remote();
         await scan.verify();
         const plan = remote.migrationRequired ? null : this._plan(scan, remote);
         return { previewId: randomUUID(), bindingId: this.bindingId, projectId: this.projectId, rootIdentity: clone(scan.rootIdentity), policyHash: scan.policyHash, head: clone(remote.head), migrationRequired: remote.migrationRequired, summary: plan?.summary || { upload: 0, download: 0, delete: 0, conflicts: 0, blocked: 1 }, ...this._archiveStatus() };
@@ -567,7 +692,8 @@ export class SyncEngine {
       await this._check('run');
       return await this.store.exclusive(async () => {
         try {
-          await this._load();
+          await this._refuseUnfinishedBootstrap(); await this._load();
+          if (this._state.bootstrap && this._state.bootstrap.phase !== 'completed') return this._result('blocked', 'SYNC_APPLY_INCOMPLETE');
           if (this._state.pendingRepair) return this._result('blocked', 'SYNC_REPAIR_INCOMPLETE');
           let scan = await this._capture({ archives: !this._state.pending?.receipt }); // Local durability precedes ANY new network request; native archives wait for accepted recovery.
           if (this._state.pending) {
