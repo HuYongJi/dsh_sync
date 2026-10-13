@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { LocalStore } from '../src/local-store.mjs';
 import { createExclusionPolicy, readExclusionPolicy } from '../src/snapshot.mjs';
 import { sha256, validateManifest } from '../src/protocol.mjs';
-import { runCli } from '../src/cli.mjs';
+import { SyncClient } from '../src/client.mjs';
 import { createController } from '../plugin/controller.mjs';
 
 const base = path.resolve(fileURLToPath(new URL('../.test-tmp/', import.meta.url)));
@@ -158,38 +158,38 @@ test('legacy dynamic Host literal exclusions invalidate validation before each n
   assert.equal(error.code, 'PROTECTED_QUEUE'); assert.equal(sends, 1); assert.deepEqual(await savedQueue(f.store), before);
 });
 
-test('legacy CLI retry checks current ignore policies for all queued projects before any request', async t => {
+test('internal legacy retry checks current ignore policies for all queued projects before any request', async t => {
   const f = await fixture(t), cloud = await f.loopback();
   const other = path.join(f.directory, 'other'); await fs.mkdir(other);
   await syntheticQueue(f.store, f.root, { id: 'queue-a', files: [['public.txt', 'safe']] });
   await syntheticQueue(f.store, other, { id: 'queue-b', project: 'other-project', files: [['private.txt', 'forbidden']] });
   await fs.writeFile(path.join(other, '.dsh-syncignore'), 'private.txt\n');
   await f.store.saveConfig({ server: cloud.server, token: 's'.repeat(43), deviceId });
-  const before = await savedQueue(f.store), outputs = [];
-  const error = await caught(runCli(['retry', '--state', f.store.directory], { output: item => outputs.push(item) }));
+  const before = await savedQueue(f.store);
+  const error = await caught(f.store.flush(new SyncClient(await f.store.config())));
   assert.equal(error.code, 'PROTECTED_QUEUE'); assert.deepEqual(cloud.requests, []); assert.deepEqual(await savedQueue(f.store), before);
-  assert.equal(outputs[0].incomplete, true); assert.deepEqual(outputs[0].uploaded, []); assert.ok(!JSON.stringify(outputs).includes('forbidden'));
+  assert.deepEqual(error.results, []); assert.ok(!JSON.stringify(error.results).includes('forbidden'));
 });
 
-test('legacy CLI retry cannot upload state directories whose names contain glob syntax', async t => {
+test('internal legacy retry cannot upload state directories whose names contain glob syntax', async t => {
   const f = await fixture(t, { insideState: true }), cloud = await f.loopback();
   await syntheticQueue(f.store, f.root, { id: 'legacy-state-queue', files: [['public.txt', 'safe'], ['state[1]/private.txt', 'STATE-MUST-NOT-SEND']] });
   await f.store.saveConfig({ server: cloud.server, token: 's'.repeat(43), deviceId });
   const before = await savedQueue(f.store);
-  await assert.rejects(runCli(['retry', '--state', f.store.directory, '--project', projectId], { output: () => {} }), { code: 'PROTECTED_QUEUE' });
+  await assert.rejects(f.store.flush(new SyncClient(await f.store.config()), projectId), { code: 'PROTECTED_QUEUE' });
   assert.deepEqual(cloud.requests, []); assert.deepEqual(await savedQueue(f.store), before);
 });
 
-test('legacy CLI retry rereads ignore policy during loopback upload instead of trusting its initial scan', async t => {
+test('internal legacy retry rereads ignore policy during loopback upload instead of trusting its initial scan', async t => {
   const f = await fixture(t); await fs.writeFile(path.join(f.root, 'z-private.txt'), 'must-stay-local'); await capture(f, 'safe');
   const cloud = await f.loopback(async entry => {
     if (entry.method === 'PUT') await fs.writeFile(path.join(f.root, '.dsh-syncignore'), 'z-private.txt\n');
   });
   await f.store.saveConfig({ server: cloud.server, token: 's'.repeat(43), deviceId });
-  const before = await savedQueue(f.store), outputs = [];
-  await assert.rejects(runCli(['retry', '--state', f.store.directory], { output: item => outputs.push(item) }), { code: 'PROTECTED_QUEUE' });
+  const before = await savedQueue(f.store);
+  const error = await caught(f.store.flush(new SyncClient(await f.store.config()))); assert.equal(error.code, 'PROTECTED_QUEUE');
   assert.equal(cloud.requests.length, 1); assert.equal(cloud.requests[0].bytes.toString(), 'safe');
-  assert.equal(outputs[0].incomplete, true); assert.deepEqual(await savedQueue(f.store), before);
+  assert.deepEqual(error.results, []); assert.deepEqual(await savedQueue(f.store), before);
 });
 
 test('legacy flush reports earlier commits when a later upload fails', async t => {
@@ -239,16 +239,16 @@ for (const rejection of ['uncertain', 'definitive', 'malformed-ack']) {
   });
 }
 
-test('legacy CLI partial output contains confirmed IDs and uncertain outcome but no remote acknowledgement extras', async t => {
+test('internal legacy loopback retry retains confirmed IDs and uncertainty without remote acknowledgement extras', async t => {
   const f = await fixture(t), first = await capture(f, 'one'), second = await capture(f, 'two');
   const cloud = await f.loopback(async (entry, response) => {
     if (entry.method === 'POST' && JSON.parse(entry.bytes).id === second.queuedId) { response.destroy(); return true; }
   });
   await f.store.saveConfig({ server: cloud.server, token: 's'.repeat(43), deviceId });
-  const outputs = [], error = await caught(runCli(['retry', '--state', f.store.directory], { output: item => outputs.push(item) }));
-  assert.deepEqual(error.results, [ack(first.manifest)]); assert.equal(outputs.length, 1);
-  assert.deepEqual(outputs[0].uploaded, [ack(first.manifest)]); assert.equal(outputs[0].outcomes[1].status, 'commit-uncertain');
-  assert.ok(!JSON.stringify(outputs).includes('REMOTE-EXTRA')); assert.ok(!JSON.stringify(outputs).includes('s'.repeat(43)));
+  const error = await caught(f.store.flush(new SyncClient(await f.store.config())));
+  assert.deepEqual(error.results, [ack(first.manifest)]); assert.equal(error.outcomes[1].status, 'commit-uncertain');
+  const publicOutcome = JSON.stringify({ results: error.results, outcomes: error.outcomes });
+  assert.ok(!publicOutcome.includes('REMOTE-EXTRA')); assert.ok(!publicOutcome.includes('s'.repeat(43)));
 });
 
 test('legacy offline controller ticks capture each current idle checkpoint before a failed network flush', async t => {

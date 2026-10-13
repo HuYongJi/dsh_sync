@@ -87,7 +87,7 @@ test('logged-out settings can explicitly check then submit one immutable native 
   assert.equal(f.installs[0].spec, `${repository}#${sha}`);
   assert.deepEqual(f.installs[0].options, { requestId: intent.requestId, enabled: true });
   assert.equal(await f.ui.confirmUpdate(intent), false);
-  assert.equal(f.ui.prepareRestore(), null);
+  assert.equal(f.ui.prepareRestore, undefined);
   assert.equal(f.actions.some(item => ['sync', 'restore', 'import', 'login'].includes(item.action)), false);
   f.released.resolve(); await f.updates.drain(); await f.ui.refreshUpdate();
   const update = f.ui.getSnapshot().update;

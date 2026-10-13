@@ -325,7 +325,7 @@ test('native RPC envelopes correlate replies and reject cross-method or malforme
     const response = await f.bridge.fetch('status', nativeRequest('status', {}, { body: JSON.stringify(value) }));
     assert.equal(response.status, 400);
   }
-  const bad = await rpc(f.bridge, 'preferences', { revision: 0, autoSync: false, projectIds: [], unexpectedPassword: 'synthetic-SECRET' });
+  const bad = await rpc(f.bridge, 'status', { unexpectedPassword: 'synthetic-SECRET' });
   assert.equal(bad.response.status, 200); assert.equal(bad.result.ok, false); assert.equal(bad.result.error.code, 'BAD_REQUEST');
   assert.ok(!JSON.stringify(bad.body).includes('synthetic-SECRET'));
 });
@@ -346,7 +346,7 @@ test('HTTP bridge redacts arbitrary exceptions and clears password from parsed p
   assert.equal(result.ok, false); assert.equal(payload.password, '');
   assert.ok(!JSON.stringify(body).includes('do-not-leak'));
 });
-test('production Client state, Host RPC and real HTTP cloud complete the settings-only workflow', async t => {
+test('account Client RPC stays public while explicit internal legacy helpers retain loopback sync compatibility', async t => {
   const { createController: createUiController } = await import('../client/state.mjs');
   let entered; const started = new Promise(resolve => { entered = resolve; });
   const f = await fixture(t, { exportSessions: async () => { entered(); return { sessions: [], assets: [], skipped: [], verifyUnchanged: async () => {} }; } });
@@ -361,21 +361,25 @@ test('production Client state, Host RPC and real HTTP cloud complete the setting
   t.after(() => ui.dispose());
   assert.equal(await ui.refresh(), true); assert.equal(ui.getSnapshot().status.loggedIn, false);
   assert.equal(await ui.login({ server, username: 'owner', password }), true);
-  ui.setProject('workspace-a', true); assert.equal(await ui.savePreferences(), true);
+  // These are deliberate compatibility calls, never a Client/RPC backdoor.
+  const loggedIn = await f.service.status();
+  await f.service.savePreferences({ revision: loggedIn.revision, autoSync: false, projectIds: ['workspace-a'] });
   assert.equal(actions.includes('sync'), false, 'login/save must not upload');
-  assert.equal(await ui.sync(), true); await started; await f.controller.drain(); await ui.refresh();
-  const snapshot = ui.getSnapshot(); assert.equal(snapshot.status.pending, 0); assert.equal(snapshot.status.lastResult.ok, true);
-  assert.deepEqual(snapshot.status.projects.filter(item => item.selected).map(item => item.id), ['workspace-a']);
+  assert.equal(actions.includes('preferences'), false, 'legacy preferences are no longer public');
+  assert.equal((await f.service.sync()).scheduled, true); await started; await f.controller.drain(); await ui.refresh();
+  const internal = await f.service.status(); assert.equal(internal.pending, 0); assert.equal(internal.lastResult.ok, true);
+  assert.deepEqual(internal.projects.filter(item => item.selected).map(item => item.id), ['workspace-a']);
   const client = new SyncClient(f.records.get(f.controller.credentialKey).payload);
-  assert.equal((await client.list(snapshot.status.projects.find(item => item.selected).projectId)).checkpoints.length, 1);
-  assert.ok(!JSON.stringify(snapshot).includes(password));
+  assert.equal((await client.list(internal.projects.find(item => item.selected).projectId)).checkpoints.length, 1);
+  assert.ok(!JSON.stringify(ui.getSnapshot()).includes(password));
+  assert.ok(actions.every(action => ['status', 'login', 'logout'].includes(action)));
   assert.equal(await ui.logout(), true); assert.equal(ui.getSnapshot().status.loggedIn, false);
 });
 
 test('exact streaming routes do not replace the native /api gateway or claim to implement admission', () => {
   const routes = [], bridge = createSettingsHttp({});
   registerSettingsRoutes({ connection: { fetch: { register: value => routes.push(value) } } }, bridge);
-  assert.equal(routes.length, 40); assert.ok(routes.every(route => route.requestBody === 'streaming' && route.path.startsWith(SETTINGS_API)));
+  assert.equal(routes.length, 26); assert.ok(routes.every(route => route.requestBody === 'streaming' && route.path.startsWith(SETTINGS_API)));
   assert.deepEqual(routes.find(route => route.path.endsWith('/status')).methods, ['POST']);
   assert.ok(routes.filter(route => !route.path.endsWith('/status')).every(route => route.methods.length === 1 && route.methods[0] === 'POST'));
 });

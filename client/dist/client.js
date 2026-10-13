@@ -6,10 +6,10 @@ window.__ModuleLoader__.load({
     "use strict";
 const __clientModules = Object.create(null);
 __clientModules["./state.mjs"] = (() => {
-// Framework-free personal-sync state. Only the DSH Connection may carry requests.
+// Account and native-updater state only. Project operations belong to the bidirectional controller.
 const RPC_CHANNEL = '/api';
 const RPC_PREFIX = 'dsh-personal-sync/';
-const CLIENT_ACTIONS = Object.freeze(['status', 'login', 'password', 'preferences', 'sync', 'logout', 'projects', 'checkpoints', 'destinationpick', 'destinationbrowse', 'destinationselect', 'restore', 'import', 'updatestatus', 'checkupdate', 'installupdate', 'cancelupdate', 'downloadpick', 'downloadbrowse', 'downloadselect', 'downloadstart', 'registerproject']);
+const CLIENT_ACTIONS = Object.freeze(['status', 'login', 'password', 'logout', 'updatestatus', 'checkupdate', 'installupdate', 'cancelupdate']);
 
 const MESSAGES = Object.freeze({
   BAD_SERVER: '服务器地址无效',
@@ -42,9 +42,6 @@ const MESSAGES = Object.freeze({
   SERVER_UNAVAILABLE: '无法连接同步服务器',
   ACCOUNT_BOUND: '同步记录已绑定其他账号',
   ACCOUNT_MISMATCH: '服务器或账号已变更',
-  PROJECT_NOT_SELECTED: '请先保存项目选择',
-  PROJECTS_UNAVAILABLE: '项目列表不可用',
-  PROTECTED_QUEUE: '受保护队列已保留，不会上传',
   SETTINGS_CORRUPT: '同步设置损坏',
   SETTINGS_FAILED: '同步设置保存失败',
   SERVER_UNREACHABLE: '无法连接同步服务器',
@@ -52,33 +49,8 @@ const MESSAGES = Object.freeze({
   REQUEST_TOO_LARGE: '请求过大',
   UNSUPPORTED_MEDIA_TYPE: '请求格式不兼容',
   RATE_LIMITED: '请求过于频繁，请稍后再试',
-  PROJECT_UNAVAILABLE: '项目不可用',
-  UNKNOWN_PROJECT: '项目已变更，请刷新',
-  NO_PROJECTS: '请先选择并保存可用项目',
-  UNSAVED_CHANGES: '请先保存或撤销更改',
   TIMEOUT: '请求超时，请刷新状态',
   REQUEST_FAILED: '请求失败，请刷新状态',
-  CLOUD_BROWSE_UNSUPPORTED: '请更新同步服务器',
-  PROJECTS_PARTIAL: '部分项目读取失败',
-  DIRECTORY_PICKER_UNAVAILABLE: '此宿主不支持选择文件夹',
-  DIRECTORY_PICKER_FAILED: '文件夹选择失败',
-  DIRECTORY_PICKER_EXPIRED: '请重新选择文件夹',
-  DESTINATION_CHANGED: '目标目录已变更，请重新选择',
-  BAD_DESTINATION: '请选择有效目标文件夹',
-  DESTINATION_EXISTS: '目标目录已存在，请选择全新目录',
-  PROTECTED_DESTINATION: '目标目录受保护，不能下载到此处',
-  CHECKPOINT_MISMATCH: '云端内容与项目不匹配',
-  CLOUD_PROJECT_EMPTY: '云端暂无内容',
-  RESTORE_FAILED: '下载未完成，目标目录可能不完整，请检查后使用新目录',
-  IMPORT_FAILED: '导入未全部完成，请检查结果，勿重复导入',
-  RECOVERY_UNAVAILABLE: '恢复功能或安全会话导入不可用',
-  RECOVERY_LIMIT: '恢复记录达到限制，请检查已有结果',
-  RECOVERY_STATE_CORRUPT: '恢复记录无法安全读取，请检查本机状态',
-  PROJECT_REGISTRATION_UNCERTAIN: '项目登记结果未确认，请核对 DSH 项目列表',
-  DOWNLOAD_LIMIT: '一次最多下载20个项目',
-  DOWNLOAD_CANCELLED: '下载已停止，未完成的目录请另行检查',
-  DOWNLOAD_FINALIZATION_FAILED: '文件已下载，状态清理未完成',
-  RECOVERY_UNCERTAIN: '请求结果未确认，请刷新状态；勿重复下载或导入',
   BAD_REQUEST_ID: '无法生成安全请求 ID，请升级浏览器',
   UPDATE_UNAVAILABLE: '此宿主不支持原生插件更新，请检查 DSH Plugins',
   UPDATE_UNMANAGED: '此插件未由原生插件管理器管理，请检查 DSH Plugins',
@@ -156,141 +128,11 @@ function optionalText(value, max = 1024) {
 
 const validId = value => typeof value === 'string' && /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,99}$/.test(value) && !['constructor', 'prototype', '__proto__'].includes(value.toLowerCase());
 const validRequestId = value => typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
-const absolutePath = value => text(value, 4096, false) && (value.startsWith('/') || /^[a-z]:[\\/]/i.test(value) || /^\\\\[^\\/]+[\\/][^\\/]+/.test(value));
-const sameBinding = (a, b) => Boolean(a && b && a.revision === b.revision && a.server === b.server && a.username === b.username);
-const bindingOf = status => freeze({ revision: status.revision, server: status.server, username: status.username });
-function validateBinding(status, binding) {
-  if (!status?.loggedIn || !status.server || !status.username) fail('NOT_LOGGED_IN');
-  if (!binding || binding.server !== status.server || binding.username !== status.username) fail('ACCOUNT_MISMATCH');
-  if (!integer(binding.revision) || binding.revision !== status.revision) fail('CONFIG_CONFLICT');
-  return bindingOf(status);
-}
 function requiredDate(value) {
   if (typeof value !== 'string' || optionalDate(value) !== value || new Date(value).toISOString() !== value) fail('INVALID_RESPONSE');
   return value;
 }
 
-/** Only validated folder labels and public metadata survive the Host boundary. */
-function parseCloudProjects(value) {
-  if (!isRecord(value) || !Array.isArray(value.projects) || value.projects.length > 20000 || ['partial', 'legacy'].some(key => value[key] !== undefined && typeof value[key] !== 'boolean')) fail('INVALID_RESPONSE');
-  const ids = new Set();
-  return freeze(value.projects.map(item => {
-    if (!isRecord(item) || !validId(item.projectId) || ids.has(item.projectId) || !integer(item.checkpointCount)) fail('INVALID_RESPONSE');
-    ids.add(item.projectId);
-    const latestCreatedAt = item.latestCreatedAt === null && item.checkpointCount === 0 ? null : requiredDate(item.latestCreatedAt);
-    if ((item.label !== undefined && !text(item.label, 1024, false)) || (item.sourceRoot !== undefined && !absolutePath(item.sourceRoot))) fail('INVALID_RESPONSE');
-    return freeze({ projectId: item.projectId, checkpointCount: item.checkpointCount, latestCreatedAt,
-      ...(item.label === undefined ? {} : { label: item.label }), ...(item.sourceRoot === undefined ? {} : { sourceRoot: item.sourceRoot }) });
-  }));
-}
-function parseDestination(value) {
-  if (!isRecord(value) || !validId(value.id) || !absolutePath(value.root) || !absolutePath(value.parent) || value.root === value.parent) fail('INVALID_RESPONSE');
-  return freeze({ id: value.id, root: value.root, parent: value.parent });
-}
-function parseDirectoryBrowser(value) {
-  if (!isRecord(value) || !validId(value.id) || !absolutePath(value.path) || !validId(value.currentId) || typeof value.selectable !== 'boolean' || typeof value.truncated !== 'boolean') fail('INVALID_RESPONSE');
-  const rows = (items, cap) => {
-    if (!Array.isArray(items) || items.length > cap) fail('INVALID_RESPONSE');
-    const ids = new Set();
-    return freeze(items.map(item => {
-      if (!isRecord(item) || !validId(item.id) || ids.has(item.id) || !text(item.label, 1024, false)) fail('INVALID_RESPONSE');
-      ids.add(item.id); return freeze({ id: item.id, label: item.label });
-    }));
-  };
-  return freeze({ id: value.id, path: value.path, currentId: value.currentId, crumbs: rows(value.crumbs, 256), directories: rows(value.directories, 2000), selectable: value.selectable, truncated: value.truncated });
-}
-function parseDestinationReply(value, action) {
-  if (!isRecord(value) || (value.cancelled !== undefined && value.cancelled !== true) || ['cancelled', 'destination', 'browser'].filter(key => Object.hasOwn(value, key)).length !== 1) fail('INVALID_RESPONSE');
-  if (value.cancelled === true && action === 'destinationpick') return freeze({ cancelled: true });
-  if (value.destination !== undefined && action !== 'destinationbrowse') return freeze({ destination: parseDestination(value.destination) });
-  if (value.browser !== undefined && action !== 'destinationselect') return freeze({ browser: parseDirectoryBrowser(value.browser) });
-  fail('INVALID_RESPONSE');
-}
-function parseCheckpoints(value, projectId) {
-  if (!validId(projectId) || !isRecord(value) || !Array.isArray(value.checkpoints) || value.checkpoints.length > 20000 || !Array.isArray(value.heads)) fail('INVALID_RESPONSE');
-  const ids = new Set();
-  const checkpoints = value.checkpoints.map(item => {
-    if (!isRecord(item) || !validId(item.id) || ids.has(item.id) || item.projectId !== projectId || !validId(item.deviceId) || !(item.parentId === null || validId(item.parentId)) || item.parentId === item.id || !integer(item.fileCount) || !integer(item.totalBytes)) fail('INVALID_RESPONSE');
-    ids.add(item.id);
-    return freeze({ id: item.id, projectId, deviceId: item.deviceId, parentId: item.parentId, createdAt: requiredDate(item.createdAt), fileCount: item.fileCount, totalBytes: item.totalBytes });
-  });
-  if (value.heads.some(id => !validId(id) || !ids.has(id)) || new Set(value.heads).size !== value.heads.length) fail('INVALID_RESPONSE');
-  return freeze({ checkpoints: freeze(checkpoints), heads: freeze([...value.heads]) });
-}
-function parseRecovery(value) {
-  if (!isRecord(value) || !validId(value.id) || !['restore', 'import'].includes(value.kind) || !['running', 'succeeded', 'failed'].includes(value.state) || !absolutePath(value.root)) fail('INVALID_RESPONSE');
-  const result = { id: value.id, kind: value.kind, state: value.state, root: value.root };
-  if (value.checkpointId !== undefined) { if (!validId(value.checkpointId)) fail('INVALID_RESPONSE'); result.checkpointId = value.checkpointId; }
-  for (const key of ['sessionCount', 'importedCount', 'skippedCount', 'failedCount']) {
-    if (value[key] !== undefined) { if (!integer(value[key])) fail('INVALID_RESPONSE'); result[key] = value[key]; }
-  }
-  if (value.errorCode !== undefined) {
-    if (typeof value.errorCode !== 'string' || !Object.hasOwn(MESSAGES, value.errorCode)) fail('INVALID_RESPONSE');
-    result.errorCode = value.errorCode;
-  }
-  if (value.sessions !== undefined) {
-    if (!Array.isArray(value.sessions) || value.sessions.length > 20000) fail('INVALID_RESPONSE');
-    const sources = new Set();
-    result.sessions = freeze(value.sessions.map(item => {
-      if (!isRecord(item) || !validId(item.sourceId) || sources.has(item.sourceId) || !['imported', 'skipped', 'failed'].includes(item.outcome) || (item.sessionId !== undefined && !validId(item.sessionId)) || (item.workspaceAttached !== undefined && typeof item.workspaceAttached !== 'boolean')) fail('INVALID_RESPONSE');
-      sources.add(item.sourceId);
-      return freeze({ sourceId: item.sourceId, outcome: item.outcome, ...(item.sessionId === undefined ? {} : { sessionId: item.sessionId }), ...(item.workspaceAttached === undefined ? {} : { workspaceAttached: item.workspaceAttached }) });
-    }));
-  }
-  return freeze(result);
-}
-/** Registration only describes a trusted completed restore; no caller path crosses RPC. */
-function parseProjectRegistration(value) {
-  if (!isRecord(value) || !validId(value.restoreId) || !validId(value.requestId) || !absolutePath(value.root) || typeof value.registered !== 'boolean') fail('INVALID_RESPONSE');
-  if (value.workspaceId !== undefined && !text(value.workspaceId, 256, false)) fail('INVALID_RESPONSE');
-  if (value.registered && (value.workspaceId === undefined || value.uncertain !== undefined || value.errorCode !== undefined)) fail('INVALID_RESPONSE');
-  if (!value.registered && (value.uncertain !== true || value.errorCode !== 'PROJECT_REGISTRATION_UNCERTAIN')) fail('INVALID_RESPONSE');
-  return freeze({ restoreId: value.restoreId, requestId: value.requestId, root: value.root, registered: value.registered,
-    ...(value.workspaceId === undefined ? {} : { workspaceId: value.workspaceId }),
-    ...(value.registered ? {} : { uncertain: true, errorCode: 'PROJECT_REGISTRATION_UNCERTAIN' }) });
-}
-
-/** Batch DTOs remain descriptive: only Host-issued destination IDs authorize writes. */
-const downloadPathKey = path => /^[a-z]:|^\\\\/i.test(path) ? path.replaceAll('\\', '/').replace(/\/+$/, '').toLowerCase() : path.replace(/\/+$/, '');
-const unpinnedDownload = value => isRecord(value) && !['checkpointId', 'checkpoint', 'checkpoints', 'heads', 'versionMode', 'versionId'].some(key => Object.hasOwn(value, key));
-const validDownloadSelection = rows => Array.isArray(rows) && rows.length > 0 && rows.length <= 20 && new Set(rows.map(row => row?.projectId)).size === rows.length && rows.every(row => unpinnedDownload(row) && validId(row.projectId));
-function parseDownloadPlan(value, selected) {
-  if (!unpinnedDownload(value) || value.latest !== true || !absolutePath(value.parent) || !Array.isArray(value.destinations) || !validDownloadSelection(selected) || value.destinations.length !== selected.length) fail('INVALID_RESPONSE');
-  const projects = new Set(), ids = new Set(), roots = new Set();
-  const parentKey = downloadPathKey(value.parent);
-  const destinations = value.destinations.map(item => {
-    if (!unpinnedDownload(item) || !validId(item.projectId) || !text(item.label, 1024, false) || !selected.some(row => row.projectId === item.projectId)) fail('INVALID_RESPONSE');
-    const destination = parseDestination(item);
-    const rootKey = downloadPathKey(destination.root);
-    const child = rootKey.slice(parentKey.length + 1);
-    if (downloadPathKey(destination.parent) !== parentKey || !rootKey.startsWith(parentKey + '/') || !child || child.includes('/') || ['.', '..'].includes(child) || projects.has(item.projectId) || ids.has(item.id) || roots.has(rootKey)) fail('INVALID_RESPONSE');
-    projects.add(item.projectId); ids.add(item.id); roots.add(rootKey);
-    return freeze({ ...destination, projectId: item.projectId, label: item.label });
-  });
-  return freeze({ latest: true, parent: value.parent, destinations: freeze(destinations) });
-}
-function parseDownloadStatus(value) {
-  if (!isRecord(value) || (Object.hasOwn(value, 'latest') && value.latest !== true) || !validId(value.id) || !['running', 'succeeded', 'partial', 'failed'].includes(value.state) || !integer(value.completed) || !integer(value.total) || !value.total || value.total > 20 || !Array.isArray(value.items) || value.items.length !== value.total) fail('INVALID_RESPONSE');
-  const projects = new Set(), restores = new Set(), roots = new Set();
-  const items = value.items.map(item => {
-    if (!isRecord(item) || !validId(item.projectId) || !validId(item.checkpointId) || !validId(item.restoreId) || !absolutePath(item.root) || !text(item.label, 1024, false) || !['pending', 'running', 'succeeded', 'failed', 'cancelled'].includes(item.state) || typeof item.canImport !== 'boolean' || projects.has(item.projectId) || restores.has(item.restoreId) || roots.has(downloadPathKey(item.root))) fail('INVALID_RESPONSE');
-    projects.add(item.projectId); restores.add(item.restoreId); roots.add(downloadPathKey(item.root));
-    const result = { projectId: item.projectId, checkpointId: item.checkpointId, restoreId: item.restoreId, root: item.root, label: item.label, state: item.state, canImport: item.canImport };
-    if (item.sessionCount !== undefined) { if (!integer(item.sessionCount)) fail('INVALID_RESPONSE'); result.sessionCount = item.sessionCount; }
-    if (item.errorCode !== undefined) { if (typeof item.errorCode !== 'string' || !Object.hasOwn(MESSAGES, item.errorCode)) fail('INVALID_RESPONSE'); result.errorCode = item.errorCode; }
-    if (item.importResult !== undefined) {
-      result.importResult = parseRecovery(item.importResult);
-      if (result.importResult.kind !== 'import' || result.importResult.root !== item.root || item.state !== 'succeeded' || item.canImport) fail('INVALID_RESPONSE');
-    }
-    if (item.canImport && (item.state !== 'succeeded' || item.sessionCount === 0)) fail('INVALID_RESPONSE');
-    return freeze(result);
-  });
-  const completed = items.filter(item => ['succeeded', 'failed', 'cancelled'].includes(item.state)).length;
-  const successes = items.filter(item => item.state === 'succeeded').length;
-  if (value.completed !== completed || (value.state !== 'running' && completed !== value.total) || (value.state === 'succeeded' && successes !== value.total) || (value.state === 'partial' && (!successes || successes === value.total)) || (value.state === 'failed' && successes)) fail('INVALID_RESPONSE');
-  if (value.warningCode !== undefined && value.warningCode !== 'DOWNLOAD_FINALIZATION_FAILED') fail('INVALID_RESPONSE');
-  return freeze({ id: value.id, ...(value.latest === true ? { latest: true } : {}), state: value.state, completed, total: value.total, items: freeze(items), ...(value.warningCode === undefined ? {} : { warningCode: value.warningCode }) });
-}
 const UPDATE_STATES = freeze(['idle', 'checking', 'available', 'up-to-date', 'installing', 'cancelling', 'restart-required', 'cancelled', 'failed', 'uncertain']);
 const UPDATE_ERRORS = freeze(['UPDATE_UNAVAILABLE', 'UPDATE_UNMANAGED', 'UPDATE_CHECK_FAILED', 'UPDATE_INVALID_METADATA', 'UPDATE_CHECK_REQUIRED', 'UPDATE_NOT_NEWER', 'UPDATE_BUILD_APPROVAL_REQUIRED', 'UPDATE_INCOMPATIBLE', 'UPDATE_FAILED', 'UPDATE_UNCERTAIN', 'UPDATE_CANCEL_TOO_LATE', 'UPDATE_RESTART_REQUIRED', 'BAD_REQUEST', 'BUSY', 'DISPOSED', 'RATE_LIMITED']);
 const validVersion = value => typeof value === 'string' && /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(value) && value.split('.').every(part => integer(Number(part)));
@@ -327,51 +169,21 @@ function parseUpdateStatus(value) {
   return freeze(result);
 }
 
-const downloadDestinationAction = action => ['downloadpick', 'downloadbrowse', 'downloadselect'].includes(action);
-const destinationAction = action => ['destinationpick', 'destinationbrowse', 'destinationselect'].includes(action) || downloadDestinationAction(action);
-const clearedDownloadPlan = () => ({ downloadPlan: null, downloadBrowser: null, downloadIntent: null });
-const newDownload = () => ({ downloadSelection: freeze([]), ...clearedDownloadPlan(), downloadPending: null, downloadUncertain: false, downloadError: null });
-const clearedDestination = cloud => freeze({ ...cloud, destination: '', destinationId: '', directoryBrowser: null, intent: null });
-function newCloud() {
-  return clearedDestination({ binding: null, projects: freeze([]), projectsLoaded: false, partial: false, legacy: false, projectId: '', checkpoints: freeze([]), heads: freeze([]), checkpointId: '', loaded: false, browseUnsupported: false, error: null });
-}
-
-/** Allowlist the public contract. Extra fields (including credentials) are discarded. */
+/** Only account and updater metadata survive this boundary. Legacy status fields are ignored. */
 function parseStatus(value) {
-  if (!isRecord(value) || !integer(value.revision) || typeof value.loggedIn !== 'boolean' || typeof value.running !== 'boolean' || !integer(value.pending) || !integer(value.intervalMs) || value.intervalMs < 1 || (value.autoSync !== undefined && typeof value.autoSync !== 'boolean') || !Array.isArray(value.projects) || value.projects.length > 20000) fail('INVALID_RESPONSE');
+  if (!isRecord(value) || !integer(value.revision) || typeof value.loggedIn !== 'boolean' || (value.running !== undefined && typeof value.running !== 'boolean')) fail('INVALID_RESPONSE');
   const server = value.server ?? '';
   const username = value.username ?? '';
   if (!text(server, 2048) || !text(username, 128)) fail('INVALID_RESPONSE');
   if (server) { try { normalizeServer(server); } catch { fail('INVALID_RESPONSE'); } }
-  const ids = new Set();
-  const projects = value.projects.map(project => {
-    if (!isRecord(project) || !text(project.id, 4096, false) || !text(project.label, 1024, false) || !text(project.root, 4096, false) || typeof project.selected !== 'boolean' || typeof project.available !== 'boolean' || ids.has(project.id)) fail('INVALID_RESPONSE');
-    ids.add(project.id);
-    const projectId = optionalText(project.projectId, 4096);
-    const warning = optionalText(project.warning);
-    return freeze({ id: project.id, label: project.label, root: project.root, selected: project.selected, available: project.available,
-      ...(projectId === undefined ? {} : { projectId }), ...(warning === undefined ? {} : { warning }) });
-  });
   const expiresAt = optionalDate(value.expiresAt);
   if (value.authState !== undefined && !['reauth-required', 'renewable', 'legacy', 'signed-out'].includes(value.authState)) fail('INVALID_RESPONSE');
   if (value.reauthRequired !== undefined && typeof value.reauthRequired !== 'boolean') fail('INVALID_RESPONSE');
   const warning = optionalText(value.warning);
-  let lastResult;
-  if (value.lastResult !== undefined && value.lastResult !== null) {
-    const result = value.lastResult;
-    if (!isRecord(result) || typeof result.ok !== 'boolean' || !text(result.message, 2048)) fail('INVALID_RESPONSE');
-    const at = optionalDate(result.at);
-    if (!at) fail('INVALID_RESPONSE');
-    lastResult = freeze({ at, ok: result.ok, message: result.message });
-  }
-  return freeze({ revision: value.revision, server, username, loggedIn: value.loggedIn, autoSync: value.autoSync === true,
-    intervalMs: value.intervalMs, projects: freeze(projects), pending: value.pending, running: value.running,
+  return freeze({ revision: value.revision, server, username, loggedIn: value.loggedIn, running: value.running === true,
     ...(expiresAt === undefined ? {} : { expiresAt }), ...(warning === undefined ? {} : { warning }),
     ...(value.authState === undefined ? {} : { authState: value.authState }),
     ...(value.reauthRequired === undefined ? {} : { reauthRequired: value.reauthRequired }),
-    ...(lastResult === undefined ? {} : { lastResult }),
-    ...(value.recovery === undefined ? {} : { recovery: parseRecovery(value.recovery) }),
-    ...(value.download === undefined ? {} : { download: parseDownloadStatus(value.download) }),
     ...(value.update === undefined ? {} : { update: parseUpdateStatus(value.update) }) });
 }
 
@@ -400,74 +212,24 @@ function createConnectionTransport(connection) {
   };
 }
 
-function newDraft(status) {
-  return freeze({ revision: status?.revision ?? 0, autoSync: status?.autoSync ?? false,
-    projectIds: freeze(status ? status.projects.filter(project => project.selected).map(project => project.id) : []) });
-}
-function isDirty(status, draft) {
-  if (!status) return false;
-  const selected = status.projects.filter(project => project.selected).map(project => project.id);
-  return status.autoSync !== draft.autoSync || selected.length !== draft.projectIds.length || selected.some(id => !draft.projectIds.includes(id));
-}
-
-/** IDs are opaque: only membership in the latest Host list permits submission. */
-function validatePreferences(status, draft) {
-  if (!status || !isRecord(draft) || !integer(draft.revision) || typeof draft.autoSync !== 'boolean' || !Array.isArray(draft.projectIds)) fail('BAD_REQUEST');
-  if (draft.revision !== status.revision) fail('CONFIG_CONFLICT');
-  const byId = new Map(status.projects.map(project => [project.id, project]));
-  const ids = new Set();
-  for (const id of draft.projectIds) {
-    const project = byId.get(id);
-    if (!project || ids.has(id)) fail('UNKNOWN_PROJECT');
-    if (!project.available && !project.selected) fail('PROJECT_UNAVAILABLE');
-    ids.add(id);
-  }
-  if (draft.autoSync && !status.loggedIn && !status.autoSync) fail('NOT_LOGGED_IN');
-  return { revision: draft.revision, autoSync: draft.autoSync, projectIds: [...ids] };
-}
-
-function filterProjects(projects, search = '') {
-  const query = String(search).trim().toLocaleLowerCase();
-  return query ? projects.filter(project => `${project.label}\n${project.root}`.toLocaleLowerCase().includes(query)) : projects;
-}
-
 function deriveView(state) {
   const status = state.status;
-  const locked = !state.ready || state.loading || state.refreshing || Boolean(state.busy) || Boolean(state.cloud?.directoryBrowser) || Boolean(state.downloadBrowser);
-  // Preferences/logout are safety controls: Host aborts and joins active work before committing them.
-  const recovering = status?.recovery?.state === 'running' || Boolean(state.recoveryPending) || status?.download?.state === 'running' || Boolean(state.downloadPending) || state.downloadUncertain === true || status?.download?.items.some(item => item.importResult?.state === 'running');
+  const locked = !state.ready || state.loading || state.refreshing || Boolean(state.busy);
   const updater = state.update ?? status?.update;
-  // Host 'uncertain' with a known terminal request means installation settled, not that rollback occurred.
+  // A known terminal task may have changed plugin files; it permits logout, never another install.
   const settledUncertain = updater?.state === 'uncertain' && updater.restartRequired === true && Boolean(updater.requestId) && !state.updatePendingId;
   const updaterBusy = updateRunning(updater) || Boolean(state.updatePendingId) || (state.updateUncertain === true && !settledUncertain);
   const restartRequired = updater?.restartRequired === true;
   const updateBlocked = updaterBusy || restartRequired || state.updateUncertain === true;
-  const editable = !locked && !state.conflict && !recovering && !updateBlocked;
-  const canBrowse = !locked && !status?.running && !recovering && !updateBlocked && Boolean(status?.loggedIn && status.server && status.username);
-  const canRecover = canBrowse && !status.running && !recovering && !state.scheduled && !state.conflict && !state.dirty;
-  const selectedAvailable = status?.projects.filter(project => project.selected && project.available).length ?? 0;
-  const downloadCount = state.downloadSelection?.length ?? 0;
-  const downloadResolved = validDownloadSelection(state.downloadSelection);
-  return freeze({ locked, editable, recovering, canBrowse, canRecover, updaterBusy, restartRequired, updateBlocked,
-    downloadCount, downloadResolved, canChooseDownloadDestination: canRecover && downloadResolved,
-    downloadWarning: status?.download?.warningCode ? MESSAGES[status.download.warningCode] : '',
-    downloadItemErrors: freeze(Object.fromEntries((status?.download?.items ?? []).filter(item => item.errorCode).map(item => [item.restoreId, MESSAGES[item.errorCode]]))),
-    canDownload: canRecover && downloadResolved && Boolean(state.downloadPlan),
-    pickingDestination: destinationAction(state.busy) || Boolean(state.cloud?.directoryBrowser) || Boolean(state.downloadBrowser),
+  return freeze({ locked, updaterBusy, restartRequired, updateBlocked,
     updateError: state.updateError?.message ?? (updater?.errorCode ? MESSAGES[updater.errorCode] : ''),
     canCheckUpdate: !locked && !updateBlocked && updater?.supported !== false && updater?.state !== 'checking',
-    canUpdate: !locked && !updateBlocked && !state.updateError && !recovering && !status?.running && !state.scheduled && !state.dirty && !state.conflict && updater?.supported === true && updater.state === 'available' && Boolean(updater.candidate),
-    // A local read must not hide cancellation; cancellation invalidates the read before writing.
+    canUpdate: !locked && !updateBlocked && !state.updateError && !status?.running && updater?.supported === true && updater.state === 'available' && Boolean(updater.candidate),
+    // A read cannot hide cancellation; cancelling invalidates that read before writing.
     canCancelUpdate: !state.busy && updateRunning(updater) && updater.state !== 'cancelling' && updater.errorCode !== 'UPDATE_CANCEL_TOO_LATE' && state.updateError?.code !== 'UPDATE_CANCEL_TOO_LATE' && Boolean(state.updatePendingId && state.updatePendingId === updater.requestId),
-    canChooseDestination: canRecover && Boolean(state.cloud?.checkpointId),
-    canRestore: canRecover && Boolean(state.cloud?.checkpointId && absolutePath(state.cloud.destination)),
-    canRestoreDestination: canRecover && Boolean(state.cloud?.checkpointId && validId(state.cloud.destinationId) && absolutePath(state.cloud.destination)),
-    canImport: canRecover && status?.recovery?.kind === 'restore' && status.recovery.state === 'succeeded' && status.recovery.sessionCount !== 0,
-    recoveryError: status?.recovery?.errorCode ? MESSAGES[status.recovery.errorCode] : '',
-    canLogin: !locked && !status?.running && !recovering && !updateBlocked, canLogout: !locked && !updaterBusy && Boolean(status?.loggedIn),
-    canChangePassword: !locked && !recovering && !updateBlocked && !state.passwordUncertain && Boolean(status?.server && status?.username),
-    canSave: editable && state.dirty, canSync: !locked && !recovering && !updateBlocked && Boolean(status?.loggedIn) && !status?.running && !state.scheduled && !state.dirty && !state.conflict && selectedAvailable > 0,
-    selectedAvailable, selectedCount: state.draft.projectIds.length });
+    canLogin: !locked && !status?.running && !updateBlocked,
+    canLogout: !locked && !updaterBusy && Boolean(status?.loggedIn),
+    canChangePassword: !locked && !updateBlocked && !state.passwordUncertain && Boolean(status?.server && status?.username) });
 }
 
 /** A subscribable, immutable state store; it never owns or persists a password. */
@@ -479,43 +241,14 @@ function createController(connection, options = {}) {
   if (typeof now !== 'function') throw new TypeError('now must be a function');
   const pollMs = Math.max(1000, options.pollMs ?? 3000);
   const timeoutMs = Math.max(1000, options.timeoutMs ?? 60000);
-  let state = freeze({ status: null, draft: newDraft(), dirty: false, conflict: false, loading: true, refreshing: false,
-    ready: false, busy: null, error: null, notice: '', scheduled: false, passwordUncertain: false,
-    cloud: newCloud(), recoveryPending: null, recoveryUncertain: false, ...newDownload(), registrationResults: freeze({}), registrationError: null,
+  let state = freeze({ status: null, loading: true, refreshing: false, ready: false, busy: null, error: null, notice: '', passwordUncertain: false,
     update: null, updateIntent: null, updatePendingId: null, updateUncertain: false, updateError: null });
   const listeners = new Set();
-  let disposed = false;
-  let watchers = 0;
-  let pollTimer;
-  let expiryTimer;
-  let expiryReadKey;
-  let rejectedAuth;
-  let active;
-  let refreshAbort;
-  let generation = 0;
-  let scheduledChecks = 0;
-  let scheduledBaseline;
-  let observedWork = false;
-  let uncertainChecks = 0;
-  let updateUncertainChecks = 0;
-  let downloadUncertainChecks = 0;
-  let destinationAbort;
-  const registrationIntents = new Map();
-  let destinationGeneration = 0;
-  const invalidateDestinationRequest = () => { ++destinationGeneration; destinationAbort?.abort(); destinationAbort = undefined; };
+  let disposed = false, watchers = 0, pollTimer, expiryTimer, expiryReadKey, rejectedAuth, active, refreshAbort;
+  let generation = 0, updateUncertainChecks = 0;
   const update = patch => {
     if (disposed) return;
-    const next = { ...state, ...patch };
-    const identityChanged = state.status && (!sameBinding(state.status, next.status) || state.status.loggedIn !== next.status?.loggedIn);
-    const runtimeChanged = state.update && next.update && state.update.currentVersion !== next.update.currentVersion;
-    if (identityChanged || runtimeChanged || deriveView(state).updateBlocked !== deriveView(next).updateBlocked) {
-      invalidateDestinationRequest();
-      next.cloud = clearedDestination(next.cloud);
-      Object.assign(next, identityChanged ? newDownload() : clearedDownloadPlan());
-      if (identityChanged) { downloadUncertainChecks = 0; registrationIntents.clear(); next.registrationResults = freeze({}); next.registrationError = null; }
-      if (destinationAction(next.busy)) next.busy = null;
-    }
-    state = freeze(next);
+    state = freeze({ ...state, ...patch });
     queueExpiry();
     for (const listener of listeners) listener();
   };
@@ -531,16 +264,12 @@ function createController(connection, options = {}) {
     rejectedAuth = { server: status.server, username: status.username, expiresAt, code };
   }
   function signedOut(status) {
-    if (!status) return status;
-    const { download: _download, recovery: _recovery, ...publicStatus } = status;
-    return freeze({ ...publicStatus, loggedIn: false, autoSync: false, reauthRequired: true, authState: 'reauth-required' });
+    return status && freeze({ ...status, loggedIn: false, reauthRequired: true, authState: 'reauth-required' });
   }
   function markAuthRejected(code) {
     rememberAuthRejection(code);
-    const status = signedOut(state.status), draft = freeze({ ...state.draft, autoSync: false });
     clearPoll();
-    update({ status, draft, dirty: isDirty(status, draft), scheduled: false, recoveryPending: null,
-      recoveryUncertain: false, cloud: newCloud(), ...newDownload(), notice: '', error: publicError(new SettingsClientError(code)) });
+    update({ status: signedOut(state.status), notice: '', error: publicError(new SettingsClientError(code)) });
   }
   function queueExpiry() {
     clearExpiry();
@@ -556,24 +285,24 @@ function createController(connection, options = {}) {
       if (Date.parse(state.status.expiresAt) > now()) { queueExpiry(); return; }
       expiryReadKey = key;
       markAuthRejected('NOT_LOGGED_IN');
-      void refresh({ discardDraft: false });
+      void refresh();
     }, Math.max(1, Math.min(remaining, 2_147_483_647)));
   }
   const invalidateRefresh = () => { ++generation; refreshAbort?.abort(); refreshAbort = undefined; };
   function queuePoll() {
     clearPoll();
     if (disposed || !watchers || state.busy || state.refreshing) return;
-    if (state.updateUncertain && updateUncertainChecks >= 10) return; // Manual read only after bounded reconciliation.
+    if (state.updateUncertain && updateUncertainChecks >= 10) return;
     if (updateRunning(state.update) || state.update?.state === 'checking' || state.updateUncertain || state.updatePendingId) {
       pollTimer = setTimer(() => { pollTimer = undefined; void refreshUpdate(); }, pollMs);
-      return;
+    } else if (state.ready && state.status?.running && !rejectedAuth && !state.passwordUncertain) {
+      // The Host busy flag includes v2 work. Reconcile that read-only guard until
+      // idle; legacy queues/preferences never trigger polling or a mutation.
+      pollTimer = setTimer(() => {
+        pollTimer = undefined;
+        if (!disposed && watchers && state.ready && !state.busy && !state.refreshing && state.status?.running) void refresh();
+      }, pollMs);
     }
-    const downloadWork = state.status?.loggedIn && ((state.downloadPending && (!state.downloadUncertain || downloadUncertainChecks < 10)) || state.status.download?.state === 'running' || state.status.download?.items.some(item => item.importResult?.state === 'running'));
-    if (state.downloadUncertain && downloadUncertainChecks >= 10) return;
-    const recoveryWork = downloadWork || (state.recoveryPending && (!state.recoveryUncertain || uncertainChecks < 10)) || state.status?.recovery?.state === 'running';
-    if (disposed || !watchers || state.busy || state.refreshing || (!recoveryWork && (state.error || !state.status?.loggedIn)) || !(recoveryWork || state.status?.running || state.status?.pending || state.scheduled)) return;
-    const delay = recoveryWork || state.status.running || state.scheduled ? pollMs : Math.max(10000, pollMs);
-    pollTimer = setTimer(() => { pollTimer = undefined; void refresh(); }, delay);
   }
   function updatePatch(incoming) {
     const runtimeChanged = state.update && incoming.currentVersion !== state.update.currentVersion;
@@ -602,73 +331,26 @@ function createController(connection, options = {}) {
     const patch = updatePatch(value);
     update({ ...patch, ...(state.status ? { status: freeze({ ...state.status, update: patch.update }) } : {}) });
   }
-  function acceptStatus(status, resetDraft = false) {
+  function acceptStatus(status) {
     const hostPaused = status.reauthRequired === true || status.authState === 'reauth-required' || (status.loggedIn && status.authState === 'signed-out');
     const expired = status.loggedIn && status.expiresAt && Date.parse(status.expiresAt) <= now();
     if (hostPaused || expired) {
       if (expired) expiryReadKey = expiryKey(status); // This read already reconciled that deadline.
       rememberAuthRejection(sameAuthIdentity(rejectedAuth, status) ? rejectedAuth.code : 'NOT_LOGGED_IN', status);
     } else if (rejectedAuth && status.loggedIn) {
-      // Revision changes alone are preferences, not authentication proof. Without
+      // Revision changes alone are not authentication proof. Without
       // an older known expiry, only explicit login can restore the same identity.
       const newExpiry = status.expiresAt && rejectedAuth.expiresAt && Date.parse(status.expiresAt) > Date.parse(rejectedAuth.expiresAt) && Date.parse(status.expiresAt) > now();
       if (!sameAuthIdentity(rejectedAuth, status) || newExpiry) rejectedAuth = undefined;
     }
     if (sameAuthIdentity(rejectedAuth, status)) status = signedOut(status);
     // A late/stale status must not revive tokens after an uncertain password write.
-    if (state.passwordUncertain) status = freeze({ ...status, loggedIn: false, autoSync: false });
-    let draft = state.draft;
-    let conflict = state.conflict;
-    if (!state.status || resetDraft || !state.dirty) {
-      draft = newDraft(status);
-      conflict = false;
-    } else {
-      if (draft.revision !== status.revision) conflict = true;
-      const permitted = new Set(status.projects.filter(project => project.available || project.selected).map(project => project.id));
-      draft = freeze({ ...draft, projectIds: freeze(draft.projectIds.filter(id => permitted.has(id))) });
-    }
-    if ((state.passwordUncertain || status.reauthRequired === true) && draft.autoSync) draft = freeze({ ...draft, autoSync: false });
-    let scheduled = state.scheduled;
-    if (scheduled) {
-      // Pending checkpoints can remain offline or deselected; they are not an active job.
-      observedWork ||= status.running;
-      ++scheduledChecks;
-      if (!status.loggedIn || status.lastResult?.at !== scheduledBaseline || (observedWork && !status.running) || scheduledChecks >= 10) scheduled = false;
-    }
-    const changed = state.status && (!sameBinding(status, state.status) || status.loggedIn !== state.status.loggedIn);
-    // The Host owns grant-scoped visibility. Never retain an old download through logout.
-    if (!status.loggedIn && status.download) { const { download: _hidden, ...visible } = status; status = freeze(visible); }
-    let downloadPending = changed ? null : state.downloadPending;
-    let downloadUncertain = changed ? false : state.downloadUncertain;
-    let downloadError = changed ? null : state.downloadError;
-    if (downloadPending) {
-      const result = downloadPending.kind === 'download' ? status.download : status.download?.items.find(item => item.restoreId === downloadPending.restoreId)?.importResult;
-      if (result?.id === downloadPending.requestId) {
-        if (downloadPending.kind === 'download') validateDownloadMatch(result, downloadPending);
-        else if (result.kind !== 'import' || result.root !== downloadPending.root) fail('INVALID_RESPONSE');
-        downloadUncertain = false; downloadUncertainChecks = 0;
-        if (downloadError?.code === 'RECOVERY_UNCERTAIN') downloadError = null;
-        if (result.state !== 'running') downloadPending = null;
-      }
-    }
-    let downloadIntent = state.downloadIntent;
-    if (downloadIntent?.kind === 'import' && !status.download?.items.some(item => item.restoreId === downloadIntent.restoreId && item.canImport && item.root === downloadIntent.root)) downloadIntent = null;
-    let recoveryPending = changed ? null : state.recoveryPending;
-    let recoveryUncertain = changed ? false : state.recoveryUncertain;
-    if (recoveryPending && status.recovery?.id === recoveryPending.requestId) {
-      if (status.recovery.kind !== recoveryPending.kind || (recoveryPending.kind === 'restore' && status.recovery.checkpointId !== undefined && status.recovery.checkpointId !== recoveryPending.checkpointId)) fail('INVALID_RESPONSE');
-      recoveryUncertain = false;
-      if (status.recovery.state !== 'running') recoveryPending = null;
-    }
-    let cloud = changed ? newCloud() : state.cloud;
-    if (!recoveryUncertain && cloud.error?.code === 'RECOVERY_UNCERTAIN') cloud = freeze({ ...cloud, error: null });
-    if (cloud.intent?.kind === 'import' && (status.recovery?.id !== cloud.intent.restoreId || status.recovery?.kind !== 'restore' || status.recovery?.state !== 'succeeded' || status.recovery?.root !== cloud.intent.root)) cloud = freeze({ ...cloud, intent: null });
+    if (state.passwordUncertain) status = freeze({ ...status, loggedIn: false });
     const updater = status.update ? updatePatch(status.update) : {};
     const latestUpdate = updater.update ?? state.update;
     if (latestUpdate) status = freeze({ ...status, update: latestUpdate });
-    update({ status, draft, dirty: isDirty(status, draft), conflict, ready: true, loading: false, scheduled,
-      cloud, recoveryPending, recoveryUncertain, downloadPending, downloadUncertain, downloadError, downloadIntent, ...updater,
-      error: conflict ? publicError(new SettingsClientError('CONFIG_CONFLICT')) : sameAuthIdentity(rejectedAuth, status) ? publicError(new SettingsClientError(rejectedAuth.code)) : null });
+    update({ status, ready: true, loading: false, ...updater,
+      error: sameAuthIdentity(rejectedAuth, status) ? publicError(new SettingsClientError(rejectedAuth.code)) : null });
   }
   async function withDeadline(action, body, abort) {
     let timedOut = false;
@@ -692,20 +374,18 @@ function createController(connection, options = {}) {
       abort.signal.removeEventListener('abort', onAbort);
     }
   }
-  async function refresh({ discardDraft = state.conflict } = {}) {
-    if (disposed || (state.busy && !destinationAction(state.busy))) return false;
+  async function refresh() {
+    if (disposed || state.busy) return false;
     clearPoll();
     invalidateRefresh();
     const current = generation;
     const abort = new AbortController();
     refreshAbort = abort;
     update({ refreshing: true });
-    if (state.recoveryUncertain) ++uncertainChecks;
-    if (state.downloadUncertain) ++downloadUncertainChecks;
     try {
       const result = await withDeadline('status', {}, abort);
       if (disposed || current !== generation) return false;
-      acceptStatus(parseStatus(result), discardDraft);
+      acceptStatus(parseStatus(result));
       return true;
     } catch (error) {
       if (!disposed && current === generation) update({ error: publicError(error), ready: false, loading: false });
@@ -714,25 +394,18 @@ function createController(connection, options = {}) {
       if (!disposed && current === generation) { refreshAbort = undefined; update({ refreshing: false }); queuePoll(); }
     }
   }
-  function editDraft(patch) {
-    const draft = freeze({ ...state.draft, ...patch });
-    update({ draft, dirty: isDirty(state.status, draft), notice: '', error: null });
-  }
   function report(error) { update({ error: publicError(error), notice: '' }); return false; }
   function guardAction(action) {
-    if (disposed || !state.ready || state.busy || state.loading || state.refreshing || state.cloud.directoryBrowser || state.downloadBrowser) return false;
+    if (disposed || !state.ready || state.busy || state.loading || state.refreshing) return false;
     const view = deriveView(state);
     if (view.updaterBusy) return report(new SettingsClientError('BUSY'));
     if (view.restartRequired && action !== 'logout') return report(new SettingsClientError('UPDATE_RESTART_REQUIRED'));
-    if (view.recovering && ['login', 'password', 'preferences', 'sync'].includes(action)) return report(new SettingsClientError('BUSY'));
-    if (state.status.running && (action === 'login' || action === 'sync')) return report(new SettingsClientError('BUSY'));
-    if (action === 'sync' && !state.status.loggedIn) return report(new SettingsClientError('NOT_LOGGED_IN'));
+    if (state.status.running && action === 'login') return report(new SettingsClientError('BUSY'));
+    if (action === 'logout' && !state.status.loggedIn) return false;
     return true;
   }
   function markPasswordUncertain() {
-    const status = state.status && freeze({ ...state.status, loggedIn: false, autoSync: false });
-    const draft = freeze({ ...state.draft, autoSync: false });
-    update({ status, draft, dirty: isDirty(status, draft), passwordUncertain: true, scheduled: false, ready: false, notice: '' });
+    update({ status: state.status && freeze({ ...state.status, loggedIn: false }), passwordUncertain: true, ready: false, notice: '' });
   }
   async function reconcilePasswordFailure(error) {
     const safe = publicError(error);
@@ -752,7 +425,7 @@ function createController(connection, options = {}) {
     } catch {
       if (!disposed) markPasswordUncertain();
     }
-    if (!disposed) update({ error: notice, conflict: safe.code === 'CONFIG_CONFLICT' || state.conflict });
+    if (!disposed) update({ error: notice });
   }
   async function reconcileAuthFailure(safe) {
     markAuthRejected(safe.code); // Show an empty sign-in form before the read settles.
@@ -767,146 +440,32 @@ function createController(connection, options = {}) {
   }
   async function mutate(action, body) {
     if (!guardAction(action)) return false;
-    invalidateRefresh();
-    clearPoll();
-    const abort = new AbortController();
-    active = abort;
+    invalidateRefresh(); clearPoll();
+    const abort = new AbortController(); active = abort;
     update({ busy: action, error: null, notice: '' });
-    let succeeded = false;
     try {
       const result = await withDeadline(action, body, abort);
       if (disposed) return false;
       if (abort.signal.aborted) fail('REQUEST_FAILED');
-      if (action === 'sync' && result?.scheduled === true) {
-        scheduledChecks = 0;
-        observedWork = false;
-        scheduledBaseline = state.status?.lastResult?.at;
-        update({ scheduled: true, notice: '同步请求已提交' });
-      } else {
-        const next = parseStatus(result);
-        if (action === 'password' && (next.loggedIn || next.autoSync)) fail('INVALID_RESPONSE');
-        const resetDraft = ['preferences', 'logout', 'password'].includes(action) || (action === 'login' && state.passwordUncertain);
-        if (action === 'login' && next.loggedIn && next.reauthRequired !== true && next.authState !== 'reauth-required' && next.authState !== 'signed-out') { rejectedAuth = undefined; expiryReadKey = undefined; }
-        if (action === 'login' || action === 'password') update({ passwordUncertain: false });
-        acceptStatus(next, resetDraft);
-        if (['preferences', 'logout', 'password'].includes(action)) update({ scheduled: false });
-        update({ notice: action === 'login' ? '已登录'
-          : action === 'password' ? '密码已修改，请重新登录'
-            : action === 'logout' ? '已退出登录'
-              : action === 'preferences' ? '已保存' : '状态已更新' });
-      }
-      succeeded = true;
+      const next = parseStatus(result);
+      // Older hosts must not acknowledge a password change while keeping its grant/automatic uploader live.
+      if (action === 'password' && (next.loggedIn || result.autoSync === true)) fail('INVALID_RESPONSE');
+      if (action === 'login' && next.loggedIn && next.reauthRequired !== true && next.authState !== 'reauth-required' && next.authState !== 'signed-out') { rejectedAuth = undefined; expiryReadKey = undefined; }
+      if (action === 'login' || action === 'password') update({ passwordUncertain: false });
+      acceptStatus(next);
+      update({ notice: action === 'login' ? '已登录' : action === 'password' ? '密码已修改，请重新登录' : '已退出登录' });
       return true;
     } catch (error) {
       if (!disposed && action === 'password') await reconcilePasswordFailure(error);
       else if (!disposed && (!abort.signal.aborted || (error instanceof SettingsClientError && error.code === 'TIMEOUT'))) {
         const safe = publicError(error);
         if (authFailure(safe.code)) await reconcileAuthFailure(safe);
-        else update({ error: safe, conflict: safe.code === 'CONFIG_CONFLICT' || state.conflict,
-          ready: !['AUTH_REQUIRED', 'FORBIDDEN', 'NOT_DEPLOYED', 'CONNECTION_UNAVAILABLE', 'INVALID_RESPONSE', 'TIMEOUT'].includes(safe.code) });
+        else update({ error: safe, ready: !['AUTH_REQUIRED', 'FORBIDDEN', 'NOT_DEPLOYED', 'CONNECTION_UNAVAILABLE', 'INVALID_RESPONSE', 'TIMEOUT'].includes(safe.code) });
       }
       return false;
     } finally {
       active = undefined;
-      if (!disposed) {
-        update({ busy: null });
-        if (action === 'sync' && succeeded) await refresh();
-        else queuePoll();
-      }
-    }
-  }
-  const cloudUpdate = patch => update({ cloud: freeze({ ...state.cloud, ...patch }) });
-  const cloudReport = error => { cloudUpdate({ error: publicError(error), intent: null }); return false; };
-  function cloudEditable() { return deriveView(state).canBrowse && !state.recoveryPending; }
-  async function browse(action) {
-    if (!deriveView(state).canBrowse) return false;
-    let binding, projectId;
-    try {
-      binding = validateBinding(state.status, bindingOf(state.status));
-      projectId = state.cloud.projectId;
-      if (action === 'checkpoints' && !validId(projectId)) fail('BAD_REQUEST');
-    } catch (error) { return cloudReport(error); }
-    invalidateRefresh(); clearPoll();
-    const abort = new AbortController(); active = abort;
-    if (action === 'projects') update({ cloud: freeze({ ...newCloud(), binding }) });
-    else cloudUpdate({ ...clearedDestination(state.cloud), binding, checkpoints: freeze([]), heads: freeze([]), checkpointId: '', loaded: false, error: null });
-    update({ busy: action });
-    let needsStatus = false;
-    try {
-      const result = await withDeadline(action, action === 'projects' ? binding : { ...binding, projectId }, abort);
-      if (disposed || !sameBinding(state.status, binding)) return false;
-      if (action === 'projects') cloudUpdate({ projects: parseCloudProjects(result), projectsLoaded: true, partial: result.partial === true, legacy: result.legacy === true });
-      else cloudUpdate({ ...parseCheckpoints(result, projectId), loaded: true });
-      return true;
-    } catch (error) {
-      if (!disposed) {
-        const safe = publicError(error);
-        if (authFailure(safe.code)) markAuthRejected(safe.code);
-        if (['ACCOUNT_MISMATCH', 'CONFIG_CONFLICT', 'NOT_LOGGED_IN', 'AUTH_RENEWAL_UNCERTAIN'].includes(safe.code)) {
-          update({ cloud: newCloud() }); needsStatus = true;
-        }
-        cloudUpdate({ error: safe, browseUnsupported: action === 'projects' && safe.code === 'CLOUD_BROWSE_UNSUPPORTED' });
-      }
-      return false;
-    } finally {
-      active = undefined;
-      if (!disposed) { update({ busy: null }); if (needsStatus) await refresh(); else queuePoll(); }
-    }
-  }
-  function closeDestinationBrowser() {
-    invalidateDestinationRequest();
-    update({ ...(destinationAction(state.busy) ? { busy: null } : {}), cloud: freeze({ ...state.cloud, directoryBrowser: null, intent: null }) });
-    queuePoll();
-  }
-  async function destinationRequest(action, nodeId) {
-    if (disposed) return false;
-    const browser = state.cloud.directoryBrowser;
-    const view = deriveView({ ...state, cloud: { ...state.cloud, directoryBrowser: null } });
-    if (!view.canChooseDestination || (action !== 'destinationpick' && !browser)) return false;
-    let binding, payload;
-    const { projectId, checkpointId } = state.cloud;
-    try {
-      binding = validateBinding(state.status, state.cloud.binding);
-      if (!state.cloud.checkpoints.some(item => item.id === checkpointId && item.projectId === projectId)) fail('CHECKPOINT_MISMATCH');
-      if (action === 'destinationpick') payload = { ...binding, projectId, checkpointId };
-      else {
-        if (!validId(nodeId) || ![browser.currentId, ...browser.crumbs.map(item => item.id), ...browser.directories.map(item => item.id)].includes(nodeId)) fail('DIRECTORY_PICKER_EXPIRED');
-        if (action === 'destinationselect' && (!browser.selectable || nodeId !== browser.currentId)) fail('BAD_DESTINATION');
-        payload = { ...binding, browserId: browser.id, nodeId };
-      }
-    } catch (error) { return cloudReport(error); }
-    invalidateRefresh(); clearPoll(); invalidateDestinationRequest();
-    const current = destinationGeneration;
-    const runtime = state.update?.currentVersion;
-    const abort = new AbortController(); destinationAbort = abort;
-    update({ busy: action, refreshing: false, cloud: freeze({ ...state.cloud, intent: null, error: null }) });
-    const live = () => !disposed && current === destinationGeneration && sameBinding(state.status, binding) && state.status.loggedIn && state.cloud.projectId === projectId && state.cloud.checkpointId === checkpointId && state.update?.currentVersion === runtime && !deriveView(state).updateBlocked;
-    let needsStatus = false;
-    try {
-      const reply = await withDeadline(action, payload, abort);
-      if (!live()) return false;
-      const result = parseDestinationReply(reply, action);
-      if (result.cancelled) return false;
-      if (result.browser) {
-        if (action === 'destinationbrowse' && result.browser.id !== browser.id) fail('INVALID_RESPONSE');
-        cloudUpdate({ directoryBrowser: result.browser });
-      } else cloudUpdate({ destinationId: result.destination.id, destination: result.destination.root, directoryBrowser: null });
-      return true;
-    } catch (error) {
-      if (live()) {
-        const safe = publicError(error);
-        if (authFailure(safe.code)) markAuthRejected(safe.code);
-        if (['ACCOUNT_MISMATCH', 'CONFIG_CONFLICT', 'NOT_LOGGED_IN', 'AUTH_RENEWAL_UNCERTAIN'].includes(safe.code)) {
-          update({ cloud: newCloud() }); needsStatus = true;
-        } else if (['DIRECTORY_PICKER_EXPIRED', 'DESTINATION_CHANGED', 'CHECKPOINT_MISMATCH', 'INVALID_RESPONSE'].includes(safe.code)) cloudUpdate(clearedDestination(state.cloud));
-        cloudUpdate({ error: safe, intent: null });
-      }
-      return false;
-    } finally {
-      if (!disposed) {
-        if (current === destinationGeneration) { destinationAbort = undefined; update({ busy: null }); }
-        if (needsStatus) await refresh(); else if (current === destinationGeneration) queuePoll();
-      }
+      if (!disposed) { update({ busy: null }); queuePoll(); }
     }
   }
   function requestId() {
@@ -924,276 +483,9 @@ function createController(connection, options = {}) {
     if (!validRequestId(id)) fail('BAD_REQUEST_ID');
     return id;
   }
-  function prepareRecovery(kind) {
-    if (!deriveView(state).canRecover) return null;
-    try {
-      const binding = validateBinding(state.status, kind === 'restore' ? state.cloud.binding : bindingOf(state.status));
-      let fields;
-      if (kind === 'restore') {
-        const cloud = state.cloud;
-        if (!cloud.checkpoints.some(item => item.id === cloud.checkpointId && item.projectId === cloud.projectId)) fail('CHECKPOINT_MISMATCH');
-        if (!absolutePath(cloud.destination)) fail('BAD_DESTINATION');
-        fields = { projectId: cloud.projectId, checkpointId: cloud.checkpointId, destination: cloud.destination,
-          ...(cloud.destinationId ? { destinationId: cloud.destinationId } : {}) };
-      } else {
-        if (!deriveView(state).canImport) fail('RECOVERY_UNAVAILABLE');
-        fields = { restoreId: state.status.recovery.id, root: state.status.recovery.root };
-      }
-      const prior = state.cloud.intent;
-      // Opening the same confirmation twice does not create a new request identity.
-      if (prior?.kind === kind && sameBinding(prior, binding) && Object.entries(fields).every(([key, value]) => prior[key] === value)) return prior;
-      const intent = freeze({ kind, ...binding, ...fields, requestId: requestId() });
-      cloudUpdate({ intent, error: null });
-      return intent;
-    } catch (error) { cloudReport(error); return null; }
-  }
-  async function confirmRecovery(intent) {
-    if (!intent || intent !== state.cloud.intent || !deriveView(state).canRecover) return false;
-    let payload;
-    try {
-      const binding = validateBinding(state.status, intent);
-      if (!validRequestId(intent.requestId)) fail('BAD_REQUEST_ID');
-      if (intent.kind === 'restore') {
-        if (intent.projectId !== state.cloud.projectId || intent.checkpointId !== state.cloud.checkpointId || intent.destination !== state.cloud.destination || (intent.destinationId ?? '') !== state.cloud.destinationId || !state.cloud.checkpoints.some(item => item.id === intent.checkpointId)) fail('CHECKPOINT_MISMATCH');
-        payload = { ...binding, projectId: intent.projectId, checkpointId: intent.checkpointId,
-          ...(intent.destinationId ? { destinationId: intent.destinationId } : { destination: intent.destination }), confirm: true, requestId: intent.requestId };
-      } else {
-        if (!deriveView(state).canImport || intent.restoreId !== state.status.recovery.id || intent.root !== state.status.recovery.root) fail('RECOVERY_UNAVAILABLE');
-        payload = { ...binding, restoreId: intent.restoreId, confirm: true, requestId: intent.requestId };
-      }
-    } catch (error) { return cloudReport(error); }
-    invalidateRefresh(); clearPoll();
-    const abort = new AbortController(); active = abort;
-    cloudUpdate({ intent: null, error: null });
-    uncertainChecks = 0;
-    update({ busy: intent.kind, recoveryPending: intent, recoveryUncertain: false, error: null, notice: '' });
-    let accepted = false;
-    try {
-      const result = await withDeadline(intent.kind, payload, abort);
-      if (disposed) return false;
-      const recovery = parseRecovery(result?.recovery);
-      if (recovery.id !== intent.requestId || recovery.kind !== intent.kind || (recovery.checkpointId !== undefined && intent.kind === 'restore' && recovery.checkpointId !== intent.checkpointId)) fail('INVALID_RESPONSE');
-      update({ status: freeze({ ...state.status, recovery, running: recovery.state === 'running' }),
-        recoveryPending: recovery.state === 'running' ? intent : null });
-      accepted = true;
-    } catch (error) {
-      if (!disposed) {
-        const safe = publicError(error);
-        if (authFailure(safe.code)) markAuthRejected(safe.code);
-        const rejected = ['BAD_REQUEST', 'BAD_DESTINATION', 'DESTINATION_EXISTS', 'PROTECTED_DESTINATION', 'DIRECTORY_PICKER_EXPIRED', 'DESTINATION_CHANGED', 'CHECKPOINT_MISMATCH', 'RECOVERY_UNAVAILABLE', 'RECOVERY_LIMIT', 'CONFIG_CONFLICT', 'ACCOUNT_MISMATCH', 'NOT_LOGGED_IN', 'AUTH_RENEWAL_UNCERTAIN', 'BUSY', 'AUTH_REQUIRED', 'FORBIDDEN', 'NOT_DEPLOYED', 'RATE_LIMITED'].includes(safe.code);
-        update({ recoveryPending: rejected ? null : intent, recoveryUncertain: !rejected });
-        cloudUpdate({ ...(['DIRECTORY_PICKER_EXPIRED', 'DESTINATION_CHANGED'].includes(safe.code) ? clearedDestination(state.cloud) : {}), error: rejected ? safe : publicError(new SettingsClientError('RECOVERY_UNCERTAIN')) });
-        if (['CONFIG_CONFLICT', 'ACCOUNT_MISMATCH', 'NOT_LOGGED_IN'].includes(safe.code)) update({ cloud: newCloud() });
-      }
-    } finally {
-      active = undefined;
-      if (!disposed) {
-        update({ busy: null });
-        // Acceptance and transport failures are reconciled only by reads, never replayed.
-        await refresh({ discardDraft: false });
-        if (!state.recoveryUncertain && state.cloud.error?.code === 'RECOVERY_UNCERTAIN') cloudUpdate({ error: null });
-      }
-    }
-    return accepted;
-  }
-  const downloadReport = error => { update({ downloadError: publicError(error), downloadIntent: null }); return false; };
-  function changeDownloadSelection(rows) {
-    invalidateDestinationRequest();
-    update({ downloadSelection: freeze(rows), ...clearedDownloadPlan(), downloadError: null });
-  }
-  async function addDownloadProject(projectId) {
-    if (disposed || !deriveView(state).canBrowse || !validId(projectId) || state.downloadSelection.some(item => item.projectId === projectId)) return false;
-    const project = state.cloud.projects.find(item => item.projectId === projectId);
-    if (!project || !state.cloud.projectsLoaded || !sameBinding(state.status, state.cloud.binding)) return downloadReport(new SettingsClientError('UNKNOWN_PROJECT'));
-    if (state.downloadSelection.length >= 20) return downloadReport(new SettingsClientError('DOWNLOAD_LIMIT'));
-    const label = project.label ?? state.status.projects.find(item => item.projectId === projectId)?.label ?? '项目文件夹';
-    // Selection is descriptive only. The Host resolves its last successful commit at start.
-    changeDownloadSelection([...state.downloadSelection, freeze({ projectId, label, ...(project.sourceRoot ? { sourceRoot: project.sourceRoot } : {}) })]);
-    return true;
-  }
-  function removeDownloadProject(projectId) {
-    if (disposed || !deriveView(state).canBrowse || !state.downloadSelection.some(item => item.projectId === projectId)) return false;
-    changeDownloadSelection(state.downloadSelection.filter(item => item.projectId !== projectId)); return true;
-  }
-  function closeDownloadBrowser() {
-    invalidateDestinationRequest();
-    update({ ...(downloadDestinationAction(state.busy) ? { busy: null } : {}), downloadBrowser: null, downloadIntent: null });
-    queuePoll();
-  }
-  async function downloadDestinationRequest(action, nodeId) {
-    if (disposed) return false;
-    const browser = state.downloadBrowser;
-    const view = deriveView({ ...state, downloadBrowser: null });
-    if (!view.canChooseDownloadDestination || (action !== 'downloadpick' && !browser)) return false;
-    const selection = state.downloadSelection;
-    let binding, payload;
-    try {
-      binding = validateBinding(state.status, state.cloud.binding);
-      if (action === 'downloadpick') payload = { ...binding, latest: true, items: selection.map(({ projectId }) => ({ projectId })) };
-      else {
-        if (!validId(nodeId) || ![browser.currentId, ...browser.crumbs.map(item => item.id), ...browser.directories.map(item => item.id)].includes(nodeId)) fail('DIRECTORY_PICKER_EXPIRED');
-        if (action === 'downloadselect' && (!browser.selectable || nodeId !== browser.currentId)) fail('BAD_DESTINATION');
-        payload = { ...binding, latest: true, browserId: browser.id, nodeId };
-      }
-    } catch (error) { return downloadReport(error); }
-    invalidateRefresh(); clearPoll(); invalidateDestinationRequest();
-    const current = destinationGeneration, runtime = state.update?.currentVersion;
-    const abort = new AbortController(); destinationAbort = abort;
-    update({ busy: action, refreshing: false, downloadIntent: null, downloadError: null });
-    const live = () => !disposed && current === destinationGeneration && sameBinding(state.status, binding) && state.status.loggedIn && state.downloadSelection === selection && state.update?.currentVersion === runtime && !deriveView(state).updateBlocked;
-    let needsStatus = false;
-    try {
-      const result = await withDeadline(action, payload, abort);
-      if (!live()) return false;
-      if (!unpinnedDownload(result) || (Object.hasOwn(result, 'latest') && result.latest !== true) || ['cancelled', 'browser', 'destinations'].filter(key => Object.hasOwn(result, key)).length !== 1) fail('INVALID_RESPONSE');
-      if (result.cancelled === true && action === 'downloadpick') return false;
-      // Old Hosts must not silently turn a latest-only request into pinned consent.
-      if (result.latest !== true) fail('INVALID_RESPONSE');
-      if (result.browser !== undefined && action !== 'downloadselect') {
-        if (!unpinnedDownload(result.browser)) fail('INVALID_RESPONSE');
-        const next = parseDirectoryBrowser(result.browser);
-        if (action === 'downloadbrowse' && next.id !== browser.id) fail('INVALID_RESPONSE');
-        update({ downloadBrowser: next });
-      } else if (result.destinations !== undefined && action !== 'downloadbrowse') update({ downloadPlan: parseDownloadPlan(result, selection), downloadBrowser: null });
-      else fail('INVALID_RESPONSE');
-      return true;
-    } catch (error) {
-      if (live()) {
-        const safe = publicError(error);
-        if (authFailure(safe.code)) markAuthRejected(safe.code);
-        if (['ACCOUNT_MISMATCH', 'CONFIG_CONFLICT', 'NOT_LOGGED_IN', 'AUTH_RENEWAL_UNCERTAIN'].includes(safe.code)) { update({ ...newDownload(), cloud: newCloud() }); needsStatus = true; }
-        else if (['DIRECTORY_PICKER_EXPIRED', 'DESTINATION_CHANGED', 'CHECKPOINT_MISMATCH', 'INVALID_RESPONSE'].includes(safe.code)) update(clearedDownloadPlan());
-        update({ downloadError: safe, downloadIntent: null });
-      }
-      return false;
-    } finally {
-      if (!disposed) {
-        if (current === destinationGeneration) { destinationAbort = undefined; update({ busy: null }); }
-        if (needsStatus) await refresh(); else if (current === destinationGeneration) queuePoll();
-      }
-    }
-  }
-  function validateDownloadMatch(result, intent) {
-    if (intent.latest !== true || result.latest !== true || result.id !== intent.requestId || result.total !== intent.items.length || !intent.items.every(row => result.items.some(item => item.projectId === row.projectId && item.root === row.root))) fail('INVALID_RESPONSE');
-  }
-  function prepareDownload() {
-    if (disposed || !deriveView(state).canDownload) return null;
-    try {
-      const binding = validateBinding(state.status, state.cloud.binding);
-      const plan = state.downloadPlan;
-      parseDownloadPlan(plan, state.downloadSelection);
-      if (state.downloadIntent?.kind === 'download' && state.downloadIntent.plan === plan) return state.downloadIntent;
-      const items = freeze(state.downloadSelection.map(row => {
-        const destination = plan.destinations.find(item => item.projectId === row.projectId);
-        return freeze({ projectId: row.projectId, destinationId: destination.id, root: destination.root, label: row.label });
-      }));
-      const intent = freeze({ kind: 'download', latest: true, binding, items, plan, requestId: requestId() });
-      update({ downloadIntent: intent, downloadError: null }); return intent;
-    } catch (error) { downloadReport(error); return null; }
-  }
-  function prepareDownloadImport(restoreId) {
-    if (disposed || !deriveView(state).canRecover || state.status.download?.state === 'running') return null;
-    const row = state.status.download?.items.find(item => item.restoreId === restoreId && item.canImport && item.state === 'succeeded');
-    if (!row) return null;
-    try {
-      const binding = validateBinding(state.status, bindingOf(state.status));
-      if (state.downloadIntent?.kind === 'import' && state.downloadIntent.restoreId === restoreId) return state.downloadIntent;
-      const intent = freeze({ kind: 'import', ...binding, batchId: state.status.download.id, restoreId, root: row.root, label: row.label, requestId: requestId() });
-      update({ downloadIntent: intent, downloadError: null }); return intent;
-    } catch (error) { downloadReport(error); return null; }
-  }
-  async function confirmDownloadMutation(intent, kind) {
-    if (disposed || !intent || intent !== state.downloadIntent || intent.kind !== kind || !deriveView(state).canRecover) return false;
-    const intentBinding = kind === 'download' ? intent.binding : intent;
-    let payload;
-    try {
-      const binding = validateBinding(state.status, intentBinding);
-      if (!validRequestId(intent.requestId)) fail('BAD_REQUEST_ID');
-      if (kind === 'download') {
-        if (intent.latest !== true || !deriveView(state).canDownload || intent.plan !== state.downloadPlan) fail('DESTINATION_CHANGED');
-        parseDownloadPlan(intent.plan, state.downloadSelection);
-        payload = { ...binding, latest: true, items: intent.items.map(({ projectId, destinationId }) => ({ projectId, destinationId })), requestId: intent.requestId, confirm: true };
-      } else {
-        if (state.status.download?.id !== intent.batchId || !state.status.download.items.some(item => item.restoreId === intent.restoreId && item.root === intent.root && item.canImport && item.state === 'succeeded')) fail('RECOVERY_UNAVAILABLE');
-        payload = { ...binding, restoreId: intent.restoreId, requestId: intent.requestId, confirm: true };
-      }
-    } catch (error) { return downloadReport(error); }
-    invalidateRefresh(); clearPoll();
-    const abort = new AbortController(); active = abort;
-    const action = kind === 'download' ? 'downloadstart' : 'import';
-    downloadUncertainChecks = 0;
-    update({ busy: action, downloadIntent: null, downloadPending: intent, downloadUncertain: false, downloadError: null, ...(kind === 'download' ? { downloadPlan: null } : {}) });
-    let accepted = false;
-    try {
-      const reply = await withDeadline(action, payload, abort);
-      if (disposed || !sameBinding(state.status, intentBinding) || !state.status.loggedIn) return false;
-      if (kind === 'download') {
-        if (!isRecord(reply) || (Object.hasOwn(reply, 'latest') && reply.latest !== true)) fail('INVALID_RESPONSE');
-        const download = parseDownloadStatus(reply.download); validateDownloadMatch(download, intent);
-        update({ status: freeze({ ...state.status, download }), downloadPending: download.state === 'running' ? intent : null });
-      } else {
-        const result = parseRecovery(reply?.recovery);
-        if (result.id !== intent.requestId || result.kind !== 'import' || result.root !== intent.root) fail('INVALID_RESPONSE');
-        const download = freeze({ ...state.status.download, items: freeze(state.status.download.items.map(item => item.restoreId === intent.restoreId ? freeze({ ...item, canImport: false, importResult: result }) : item)) });
-        update({ status: freeze({ ...state.status, download, recovery: result }), downloadPending: result.state === 'running' ? intent : null });
-      }
-      accepted = true;
-    } catch (error) {
-      if (!disposed && sameBinding(state.status, intentBinding)) {
-        const safe = publicError(error);
-        if (authFailure(safe.code)) markAuthRejected(safe.code);
-        const rejected = ['BAD_REQUEST', 'BAD_DESTINATION', 'DESTINATION_EXISTS', 'PROTECTED_DESTINATION', 'DIRECTORY_PICKER_EXPIRED', 'DESTINATION_CHANGED', 'CHECKPOINT_MISMATCH', 'CLOUD_PROJECT_EMPTY', 'RECOVERY_UNAVAILABLE', 'RECOVERY_LIMIT', 'DOWNLOAD_LIMIT', 'CONFIG_CONFLICT', 'ACCOUNT_MISMATCH', 'NOT_LOGGED_IN', 'AUTH_RENEWAL_UNCERTAIN', 'BUSY', 'AUTH_REQUIRED', 'FORBIDDEN', 'NOT_DEPLOYED', 'RATE_LIMITED'].includes(safe.code);
-        update({ downloadPending: rejected ? null : intent, downloadUncertain: !rejected, downloadError: rejected ? safe : publicError(new SettingsClientError('RECOVERY_UNCERTAIN')) });
-      }
-    } finally {
-      if (active === abort) active = undefined;
-      if (!disposed) { update({ busy: null }); await refresh({ discardDraft: false }); }
-    }
-    return accepted;
-  }
-  async function registerRestoredProject(restoreId) {
-    if (disposed || !deriveView(state).canRecover || !validId(restoreId)) return false;
-    const row = state.status.download?.items.find(item => item.restoreId === restoreId && item.state === 'succeeded');
-    const ordinary = state.status.recovery?.kind === 'restore' && state.status.recovery.state === 'succeeded' && state.status.recovery.id === restoreId ? state.status.recovery : undefined;
-    const root = row?.root ?? ordinary?.root;
-    if (!root) return false;
-    let intent;
-    try {
-      const binding = validateBinding(state.status, bindingOf(state.status));
-      const previous = registrationIntents.get(restoreId);
-      intent = previous && sameBinding(previous, binding) && previous.root === root ? previous : freeze({ ...binding, restoreId, root, requestId: requestId() });
-      registrationIntents.set(restoreId, intent);
-    } catch (error) { update({ registrationError: publicError(error) }); return false; }
-    invalidateRefresh(); clearPoll();
-    const abort = new AbortController(); active = abort;
-    update({ busy: 'registerproject', registrationError: null });
-    let reconciled = false;
-    try {
-      const reply = await withDeadline('registerproject', { revision: intent.revision, server: intent.server, username: intent.username, restoreId, requestId: intent.requestId, confirm: true }, abort);
-      if (disposed || !sameBinding(state.status, intent)) return false;
-      const result = parseProjectRegistration(reply);
-      if (result.restoreId !== restoreId || result.requestId !== intent.requestId || result.root !== root) fail('INVALID_RESPONSE');
-      update({ registrationResults: freeze({ ...state.registrationResults, [restoreId]: result }), registrationError: result.registered ? null : publicError(new SettingsClientError('PROJECT_REGISTRATION_UNCERTAIN')) });
-      return result.registered;
-    } catch (error) {
-      if (!disposed) {
-        const safe = publicError(error);
-        if (authFailure(safe.code)) { reconciled = true; await reconcileAuthFailure(safe); }
-        else {
-          const known = ['BAD_REQUEST', 'BUSY', 'NOT_DEPLOYED', 'AUTH_REQUIRED', 'FORBIDDEN', 'CONFIG_CONFLICT', 'ACCOUNT_MISMATCH', 'RECOVERY_UNAVAILABLE', 'RECOVERY_STATE_CORRUPT', 'RECOVERY_LIMIT', 'DESTINATION_CHANGED', 'CHECKPOINT_MISMATCH', 'PROJECT_UNAVAILABLE', 'PROJECTS_UNAVAILABLE', 'UPDATE_RESTART_REQUIRED'].includes(safe.code);
-          update({ registrationError: known ? safe : publicError(new SettingsClientError('PROJECT_REGISTRATION_UNCERTAIN')),
-            ...(!known ? { registrationResults: freeze({ ...state.registrationResults, [restoreId]: freeze({ restoreId, requestId: intent.requestId, root, registered: false, uncertain: true, errorCode: 'PROJECT_REGISTRATION_UNCERTAIN' }) }) } : {}) });
-        }
-      }
-      return false;
-    } finally {
-      active = undefined;
-      if (!disposed) { update({ busy: null }); if (!reconciled) await refresh({ discardDraft: false }); else queuePoll(); }
-    }
-  }
   const updateReport = error => { update({ updateError: publicError(error), updateIntent: null }); return false; };
   async function refreshUpdate() {
-    if (disposed || (state.busy && !destinationAction(state.busy))) return false;
+    if (disposed || state.busy) return false;
     clearPoll(); invalidateRefresh();
     const current = generation;
     const abort = new AbortController(); refreshAbort = abort;
@@ -1287,45 +579,9 @@ function createController(connection, options = {}) {
   }
   return {
     getSnapshot: () => state,
-    addDownloadProject, removeDownloadProject,
-    chooseDownloadDestination: () => downloadDestinationRequest('downloadpick'),
-    browseDownloadDestination: nodeId => downloadDestinationRequest('downloadbrowse', nodeId),
-    selectDownloadDestination: (nodeId = state.downloadBrowser?.currentId) => downloadDestinationRequest('downloadselect', nodeId),
-    closeDownloadBrowser, prepareDownload, prepareDownloadImport,
-    confirmDownload: intent => confirmDownloadMutation(intent, 'download'),
-    confirmDownloadImport: intent => confirmDownloadMutation(intent, 'import'),
-    registerRestoredProject,
-    cancelDownloadIntent() { update({ downloadIntent: null }); },
-    checkUpdate, prepareUpdate, confirmUpdate, cancelUpdate, refreshUpdate,
-    cancelUpdateIntent() { update({ updateIntent: null }); },
-    browseProjects: () => browse('projects'),
-    loadCheckpoints: () => browse('checkpoints'),
-    chooseDestination: () => destinationRequest('destinationpick'),
-    browseDestination: nodeId => destinationRequest('destinationbrowse', nodeId),
-    selectDestination: (nodeId = state.cloud.directoryBrowser?.currentId) => destinationRequest('destinationselect', nodeId),
-    closeDestinationBrowser,
-    setCloudProject(projectId) {
-      if (!cloudEditable() || !text(projectId, 100)) return false;
-      invalidateDestinationRequest();
-      cloudUpdate({ ...clearedDestination(state.cloud), binding: bindingOf(state.status), projectId, checkpoints: freeze([]), heads: freeze([]), checkpointId: '', loaded: false, error: null });
-      return true;
-    },
-    selectCheckpoint(id) {
-      if (!cloudEditable() || (id !== '' && !state.cloud.checkpoints.some(item => item.id === id))) return false;
-      invalidateDestinationRequest();
-      cloudUpdate({ ...clearedDestination(state.cloud), checkpointId: id, error: null }); return true;
-    },
-    setDestination(destination) {
-      if (!cloudEditable() || !text(destination, 4096)) return false;
-      cloudUpdate({ destination, destinationId: '', directoryBrowser: null, intent: null, error: null }); return true;
-    },
-    prepareRestore: () => prepareRecovery('restore'),
-    prepareImport: () => prepareRecovery('import'),
-    confirmRecovery,
-    cancelRecoveryIntent() { cloudUpdate({ intent: null }); },
     subscribe(listener) { if (disposed) return () => {}; listeners.add(listener); return () => listeners.delete(listener); },
     refresh,
-    refreshIfWatching() { if (watchers > 0) return refresh({ discardDraft: false }); return Promise.resolve(false); },
+    refreshIfWatching() { return watchers > 0 ? refresh() : Promise.resolve(false); },
     watch() {
       if (disposed) return () => {};
       ++watchers;
@@ -1335,46 +591,13 @@ function createController(connection, options = {}) {
         if (ended) return;
         ended = true;
         if (--watchers === 0) {
-          closeDestinationBrowser();
-          closeDownloadBrowser();
-          clearPoll();
-          clearExpiry();
-          invalidateRefresh();
+          clearPoll(); clearExpiry(); invalidateRefresh();
           update({ refreshing: false, loading: !state.status, updateIntent: null });
         }
       };
     },
-    setProject(id, selected) {
-      if (!deriveView(state).editable || typeof selected !== 'boolean') return false;
-      const project = state.status.projects.find(item => item.id === id);
-      if (!project) return report(new SettingsClientError('UNKNOWN_PROJECT'));
-      const ids = new Set(state.draft.projectIds);
-      if (selected && !project.available && !ids.has(id)) return report(new SettingsClientError('PROJECT_UNAVAILABLE'));
-      if (selected) ids.add(id); else ids.delete(id);
-      editDraft({ projectIds: freeze([...ids]) });
-      return true;
-    },
-    selectVisible(search, selected) {
-      if (!deriveView(state).editable || typeof selected !== 'boolean') return false;
-      const ids = new Set(state.draft.projectIds);
-      for (const project of filterProjects(state.status.projects, search)) {
-        if (selected && project.available) ids.add(project.id);
-        if (!selected) ids.delete(project.id);
-      }
-      editDraft({ projectIds: freeze([...ids]) });
-      return true;
-    },
-    setAutoSync(enabled) {
-      if (!deriveView(state).editable || typeof enabled !== 'boolean') return false;
-      if (enabled && !state.status.loggedIn && !state.draft.autoSync) return report(new SettingsClientError('NOT_LOGGED_IN'));
-      editDraft({ autoSync: enabled });
-      return true;
-    },
-    discardChanges() {
-      if (!deriveView(state).editable) return false;
-      update({ draft: newDraft(state.status), dirty: false, error: null, notice: '' });
-      return true;
-    },
+    checkUpdate, prepareUpdate, confirmUpdate, cancelUpdate, refreshUpdate,
+    cancelUpdateIntent() { update({ updateIntent: null }); },
     async login(input) {
       if (!guardAction('login')) return false;
       try { return await mutate('login', validateLogin(input)); }
@@ -1389,37 +612,16 @@ function createController(connection, options = {}) {
     cancelPasswordChange() {
       if (state.busy === 'password') active?.abort();
     },
-    async savePreferences() {
-      if (!guardAction('preferences')) return false;
-      if (state.conflict) return report(new SettingsClientError('CONFIG_CONFLICT'));
-      try { return await mutate('preferences', validatePreferences(state.status, state.draft)); }
-      catch (error) { return report(error); }
-    },
-    async sync(projectId) {
-      if (!guardAction('sync')) return false;
-      if (state.conflict) return report(new SettingsClientError('CONFIG_CONFLICT'));
-      if (state.dirty) return report(new SettingsClientError('UNSAVED_CHANGES'));
-      if (state.scheduled) return report(new SettingsClientError('BUSY'));
-      const selected = state.status.projects.filter(project => project.selected && project.available);
-      if (!selected.length) return report(new SettingsClientError('NO_PROJECTS'));
-      if (projectId !== undefined && !selected.some(project => project.id === projectId)) return report(new SettingsClientError('UNKNOWN_PROJECT'));
-      return mutate('sync', projectId === undefined ? {} : { projectId });
-    },
     logout: () => mutate('logout', {}),
     dispose() {
       disposed = true;
-      clearPoll();
-      clearExpiry();
-      invalidateRefresh();
-      active?.abort();
-      invalidateDestinationRequest();
-      listeners.clear();
+      clearPoll(); clearExpiry(); invalidateRefresh(); active?.abort(); listeners.clear();
       state = freeze({ ...state, busy: null, refreshing: false });
     },
   };
 }
 
-return Object.freeze({RPC_CHANNEL, RPC_PREFIX, CLIENT_ACTIONS, SettingsClientError, normalizeServer, validateLogin, validatePasswordChange, parseCloudProjects, parseDestination, parseDirectoryBrowser, parseCheckpoints, parseRecovery, parseProjectRegistration, parseDownloadPlan, parseDownloadStatus, parseUpdateStatus, parseStatus, createConnectionTransport, validatePreferences, filterProjects, deriveView, createController});
+return Object.freeze({RPC_CHANNEL, RPC_PREFIX, CLIENT_ACTIONS, SettingsClientError, normalizeServer, validateLogin, validatePasswordChange, parseUpdateStatus, parseStatus, createConnectionTransport, deriveView, createController});
 })();
 __clientModules["./bidirectional-state.mjs"] = (() => {
 // Framework-free v2 GUI state. The authenticated DSH Connection is the only carrier.
@@ -1443,7 +645,7 @@ const MESSAGES = Object.freeze({
   SYNC_PROJECT_UNAVAILABLE: '项目不可用，请检查工作区', SYNC_BINDING_NOT_FOUND: '配对已变更，请刷新',
   SYNC_BLOCKED: '存在受保护或不兼容的路径，请先处理阻止项', SYNC_CONFLICT: '项目存在冲突，请保留副本并核对',
   SYNC_CONFLICT_NOT_FOUND: '冲突已变更，请刷新列表', SYNC_RECYCLE_NOT_FOUND: '回收记录已变更，请刷新列表',
-  SYNC_DESTINATION_EXISTS: '恢复位置已有内容，请重新预览', SYNC_LEGACY_HEAD_MISMATCH: '旧版云端内容已变更，请重新预览',
+  SYNC_DESTINATION_EXISTS: '恢复位置已有内容，请重新预览', SYNC_LEGACY_HEAD_MISMATCH: '云端历史内容已变更，请重新预览',
   SYNC_HEAD_MISMATCH: '云端内容已变更，请重新预览', SYNC_LIMIT: '项目达到安全限制，请先检查内容',
   SYNC_UNCERTAIN: '结果未确认，仅核对状态；不要重复提交', SYNC_FAILED: '操作未完成，请核对项目状态',
   AUTH_RENEWAL_UNCERTAIN: '登录续期结果未确认，请重新登录',
@@ -1484,6 +686,9 @@ const text = (value, maximum = 4096, empty = false) => typeof value === 'string'
 const id = value => typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9_-]{0,99}$/.test(value) && !['constructor', 'prototype', '__proto__'].includes(value.toLowerCase());
 const opaque = value => text(value, 4096);
 const absolute = value => text(value) && (value.startsWith('/') || /^[A-Za-z]:[\\/]/.test(value) || /^\\\\[^\\/]+[\\/][^\\/]+/.test(value)) && value.replaceAll('\\', '/').split('/').every(part => part !== '.' && part !== '..');
+// Match v1 projectFolderMetadata's display contract, not local-root authority.
+// Dot segments and POSIX backslash characters in historical hints are harmless text.
+const sourceHint = value => text(value) && (value.startsWith('/') || /^[A-Za-z]:[\\/]/.test(value) || /^\\\\[^\\]+\\[^\\]+/.test(value));
 const pathKey = value => /^[A-Za-z]:|^\\\\/.test(value) ? value.replaceAll('\\', '/').replace(/\/+$/, '').toLowerCase() : value.replace(/\/+$/, '');
 const relative = value => text(value, 1024) && !/[\\:]/.test(value) && value.split('/').every(part => part && part !== '.' && part !== '..');
 const accountEqual = (a, b) => Boolean(a && b && a.server === b.server && a.username === b.username);
@@ -1557,7 +762,16 @@ function parseSyncStatus(value) {
 }
 function parseSyncProjects(value) {
   check(record(value) && (value.partial === undefined || typeof value.partial === 'boolean'));
-  return freeze({ projects: rows(value.projects, item => { check(id(item.projectId) && text(item.label, 1024) && (item.legacy === undefined || typeof item.legacy === 'boolean')); return { projectId: item.projectId, label: item.label, legacy: item.legacy === true }; }), partial: value.partial === true });
+  return freeze({ projects: rows(value.projects, item => {
+    check(id(item.projectId) && text(item.label, 1024) && (item.legacy === undefined || typeof item.legacy === 'boolean'));
+    const metadata = {};
+    // Cloud source paths are display/search hints only. Pairing sends the issued
+    // project ID and registered local workspace ID, never a remote filesystem path.
+    if (item.sourceRoot !== undefined) { check(sourceHint(item.sourceRoot)); metadata.sourceRoot = item.sourceRoot; }
+    if (item.checkpointCount !== undefined) { check(integer(item.checkpointCount) && item.checkpointCount <= 1_000_000); metadata.checkpointCount = item.checkpointCount; }
+    if (item.latestCreatedAt !== undefined) { check(date(item.latestCreatedAt)); metadata.latestCreatedAt = item.latestCreatedAt; }
+    return { projectId: item.projectId, label: item.label, legacy: item.legacy === true, ...metadata };
+  }), partial: value.partial === true });
 }
 function parseSyncArchives(value) {
   check(record(value) && record(value.counts));
@@ -2028,6 +1242,7 @@ function createBidirectionalPanel(React, { Button, Input, Checkbox, Switch, Moda
     heading: { margin: 0, fontSize: 15, fontWeight: 600 },
     item: { display: 'flex', flexDirection: 'column', gap: 6, padding: '10px 0', borderBottom: '1px solid var(--dsw-alias-settings-card-stroke)' },
     list: { maxHeight: 260, overflowY: 'auto', overscrollBehavior: 'contain' },
+    projectOption: { display: 'flex', flexDirection: 'column', gap: 5, width: '100%', minWidth: 0, boxSizing: 'border-box', padding: 10, borderRadius: 8, border: '1px solid var(--dsw-alias-settings-card-stroke)', overflowWrap: 'anywhere' },
     grid: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 240px), 1fr))', gap: 16 },
     warning: { color: 'var(--dsw-alias-state-warning-primary, var(--dsw-alias-label-secondary))' },
   };
@@ -2117,14 +1332,17 @@ function createBidirectionalPanel(React, { Button, Input, Checkbox, Switch, Moda
     const protectIme = event => { if (event.key === 'Escape' && composing(event)) { event.preventDefault(); event.stopPropagation(); } };
     const search = (value, setValue, label, autofocus = false) => h(Input, { type: 'search', value, onChange: event => setValue(event.target.value), 'aria-label': label, placeholder: label, autoComplete: 'off', spellCheck: false, maxLength: 1024, ...(autofocus ? { 'data-modal-autofocus': '' } : {}),
       onCompositionStart: () => { composition.current = { active: true, ended: false }; }, onCompositionEnd: () => { composition.current = { active: false, ended: true }; }, onKeyUp: () => { composition.current.ended = false; }, onBlur: () => { composition.current = { active: false, ended: false }; } });
-    const matches = (row, query) => !query.trim() || `${row.label ?? row.path}\n${row.root ?? ''}`.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase());
+    const matches = (row, query) => !query.trim() || `${row.label ?? row.path}\n${row.root ?? row.sourceRoot ?? ''}`.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase());
     const visibleBindings = status?.bindings.filter(row => matches(row, bindingSearch)) ?? [];
     const binding = dialog?.bindingId ? status?.bindings.find(row => row.id === dialog.bindingId) : null;
     const workspaces = status?.workspaces.filter(row => matches(row, workspaceSearch)) ?? [], projects = state.projects.items.filter(row => matches(row, projectSearch));
+    const projectNames = new Map();
+    for (const row of state.projects.items) { const key = row.label.normalize('NFC').toLocaleLowerCase(); projectNames.set(key, (projectNames.get(key) ?? 0) + 1); }
+    const duplicateProject = row => projectNames.get(row.label.normalize('NFC').toLocaleLowerCase()) > 1;
     const items = dialog?.items?.filter(row => matches(row, itemSearch)) ?? [], selected = dialog?.items?.find(row => row.id === dialog.selectedId), plan = dialog?.plan;
     const titles = { pair: '配对同步项目', conflicts: '处理文件冲突', recycle: '本机回收站', archives: '会话归档', repair: '核对中断事务' };
     const reviewTitles = { pair: '确认启用双向同步', conflicts: '确认处理冲突', recycle: '确认恢复文件', archives: '确认导入安全会话', repair: '确认修复中断事务' };
-    const title = dialog?.stage === 'review' ? reviewTitles[dialog.kind] : dialog?.stage === 'legacy' ? '选择旧版主版本' : ['progress', 'uncertain'].includes(dialog?.stage) ? '核对同步结果' : titles[dialog?.kind] ?? '本机回收站';
+    const title = dialog?.stage === 'review' ? reviewTitles[dialog.kind] : dialog?.stage === 'legacy' ? '选择云端主要版本' : ['progress', 'uncertain'].includes(dialog?.stage) ? '核对同步结果' : titles[dialog?.kind] ?? '本机回收站';
     const repairReady = canAct && canRepairBinding(binding) && !dialog?.stale;
     const planReady = Boolean(canAct && plan && plan.expiresAt > Date.now() && (dialog.kind !== 'archives' || plan.eligibility === 'unchecked') && (dialog.kind !== 'repair' || repairReady));
     const itemReady = Boolean(canAct && selected && !dialog?.stale && (dialog.kind !== 'archives' || selected.state === 'available'));
@@ -2158,7 +1376,7 @@ function createBidirectionalPanel(React, { Button, Input, Checkbox, Switch, Moda
           h(Button, { type: 'button', variant: 'outline', disabled: !canDiscover, onClick: () => start(() => controller.openPair()) }, discoveryLabel))),
       body('配对前先预览，确认后才启用；不会自动选择工作区。'),
       (!identity?.loggedIn || rejectedSavedIdentity) && h('div', { style: styles.row }, body(rejectedSavedIdentity ? '同步授权已失效，请重新登录；不会自动重发凭据。' : '请先在账号卡片登录。'), h(Button, { type: 'button', variant: 'outline', onClick: requestAuthentication }, rejectedSavedIdentity ? '重新登录' : '前往登录')),
-      identity?.loggedIn && status?.capability === 'upgrade-required' && body('请升级同步服务器后使用双向同步。旧版归档仍可单独下载。', { role: 'status', style: { ...styles.body, ...styles.warning } }),
+      identity?.loggedIn && status?.capability === 'upgrade-required' && body('请升级同步服务器后使用双向同步。已有云端数据会保留，不会自动启用同步。', { role: 'status', style: { ...styles.body, ...styles.warning } }),
       identity?.loggedIn && (!state.ready || !identityMatches) && body(state.refreshing ? '正在核对账号状态…' : '状态尚未确认，请刷新。', { role: 'status' }),
       loggedIn && state.ready && status.capability === 'unknown' && body('点击“连接项目”检查服务器能力；打开页面或刷新状态不会连接云端。', { role: 'status' }),
       state.error && body(state.error.message, { role: 'alert', style: { ...styles.body, ...styles.warning } }),
@@ -2208,11 +1426,18 @@ function createBidirectionalPanel(React, { Button, Input, Checkbox, Switch, Moda
                   h(Checkbox, { checked: dialog.workspaceId === row.id, label: row.label + (row.available ? '' : ' · 不可用'), disabled: !canAct || !row.available, onChange: selected => act(() => controller.selectWorkspace(selected ? row.id : '')) }), root(row.root)))),
                 !workspaces.length && body('没有匹配的工作区；请先在 DSH 中添加工作区。'), workspaces.length > 100 && body('仅显示前100项，请继续搜索。')),
               h('div', { style: styles.column }, h('h4', { style: styles.heading }, '云端项目'), search(projectSearch, setProjectSearch, '搜索云端项目'),
-                h(Checkbox, { checked: dialog.projectChoice === 'new', label: '创建新的云端项目', disabled: !canAct || !state.projects.loaded, onChange: selected => act(() => controller.selectProject(selected ? null : undefined)) }),
-                h('div', { style: styles.list, role: 'group', 'aria-label': '云端项目列表' }, ...projects.slice(0, 100).map(row => h(Checkbox, { key: row.projectId, checked: dialog.projectChoice === 'existing' && dialog.projectId === row.projectId, label: row.label + (row.legacy ? ' · 旧版' : ''), disabled: !canAct || !state.projects.loaded, onChange: selected => act(() => controller.selectProject(selected ? row.projectId : undefined)) }))),
+                h('div', { style: styles.projectOption, 'data-cloud-choice': 'new' },
+                  h(Checkbox, { checked: dialog.projectChoice === 'new', label: '创建新的云端项目', disabled: !canAct || !state.projects.loaded, onChange: selected => act(() => controller.selectProject(selected ? null : undefined)) }),
+                  root('新建独立项目，不覆盖已有备份。')),
+                h('div', { style: { ...styles.list, ...styles.column, gap: 8 }, role: 'group', 'aria-label': '云端项目列表' }, ...projects.slice(0, 100).map(row => h('div', { key: row.projectId, style: styles.projectOption, 'data-cloud-project-id': row.projectId },
+                  h(Checkbox, { checked: dialog.projectChoice === 'existing' && dialog.projectId === row.projectId, label: row.label, disabled: !canAct || !state.projects.loaded, onChange: selected => act(() => controller.selectProject(selected ? row.projectId : undefined)) }),
+                  row.sourceRoot && root(`来源：${row.sourceRoot}`),
+                  row.checkpointCount !== undefined && root(`已保存 ${row.checkpointCount} 个版本${row.latestCreatedAt ? ` · 最近 ${when(row.latestCreatedAt)}` : ''}`),
+                  duplicateProject(row) && h('details', null, h('summary', { style: styles.root }, '区分同名项目'), root(`项目标识：${row.projectId}`))))),
+                body('已有云端内容会保留；首次连接须预览并确认。'),
                 state.projects.loaded && !projects.length && body('暂无匹配的云端项目，可显式创建新项目。'), projects.length > 100 && body('仅显示前100项，请继续搜索。'), state.projects.partial && body('部分云端项目读取失败，请刷新核对。', { role: 'alert' }))),
-            dialog.legacyChoices.length > 0 && h('div', { style: styles.column, role: 'group', 'aria-label': '旧版主版本' }, body('旧版项目存在多个分支。请选择一次性主版本，其余差异仍保留，不推断历史删除。'),
-              ...dialog.legacyChoices.map(row => h(Checkbox, { key: row.id, checked: dialog.primaryLegacyId === row.id, label: row.label, disabled: !canAct, onChange: checked => { if (checked) act(() => controller.selectLegacy(row.id)); } })))),
+            dialog.legacyChoices.length > 0 && h('div', { style: styles.column, role: 'group', 'aria-label': '云端主要版本' }, body('这个项目保存过不同分支。请选择首次连接采用的主要版本，其余差异和历史内容仍保留，不会把缺少的文件当作删除指令。'),
+              ...dialog.legacyChoices.map(row => h('div', { key: row.id, style: styles.projectOption }, h(Checkbox, { checked: dialog.primaryLegacyId === row.id, label: row.label, disabled: !canAct, onChange: checked => { if (checked) act(() => controller.selectLegacy(row.id)); } }))))),
           ['conflicts', 'recycle'].includes(dialog.kind) && dialog.stage === 'choose' && h('div', { style: styles.column },
             binding && h('div', null, body(binding.label), root(binding.root)), search(itemSearch, setItemSearch, dialog.kind === 'conflicts' ? '搜索冲突文件' : '搜索回收文件', true),
             dialog.kind === 'conflicts' && body('默认保留双方。先预览目标文件，再明确确认；不提供自动文本合并。'),
@@ -2243,7 +1468,8 @@ function createBidirectionalPanel(React, { Button, Input, Checkbox, Switch, Moda
             dialog.kind === 'pair' && h('div', { style: styles.column }, body(plan.label), root(plan.root),
               body(`上传 ${plan.summary.upload} · 下载 ${plan.summary.download} · 删除 ${plan.summary.delete} · 冲突 ${plan.summary.conflicts} · 阻止 ${plan.summary.blocked}`, { 'aria-label': '配对变更摘要' }),
               plan.summary.blocked > 0 && body('存在阻止项，不能启用。请返回处理后重新预览。', { role: 'alert' }),
-              body('确认后启用此配对的自动双向同步。未跟踪文件不会被当作删除；有冲突时保留副本。')),
+              body('确认后启用此配对的自动双向同步。未跟踪文件不会被当作删除；有冲突时保留副本。'),
+              state.projects.items.find(row => row.projectId === dialog.projectId)?.legacy && body('此项目的历史内容会保留。连接后以双向状态为准，旧客户端将不能再向此项目追加备份。')),
             dialog.kind === 'conflicts' && h('div', { style: styles.column }, root(plan.root), body(plan.summary),
               body(`选择：${({ both: '保留双方', local: '本机版本', remote: '云端版本' })[plan.choice]}`),
               h('ul', { style: { ...styles.body, ...styles.list }, 'aria-label': '冲突处理目标' }, ...plan.paths.map((name, index) => h('li', { key: index }, name)))),
@@ -2273,16 +1499,15 @@ function createBidirectionalPanel(React, { Button, Input, Checkbox, Switch, Moda
 return Object.freeze({createBidirectionalPanel});
 })();
 __clientModules["./adapter.mjs"] = (() => {
-const { createController, deriveView, filterProjects } = __clientModules["./state.mjs"];
+const { createController, deriveView } = __clientModules["./state.mjs"];
 const { createBidirectionalPanel } = __clientModules["./bidirectional-panel.mjs"];
 
 // DSH 0.2.0-rc.2 uses React slots; both React and controls come from its module loader.
 function createClientPlugin(require) {
   const React = require('react');
-  const { Button, Input, Checkbox, Switch, Modal, IconFolderCloseRegular } = require('@deepseek-ai/dsh-client-ui-primitives');
+  const { Button, Input, Checkbox, Switch, Modal } = require('@deepseek-ai/dsh-client-ui-primitives');
   const h = React.createElement;
   const BidirectionalPanel = createBidirectionalPanel(React, { Button, Input, Checkbox, Switch, Modal });
-  const folderIcon = IconFolderCloseRegular ? h('span', { 'aria-hidden': 'true', style: { display: 'inline-flex', flexShrink: 0 } }, h(IconFolderCloseRegular, { size: 16 })) : null;
   const styles = {
     page: { maxWidth: 820, minWidth: 0, display: 'flex', flexDirection: 'column', gap: 16, color: 'var(--dsw-alias-label-primary)' },
     card: { minWidth: 0, display: 'flex', flexDirection: 'column', gap: 12, padding: 16, borderRadius: 'var(--dsw-radius-xl, 12px)', border: '1px solid var(--dsw-alias-settings-card-stroke)', background: 'var(--dsw-alias-settings-card-fill)', boxSizing: 'border-box' },
@@ -2295,21 +1520,16 @@ function createClientPlugin(require) {
     grid: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 240px), 1fr))', gap: 12 },
     badge: { display: 'inline-flex', alignItems: 'center', gap: 6, border: '1px solid var(--dsw-alias-settings-card-stroke)', borderRadius: 999, padding: '3px 9px', fontSize: 12 },
     root: { margin: '4px 0 0', color: 'var(--dsw-alias-label-tertiary)', fontSize: 12, lineHeight: '19px', overflowWrap: 'anywhere', userSelect: 'text' },
-    project: { display: 'flex', flexDirection: 'column', gap: 4, padding: '10px 0', borderBottom: '1px solid var(--dsw-alias-settings-card-stroke)' },
-    list: { maxHeight: 350, overflowY: 'auto', overscrollBehavior: 'contain', paddingRight: 6 },
     summary: { minWidth: 0, flex: '1 1 240px', display: 'flex', flexDirection: 'column', gap: 6 },
-    summaryList: { margin: 0, paddingLeft: 20, color: 'var(--dsw-alias-label-secondary)', fontSize: 13, lineHeight: '21px', overflowWrap: 'anywhere' },
     warning: { color: 'var(--dsw-alias-state-warning-primary, var(--dsw-alias-label-secondary))' },
     error: { color: 'var(--dsw-alias-state-error-primary, var(--dsw-alias-label-primary))' },
   };
-  const when = value => {
-    if (!value) return '尚无记录';
-    const date = new Date(value);
-    return Number.isFinite(date.getTime()) ? date.toLocaleString('zh-CN') : '未知时间';
-  };
   const sameIdentity = (status, binding) => Boolean(status && binding && status.server === binding.server && status.username === binding.username && status.revision === binding.revision);
+  const bindingOf = status => Object.freeze({ server: status.server, username: status.username, revision: status.revision });
 
   function SettingsPage({ controller, connection }) {
+    // Account/local status/native updates are separate from project operations.
+    // All project operations belong to the single bidirectional panel below.
     const state = React.useSyncExternalStore(controller.subscribe, controller.getSnapshot);
     const status = state.status;
     const view = deriveView(state);
@@ -2317,21 +1537,7 @@ function createClientPlugin(require) {
     const [server, setServer] = React.useState(status?.server ?? '');
     const [username, setUsername] = React.useState(status?.username ?? '');
     const [remember, setRemember] = React.useState(false);
-    const [search, setSearch] = React.useState('');
-    const [projectManagerOpen, setProjectManagerOpen] = React.useState(false);
-    const [cloudOpen, setCloudOpen] = React.useState(false);
-    const [cloudStage, setCloudStage] = React.useState('select');
-    const [downloadSearch, setDownloadSearch] = React.useState('');
-    const [suggestionsOpen, setSuggestionsOpen] = React.useState(false);
-    const [activeSuggestion, setActiveSuggestion] = React.useState('');
-    const [downloadNotice, setDownloadNotice] = React.useState('');
-    const downloadInput = React.useRef(null);
-    const comboRoot = React.useRef(null);
-    const stageFocus = React.useRef(null);
-    const mainRefresh = React.useRef(null);
-    const composition = React.useRef({ active: false, ended: false });
-    const cloudLife = React.useRef(0);
-    const [confirmLogout, setConfirmLogout] = React.useState(false);
+    const [logoutIdentity, setLogoutIdentity] = React.useState(null);
     const [passwordIdentity, setPasswordIdentity] = React.useState(null);
     // Secrets live in uncontrolled native inputs, never React/controller state or storage.
     const password = React.useRef(null);
@@ -2339,6 +1545,7 @@ function createClientPlugin(require) {
     const newPassword = React.useRef(null);
     const confirmPassword = React.useRef(null);
     const passwordBinding = React.useRef(null);
+    const logoutBinding = React.useRef(null);
     const clearSecrets = () => {
       for (const ref of [password, currentPassword, newPassword, confirmPassword]) if (ref.current) ref.current.value = '';
     };
@@ -2348,21 +1555,30 @@ function createClientPlugin(require) {
       setPasswordIdentity(null);
       controller.cancelPasswordChange();
     };
+    const closeLogout = () => {
+      clearSecrets();
+      logoutBinding.current = null;
+      setLogoutIdentity(null);
+    };
     React.useEffect(() => {
       let previous = controller.getSnapshot();
       // Invalidate immediately on Host changes, before React can render a stale submit handler.
       const unsubscribe = controller.subscribe(() => {
         const next = controller.getSnapshot();
-        if (!sameIdentity(next.status, previous.status) || next.status?.loggedIn !== previous.status?.loggedIn || next.busy !== previous.busy || deriveView(next).updateBlocked !== deriveView(previous).updateBlocked) clearSecrets();
-        if (!sameIdentity(next.status, previous.status) || next.status?.loggedIn !== previous.status?.loggedIn || next.update?.currentVersion !== previous.update?.currentVersion || deriveView(next).updateBlocked !== deriveView(previous).updateBlocked) { ++cloudLife.current; setCloudOpen(false); setSuggestionsOpen(false); setDownloadSearch(''); setDownloadNotice(''); }
+        const identityChanged = !sameIdentity(next.status, previous.status) || next.status?.loggedIn !== previous.status?.loggedIn;
+        const runtimeChanged = next.update?.currentVersion !== previous.update?.currentVersion;
+        const updateGateChanged = deriveView(next).updateBlocked !== deriveView(previous).updateBlocked;
+        if (identityChanged || runtimeChanged || updateGateChanged || next.busy !== previous.busy) clearSecrets();
+        // Store first: cancelling an in-flight password request can notify this subscription again.
         previous = next;
-        if (passwordBinding.current && !sameIdentity(next.status, passwordBinding.current)) closePassword();
+        if (passwordBinding.current && (identityChanged || runtimeChanged || updateGateChanged)) closePassword();
+        if (logoutBinding.current && (identityChanged || runtimeChanged || updateGateChanged)) closeLogout();
       });
       const stop = controller.watch();
       return () => {
         clearSecrets();
         passwordBinding.current = null;
-        ++cloudLife.current;
+        logoutBinding.current = null;
         unsubscribe();
         controller.cancelPasswordChange();
         stop();
@@ -2384,155 +1600,53 @@ function createClientPlugin(require) {
       const latest = controller.getSnapshot();
       if (!deriveView(latest).canChangePassword) return;
       clearSecrets();
-      const binding = Object.freeze({ server: latest.status.server, username: latest.status.username, revision: latest.status.revision });
+      const binding = bindingOf(latest.status);
       passwordBinding.current = binding;
       setPasswordIdentity(binding);
     };
     const changePassword = event => {
       event.preventDefault();
-      const binding = passwordBinding.current;
+      const binding = passwordIdentity;
       const input = { currentPassword: currentPassword.current?.value ?? '', newPassword: newPassword.current?.value ?? '', confirmPassword: confirmPassword.current?.value ?? '' };
       clearSecrets();
-      if (!sameIdentity(controller.getSnapshot().status, binding)) { closePassword(); return; }
+      if (!binding || passwordBinding.current !== binding || !sameIdentity(controller.getSnapshot().status, binding)) return;
       void controller.changePassword(binding, input).then(changed => {
         if (changed && passwordBinding.current === binding) closePassword();
       }).finally(clearSecrets);
     };
+    const openLogout = () => {
+      const latest = controller.getSnapshot();
+      if (!deriveView(latest).canLogout) return;
+      closePassword();
+      const binding = bindingOf(latest.status);
+      logoutBinding.current = binding;
+      setLogoutIdentity(binding);
+    };
+    const logout = () => {
+      clearSecrets();
+      if (!logoutIdentity || logoutBinding.current !== logoutIdentity || !sameIdentity(controller.getSnapshot().status, logoutIdentity)) return;
+      closeLogout();
+      void controller.logout();
+    };
     const blurSecrets = event => { if (!event.currentTarget.contains(event.relatedTarget)) clearSecrets(); };
-    const openProjects = () => {
-      if (!controller.getSnapshot().status || deriveView(controller.getSnapshot()).updateBlocked || deriveView(controller.getSnapshot()).pickingDestination) return;
-      clearSecrets();
-      setSearch('');
-      setProjectManagerOpen(true);
-    };
-    // Closing only hides the editor; the existing draft/save contract stays explicit.
-    const closeProjects = () => {
-      if (controller.getSnapshot().busy === 'preferences') return;
-      clearSecrets();
-      setProjectManagerOpen(false);
-      setSearch('');
-    };
-    const saveProjects = () => {
-      clearSecrets();
-      void controller.savePreferences().then(saved => { if (saved) closeProjects(); });
-    };
-    const openCloud = () => {
-      if (!deriveView(controller.getSnapshot()).canBrowse) return;
-      clearSecrets(); ++cloudLife.current; composition.current = { active: false, ended: false }; setDownloadSearch(''); setSuggestionsOpen(false); setActiveSuggestion(''); setCloudStage('select'); setCloudOpen(true);
-      void controller.browseProjects();
-    };
-    const closeCloud = () => {
-      ++cloudLife.current; composition.current = { active: false, ended: false }; setCloudOpen(false); setSuggestionsOpen(false); controller.closeDownloadBrowser(); controller.cancelDownloadIntent();
-      // Native Modal restores its invoker; an accepted download disables that button.
-      queueMicrotask(() => { const target = mainRefresh.current; if (target?.isConnected && !target.disabled && target.ownerDocument.activeElement === target.ownerDocument.body) target.focus(); });
-    };
-    const cloud = state.cloud;
-    const intent = state.downloadIntent;
-    const downloads = state.downloadSelection;
-    const download = status?.download;
-    const directoryBrowser = state.downloadBrowser;
-    const downloadTitle = ({ select: '选择要下载的项目', folders: '选择保存位置', review: '确认下载所选项目', progress: '下载进度', import: '导入安全会话？' })[cloudStage];
-    const showProgress = () => { clearSecrets(); setCloudStage('progress'); setCloudOpen(true); void controller.refresh(); };
-    const chooseDownloadFolder = () => {
-      clearSecrets(); const lifetime = cloudLife.current;
-      setSuggestionsOpen(false); setCloudOpen(true);
-      void controller.chooseDownloadDestination().then(selected => {
-        if (cloudLife.current !== lifetime) return;
-        if (controller.getSnapshot().downloadBrowser) setCloudStage('folders');
-        else if (selected && controller.getSnapshot().downloadPlan && controller.prepareDownload()) setCloudStage('review');
-      });
-    };
-    const backToDownloadSelection = () => { controller.closeDownloadBrowser(); controller.cancelDownloadIntent(); setCloudStage('select'); };
-    const registeredRoot = (restoreId, root) => state.registrationResults?.[restoreId]?.registered === true || status?.projects.some(project => project.root === root);
-    React.useEffect(() => {
-      if (!cloudOpen || cloudStage === 'select') return;
-      stageFocus.current?.focus();
-    }, [cloudOpen, cloudStage]);
-    React.useEffect(() => {
-      if (!cloudOpen || !suggestionsOpen || !comboRoot.current) return;
-      const doc = comboRoot.current.ownerDocument;
-      const outside = event => { if (!comboRoot.current?.contains(event.target)) setSuggestionsOpen(false); };
-      doc.addEventListener('pointerdown', outside);
-      return () => doc.removeEventListener('pointerdown', outside);
-    }, [cloudOpen, suggestionsOpen]);
-    const recovery = status?.recovery;
     const updater = state.update;
     const updateIntent = state.updateIntent;
     const installing = ['installing', 'cancelling'].includes(updater?.state) || ['installupdate', 'cancelupdate'].includes(state.busy);
     const updateLabel = state.updateUncertain ? '结果未确认' : state.busy === 'checkupdate' ? '检查中…' : ({ idle: '尚未检查', checking: '检查中…', available: '有新版本', 'up-to-date': '已是最新版本', installing: '更新中…', cancelling: '更新中…', 'restart-required': '待重启', cancelled: '已取消', failed: '更新未完成', uncertain: '结果未确认' }[updater?.state] ?? '尚未检查');
     const manualUpdate = updater?.state === 'available' && Boolean(updater.candidate) && !state.updateError;
     const updateAction = installing ? '更新中…' : view.restartRequired ? '待重启' : manualUpdate ? '手动更新' : '检查更新';
-    const projectLabel = project => project?.label ?? status?.projects.find(item => item.projectId === project?.projectId)?.label ?? '项目文件夹';
-    const chosenIds = new Set(downloads.map(item => item.projectId));
-    const query = downloadSearch.trim().toLocaleLowerCase();
-    const unchosen = cloud.projects.filter(item => !chosenIds.has(item.projectId) && (!query || `${projectLabel(item)}\n${item.sourceRoot ?? ''}`.toLocaleLowerCase().includes(query)));
-    const suggestions = unchosen.slice(0, 100);
-    const activeOption = suggestions.find(item => item.projectId === activeSuggestion);
-    const dropdownOpen = cloudOpen && cloudStage === 'select' && suggestionsOpen;
-    const addSuggested = projectId => {
-      const project = suggestions.find(item => item.projectId === projectId);
-      if (!project || !deriveView(controller.getSnapshot()).canBrowse || controller.getSnapshot().downloadSelection.length >= 20) return;
-      const lifetime = cloudLife.current;
-      setSuggestionsOpen(false); setActiveSuggestion(''); setDownloadSearch('');
-      void controller.addDownloadProject(projectId).then(() => {
-        if (cloudLife.current !== lifetime) return;
-        if (controller.getSnapshot().downloadSelection.some(item => item.projectId === projectId)) setDownloadNotice(`已添加 ${projectLabel(project)}`);
-        // Only restore input after its own selection; never steal a later outside click.
-        const input = downloadInput.current;
-        if (input && (!input.ownerDocument.activeElement || input.ownerDocument.activeElement === input || input.ownerDocument.activeElement === input.ownerDocument.body)) input.focus();
-      });
-    };
-    const composingKey = event => composition.current.active || composition.current.ended || event.isComposing || event.nativeEvent?.isComposing || event.keyCode === 229 || event.nativeEvent?.keyCode === 229;
-    const comboEscape = event => {
-      if (event.key !== 'Escape' || !dropdownOpen || event.shiftKey || event.ctrlKey || event.altKey || event.metaKey) return;
-      event.preventDefault(); event.stopPropagation();
-      if (!composingKey(event)) { setSuggestionsOpen(false); setActiveSuggestion(''); }
-    };
-    const comboKey = event => {
-      if (composingKey(event) || event.ctrlKey || event.altKey || event.metaKey) return;
-      if (event.key === 'Escape') { comboEscape(event); return; }
-      if (event.key === 'Tab') { setSuggestionsOpen(false); setActiveSuggestion(''); return; }
-      if (['ArrowDown', 'ArrowUp'].includes(event.key)) {
-        event.preventDefault(); setSuggestionsOpen(true);
-        const current = suggestions.findIndex(item => item.projectId === activeSuggestion);
-        const index = current < 0 ? (event.key === 'ArrowDown' ? 0 : suggestions.length - 1) : (current + (event.key === 'ArrowDown' ? 1 : -1) + suggestions.length) % suggestions.length;
-        setActiveSuggestion(suggestions[index]?.projectId ?? '');
-      } else if (event.key === 'Enter' && dropdownOpen) {
-        event.preventDefault(); if (activeOption) addSuggested(activeOption.projectId);
-      }
-    };
-    React.useEffect(() => {
-      if (dropdownOpen && activeOption) comboRoot.current?.querySelector(`[id="${id}-download-option-${activeOption.projectId}"]`)?.scrollIntoView?.({ block: 'nearest' });
-    }, [dropdownOpen, activeOption?.projectId]);
-    const projects = filterProjects(status?.projects ?? [], search);
-    const checkedIds = new Set(state.draft.projectIds);
-    const selectedProjects = (status?.projects ?? []).filter(project => checkedIds.has(project.id));
     const loginState = state.loading ? '读取中' : !state.ready ? '状态未确认' : status?.loggedIn ? '已登录' : '未登录';
     const passwordOpen = sameIdentity(status, passwordIdentity) && passwordBinding.current === passwordIdentity;
+    const logoutOpen = status?.loggedIn === true && sameIdentity(status, logoutIdentity) && logoutBinding.current === logoutIdentity;
     const body = (content, extra = {}) => h('p', { style: styles.body, ...extra }, content);
-    const registrationControl = (restoreId, root, label) => registeredRoot(restoreId, root)
-      ? body('已添加到DSH项目', { role: 'status' })
-      : h(Button, { type: 'button', variant: 'outline', disabled: !view.canRecover, 'aria-label': `将 ${label} 添加到DSH项目`, onClick: () => { clearSecrets(); void controller.registerRestoredProject(restoreId); } }, state.registrationResults?.[restoreId]?.uncertain ? '核对项目登记' : '添加到DSH项目');
-    const recoveryResult = !download && recovery && h('div', { style: styles.form, role: 'status', 'aria-live': 'polite', 'data-personal-sync': 'recovery-result' },
-      body(`${recovery.kind === 'restore' ? '下载' : '导入'}${recovery.state === 'running' ? '进行中…' : recovery.state === 'succeeded' ? '完成' : '未完成'}`),
-      body(recovery.root, { style: styles.root }),
-      recovery.kind === 'restore' && recovery.sessionCount !== undefined && body(`会话归档 ${recovery.sessionCount} 个`),
-      recovery.kind === 'restore' && recovery.state === 'succeeded' && registrationControl(recovery.id, recovery.root, '已下载项目'),
-      state.registrationError && body(state.registrationError.message, { role: 'alert', style: styles.warning }),
-      recovery.kind === 'import' && body(`已导入 ${recovery.importedCount ?? '未确认'} · 已跳过 ${recovery.skippedCount ?? '未确认'} · 失败 ${recovery.failedCount ?? '未确认'}`),
-      view.recoveryError && body(view.recoveryError, { role: 'alert', style: { ...styles.body, ...styles.warning } }),
-      recovery.state === 'failed' && body(recovery.kind === 'restore' ? '目录可能不完整，请使用新目录重试' : '部分会话可能已写入，勿重复导入', { style: { ...styles.body, ...styles.warning } }),
-      recovery.sessions?.length > 0 && h('div', { style: styles.list, 'aria-label': '会话导入结果' }, ...recovery.sessions.map(item => h('div', { key: item.sourceId, style: styles.project },
-        body(`${item.sourceId} → ${item.sessionId ?? '无新会话 ID'} · ${{ imported: '已导入', skipped: '已跳过', failed: '失败' }[item.outcome]}`),
-        item.workspaceAttached === false && body('未关联工作区，勿重复导入', { style: { ...styles.body, ...styles.warning } })) )));
     return h('section', { style: styles.page, 'aria-label': '个人云同步', 'aria-busy': state.loading || state.refreshing || Boolean(state.busy), 'data-personal-sync': 'settings' },
       h('div', { style: styles.between },
         h('h2', { style: { ...styles.heading, fontSize: 18 } }, '个人云同步'),
-        h(Button, { ref: mainRefresh, type: 'button', variant: 'ghost', disabled: Boolean(state.busy) || state.refreshing,
-          onClick: () => { clearSecrets(); void controller.refresh(); } }, state.refreshing ? '刷新中…' : state.conflict ? '刷新并重新选择' : '刷新')),
-      state.error && !passwordOpen && !projectManagerOpen && h('div', { role: 'alert', style: { ...styles.card, ...styles.error }, 'data-personal-sync': 'error' }, state.error.message),
+        h(Button, { type: 'button', variant: 'ghost', disabled: Boolean(state.busy) || state.refreshing,
+          onClick: () => { clearSecrets(); void controller.refresh(); } }, state.refreshing ? '刷新中…' : '刷新')),
+      state.error && !passwordOpen && h('div', { role: 'alert', style: { ...styles.card, ...styles.error }, 'data-personal-sync': 'error' }, state.error.message),
       state.notice && body(state.notice, { role: 'status', 'aria-live': 'polite' }),
-      h('section', { style: styles.card, 'aria-labelledby': `${id}-account-title` },
+      h('section', { style: styles.card, 'aria-labelledby': `${id}-account-title`, 'data-personal-sync': 'account-summary' },
         h('div', { style: styles.between },
           h('h3', { id: `${id}-account-title`, style: styles.heading }, '账号'),
           h('span', { style: styles.badge, role: 'status', 'aria-live': 'polite', 'data-personal-sync': 'login-status' }, loginState)),
@@ -2556,60 +1670,9 @@ function createClientPlugin(require) {
               h(Button, { type: 'submit', variant: 'primary', disabled: !view.canLogin, 'aria-busy': state.busy === 'login' }, state.busy === 'login' ? '登录中…' : '登录'))),
         h('div', { style: styles.row },
           h(Button, { type: 'button', variant: 'outline', disabled: !view.canChangePassword, onClick: openPassword }, '修改密码'),
-          h(Button, { type: 'button', variant: 'ghost', disabled: !view.canLogout,
-            onClick: () => { closePassword(); setConfirmLogout(true); } }, state.busy === 'logout' ? '退出中…' : '退出登录')),
+          h(Button, { type: 'button', variant: 'ghost', disabled: !view.canLogout, onClick: openLogout }, state.busy === 'logout' ? '退出中…' : '退出登录')),
         status?.warning && body(status.warning, { role: 'status', style: { ...styles.body, ...styles.warning } })),
-      h(BidirectionalPanel, { connection, identity: { server: status?.server ?? '', username: status?.username ?? '', loggedIn: status?.loggedIn === true }, onAuthenticationRequired: () => { clearSecrets(); void controller.refresh().then(() => password.current?.focus?.()); } }),
-      h('details', { style: { ...styles.form, gap: 16 }, 'data-personal-sync': 'legacy-actions' },
-      h('summary', { style: { ...styles.body, cursor: 'pointer' } }, '备份与恢复（高级）'),
-      h('section', { style: styles.card, 'aria-labelledby': `${id}-projects-title`, 'data-personal-sync': 'projects-summary' },
-        h('div', { style: { ...styles.between, alignItems: 'flex-start' } },
-          h('div', { style: styles.summary },
-            h('h3', { id: `${id}-projects-title`, style: styles.heading }, '同步项目'),
-            body(status ? `仅同步所选项目，已选择 ${view.selectedCount} 项` : '读取中'),
-            selectedProjects.length > 0
-              ? h('ul', { style: styles.summaryList, 'aria-label': '已选同步项目' }, ...selectedProjects.slice(0, 3).map(project =>
-                h('li', { key: project.id }, project.label + (project.available ? '' : ' · 不可用'))))
-              : status && body(status.projects.length ? '暂未选择项目' : '暂无项目'),
-            selectedProjects.length > 3 && body(`另有 ${selectedProjects.length - 3} 个项目`),
-            state.dirty && h('span', { style: styles.body, role: 'status' }, '未保存')),
-          h(Button, { type: 'button', variant: 'outline', disabled: !status || view.updateBlocked || view.pickingDestination, onClick: openProjects }, '管理'))),
-      h('section', { style: styles.card, 'aria-labelledby': `${id}-cloud-title`, 'data-personal-sync': 'cloud-summary' },
-        h('div', { style: styles.between },
-          h('div', { style: styles.summary }, h('h3', { id: `${id}-cloud-title`, style: styles.heading }, '云端下载'),
-            body(`已选择 ${downloads.length} 个项目`),
-            downloads.length > 0 && h('ul', { style: styles.summaryList, 'aria-label': '所选下载项目' }, ...downloads.slice(0, 3).map(row => h('li', { key: row.projectId }, row.label))),
-            downloads.length > 3 && body(`另有 ${downloads.length - 3} 个项目`)),
-          h(Button, { type: 'button', variant: 'outline', 'aria-label': downloads.length ? '管理下载项目' : '选择下载项目', disabled: !view.canBrowse, onClick: openCloud }, downloads.length ? '管理' : '选择项目')),
-        h('div', { style: styles.between },
-          h('div', { style: styles.summary }, body('保存位置'), body(state.downloadPlan?.parent ?? '尚未选择', { style: styles.root, 'aria-label': '下载保存位置' })),
-          h(Button, { type: 'button', variant: 'outline', disabled: !view.canChooseDownloadDestination, onClick: chooseDownloadFolder }, state.busy === 'downloadpick' ? '选择中…' : '保存位置')),
-        h('div', { style: styles.row },
-          h(Button, { type: 'button', variant: 'primary', disabled: !view.canDownload, onClick: () => { clearSecrets(); if (controller.prepareDownload()) { setCloudStage('review'); setCloudOpen(true); } } }, '下载所选'),
-          download && h(Button, { type: 'button', variant: 'ghost', disabled: Boolean(state.busy) || state.refreshing, onClick: showProgress }, '查看下载进度')),
-        download && body(`下载${({ running: '进行中…', succeeded: '完成', partial: '部分完成', failed: '未完成' })[download.state]} · ${download.completed}/${download.total}`, { role: 'status', 'aria-live': 'polite' }),
-        view.downloadWarning && body(view.downloadWarning, { role: 'alert', style: styles.warning }),
-        !download && !cloudOpen && recoveryResult,
-        (state.downloadUncertain || state.recoveryUncertain) && !cloudOpen && body('结果未确认，请刷新；勿重复提交', { role: 'alert', style: { ...styles.body, ...styles.warning } }),
-        state.downloadError && !cloudOpen && h('div', { role: 'alert', style: styles.error }, state.downloadError.message)),
-      h('section', { style: styles.card, 'aria-labelledby': `${id}-status-title` },
-        h('div', { style: styles.between },
-          h('h3', { id: `${id}-status-title`, style: styles.heading }, '同步状态'),
-          h('span', { style: styles.badge, role: 'status', 'aria-live': 'polite' }, !state.ready ? '状态未确认' : status?.running ? '同步中' : state.scheduled ? '已提交' : status?.pending ? '待重试' : '空闲')),
-        body(`待上传 ${status?.pending ?? '—'} · 可用项目 ${view.selectedAvailable}`),
-        status?.lastResult && h('div', { role: 'status', 'aria-live': 'polite' },
-          body(`${status.lastResult.ok ? '成功' : '未完成'} · ${when(status.lastResult.at)}`),
-          body(status.lastResult.message, { style: { ...styles.body, ...(status.lastResult.ok ? {} : styles.warning) } })),
-        h('div', { style: styles.between },
-          h('strong', { style: { fontSize: 14 } }, '自动同步'),
-          h(Switch, { checked: state.draft.autoSync, label: '自动同步',
-            disabled: !view.editable || (!status?.loggedIn && !state.draft.autoSync), onChange: enabled => controller.setAutoSync(enabled) })),
-        h('div', { style: styles.row },
-          h(Button, { type: 'button', variant: 'primary', disabled: !view.canSave, 'aria-busy': state.busy === 'preferences',
-            onClick: () => { clearSecrets(); void controller.savePreferences(); } }, state.busy === 'preferences' ? '保存中…' : '保存'),
-          h(Button, { type: 'button', variant: 'ghost', disabled: !view.editable || !state.dirty, onClick: () => controller.discardChanges() }, '撤销更改'),
-          h(Button, { type: 'button', variant: 'outline', disabled: !view.canSync, 'aria-busy': state.busy === 'sync',
-            onClick: () => { clearSecrets(); void controller.sync(); } }, state.busy === 'sync' ? '提交中…' : '立即同步')))),
+      h(BidirectionalPanel, { connection, identity: { server: status?.server ?? '', username: status?.username ?? '', loggedIn: status?.loggedIn === true }, onAuthenticationRequired: () => { clearSecrets(); return controller.refresh().then(() => { if (!controller.getSnapshot().status?.loggedIn) password.current?.focus?.(); }); } }),
       h('section', { style: styles.card, 'aria-labelledby': `${id}-update-title`, 'data-personal-sync': 'update-summary' },
         h('div', { style: styles.between },
           h('div', { style: styles.summary },
@@ -2618,143 +1681,18 @@ function createClientPlugin(require) {
           h(Button, { type: 'button', variant: 'primary', disabled: installing || view.restartRequired || (manualUpdate ? !view.canUpdate : !view.canCheckUpdate),
             onClick: () => { clearSecrets(); if (manualUpdate) controller.prepareUpdate(); else void controller.checkUpdate(); } }, updateAction)),
         view.restartRequired && !installing && body('请重启 DSH', { role: 'status' }),
-        view.updateError && body(view.updateError, { role: 'alert', style: { ...styles.body, ...styles.warning } }),
-        (state.dirty || state.conflict) && body('请先保存或撤销更改')),
-      h(Modal, { open: Boolean(updateIntent), onClose: () => controller.cancelUpdateIntent(), title: '确认更新插件？', closeLabel: '取消' },
+        view.updateError && body(view.updateError, { role: 'alert', style: { ...styles.body, ...styles.warning } })),
+      h(Modal, { open: Boolean(updateIntent), onClose: () => { clearSecrets(); controller.cancelUpdateIntent(); }, title: '确认更新插件？', closeLabel: '取消' },
         updateIntent && h('div', { style: styles.form },
           body(`${updateIntent.currentVersion} → ${updateIntent.version}`),
           body('更新后需重启 DSH'),
           h('div', { style: styles.row },
-            h(Button, { type: 'button', variant: 'ghost', onClick: () => controller.cancelUpdateIntent() }, '取消'),
-            h(Button, { type: 'button', variant: 'primary', disabled: !view.canUpdate, onClick: () => { void controller.confirmUpdate(updateIntent); } }, '确认更新')))),
-      h(Modal, { open: cloudOpen, onClose: closeCloud, title: downloadTitle, closeLabel: '关闭', onKeyDownCapture: comboEscape,
-        footer: cloudOpen && h('div', { style: styles.between },
-          h('span', { style: styles.body, role: 'status' }, cloudStage === 'select' ? `已选择 ${downloads.length} 个项目` : ''),
-          h('div', { style: styles.row },
-            h(Button, { type: 'button', variant: 'ghost', onClick: closeCloud }, '关闭'),
-            cloudStage === 'select' && h(Button, { type: 'button', variant: 'primary', disabled: !view.canChooseDownloadDestination, onClick: chooseDownloadFolder }, '下一步：保存位置'),
-            ['folders', 'review'].includes(cloudStage) && h(Button, { type: 'button', variant: 'outline', disabled: Boolean(state.busy) || state.refreshing, onClick: backToDownloadSelection }, '返回选择'),
-            cloudStage === 'review' && intent?.kind === 'download' && h(Button, { type: 'button', variant: 'primary', disabled: !view.canDownload, onClick: () => {
-              if (controller.getSnapshot().downloadIntent !== intent) return;
-              const lifetime = cloudLife.current;
-              void controller.confirmDownload(intent).then(accepted => { if (cloudLife.current === lifetime && (accepted || controller.getSnapshot().downloadUncertain)) setCloudStage('progress'); });
-            } }, '确认下载'),
-            cloudStage === 'import' && intent?.kind === 'import' && h(Button, { type: 'button', variant: 'primary', disabled: !view.canRecover, onClick: () => {
-              if (controller.getSnapshot().downloadIntent !== intent) return;
-              const lifetime = cloudLife.current;
-              void controller.confirmDownloadImport(intent).then(accepted => { if (cloudLife.current === lifetime && (accepted || controller.getSnapshot().downloadUncertain)) setCloudStage('progress'); });
-            } }, '确认导入'))) },
-        cloudOpen && h('div', { style: styles.form, ref: stageFocus, tabIndex: -1, ...(cloudStage !== 'select' ? { 'data-modal-autofocus': '' } : {}) },
-          cloudStage === 'select' && h('div', { style: styles.form },
-            !downloads.length && body('尚未选择项目，请在下方添加'),
-            downloads.length > 0 && h('ul', { style: { ...styles.list, listStyle: 'none', margin: 0, padding: 0 }, 'aria-label': '已选择的下载项目' }, ...downloads.map((row, index) => h('li', { key: row.projectId, style: styles.project },
-              h('div', { style: styles.between },
-                h('strong', { style: { ...styles.row, fontSize: 14 } }, folderIcon, row.label),
-                h('div', { style: styles.row },
-                  h(Button, { type: 'button', variant: 'ghost', disabled: !view.canBrowse, 'data-download-remove': '', 'aria-label': `移除 ${row.label}`, onClick: event => {
-                    const list = event.currentTarget?.closest?.('ul');
-                    if (controller.removeDownloadProject(row.projectId)) { setDownloadNotice(`已移除 ${row.label}`); queueMicrotask(() => { const buttons = list?.querySelectorAll?.('[data-download-remove]'); const target = buttons?.[Math.min(index, (buttons?.length ?? 0) - 1)]; (target?.isConnected ? target : downloadInput.current)?.focus(); }); }
-                  } }, '移除'))),
-              downloads.some(other => other !== row && other.label === row.label) && row.sourceRoot && body(row.sourceRoot, { style: styles.root })))),
-            h('div', { ref: comboRoot, style: { ...styles.form, paddingTop: 12, borderTop: '1px solid var(--dsw-alias-settings-card-stroke)' },
-              onBlur: event => { if (!event.currentTarget.contains(event.relatedTarget)) { setSuggestionsOpen(false); setActiveSuggestion(''); } } },
-              h('label', { style: styles.label, htmlFor: `${id}-download-add` }, '添加项目',
-                h(Input, { ref: downloadInput, id: `${id}-download-add`, type: 'text', role: 'combobox', value: downloadSearch, placeholder: '搜索云端项目…', autoComplete: 'off', spellCheck: false, maxLength: 1024,
-                  'data-modal-autofocus': '', 'aria-autocomplete': 'list', 'aria-expanded': dropdownOpen, 'aria-controls': dropdownOpen ? `${id}-download-options` : undefined,
-                  'aria-activedescendant': dropdownOpen && activeOption ? `${id}-download-option-${activeOption.projectId}` : undefined,
-                  'aria-describedby': downloads.length >= 20 ? `${id}-download-help` : undefined, readOnly: !view.canBrowse, 'aria-disabled': !view.canBrowse || downloads.length >= 20,
-                  onFocus: () => { if (deriveView(controller.getSnapshot()).canBrowse) setSuggestionsOpen(true); },
-                  onClick: () => { if (deriveView(controller.getSnapshot()).canBrowse) setSuggestionsOpen(true); },
-                  onChange: event => { setDownloadSearch(event.target.value); setActiveSuggestion(''); setSuggestionsOpen(true); }, onKeyDown: comboKey,
-                  onCompositionStart: () => { composition.current = { active: true, ended: false }; }, onCompositionEnd: () => { composition.current = { active: false, ended: true }; }, onKeyUp: () => { composition.current.ended = false; } })),
-              downloads.length >= 20 && body('最多选择20个项目', { id: `${id}-download-help` }),
-              dropdownOpen && h('div', { id: `${id}-download-options`, role: 'listbox', 'aria-label': '可添加的云端项目', style: { ...styles.card, maxHeight: 220, overflowY: 'auto', padding: 4, gap: 0 } },
-                ...suggestions.map(project => h('div', { key: project.projectId, id: `${id}-download-option-${project.projectId}`, role: 'option', 'aria-selected': activeOption?.projectId === project.projectId,
-                  'aria-disabled': !view.canBrowse || downloads.length >= 20, style: { padding: '9px 12px', borderRadius: 8, cursor: 'pointer', background: activeOption?.projectId === project.projectId ? 'var(--dsw-alias-settings-card-stroke)' : 'transparent' },
-                  onPointerDown: event => event.preventDefault(), onPointerMove: () => setActiveSuggestion(project.projectId), onClick: () => addSuggested(project.projectId) },
-                  h('span', { style: styles.row }, folderIcon, projectLabel(project)),
-                  cloud.projects.some(other => other.projectId !== project.projectId && projectLabel(other) === projectLabel(project)) && project.sourceRoot && body(project.sourceRoot, { style: styles.root })))),
-              dropdownOpen && !suggestions.length && !cloud.error && body(cloud.projectsLoaded ? (query ? '无匹配项目' : cloud.projects.length ? '所有项目已添加' : '暂无云端项目') : '读取中…', { role: 'status' }),
-              dropdownOpen && unchosen.length > 100 && body('仅显示前100项，请继续搜索'),
-              body(downloadNotice, { role: 'status', 'aria-live': 'polite' })),
-            state.busy === 'projects' && body('读取中…', { role: 'status' }),
-            cloud.projectsLoaded && !cloud.projects.length && body('暂无云端项目'),
-            cloud.partial && body('部分项目读取失败', { role: 'alert', style: styles.warning }),
-            cloud.error && body(cloud.error.message, { role: 'alert', style: styles.error })),
-          cloudStage === 'folders' && directoryBrowser && h('div', { style: styles.form },
-            h('div', { style: styles.row, 'aria-label': '文件夹导航' }, ...directoryBrowser.crumbs.map(crumb => h(Button, { key: crumb.id, type: 'button', variant: 'ghost', disabled: Boolean(state.busy) || state.refreshing,
-              onClick: () => { if (controller.getSnapshot().downloadBrowser === directoryBrowser) void controller.browseDownloadDestination(crumb.id); } }, crumb.label))),
-            body(directoryBrowser.path, { style: styles.root }),
-            h('div', { style: styles.list, 'aria-label': '文件夹列表' }, ...directoryBrowser.directories.map(folder => h(Button, { key: folder.id, type: 'button', variant: 'ghost', disabled: Boolean(state.busy) || state.refreshing,
-              onClick: () => { if (controller.getSnapshot().downloadBrowser === directoryBrowser) void controller.browseDownloadDestination(folder.id); } }, folder.label))),
-            !directoryBrowser.directories.length && body('暂无子文件夹'), directoryBrowser.truncated && body('仅显示部分文件夹'),
-            h(Button, { type: 'button', variant: 'primary', disabled: !directoryBrowser.selectable || Boolean(state.busy) || state.refreshing, onClick: () => {
-              const lifetime = cloudLife.current;
-              if (controller.getSnapshot().downloadBrowser === directoryBrowser) void controller.selectDownloadDestination(directoryBrowser.currentId).then(selected => { if (selected && cloudLife.current === lifetime && controller.prepareDownload()) setCloudStage('review'); });
-            } }, '选择此文件夹')),
-          cloudStage === 'review' && intent?.kind === 'download' && h('div', { style: styles.form },
-            body(`将下载 ${intent.items.length} 个项目`), body('下载云端最新内容'),
-            ...intent.items.map(item => h('div', { key: item.projectId, style: styles.project }, h('strong', null, item.label), body(item.root, { style: styles.root }))),
-            body('新建目录，不覆盖现有文件'), body('关闭窗口后继续下载')),
-          cloudStage === 'import' && intent?.kind === 'import' && h('div', { style: styles.form }, body(intent.label), body(intent.root, { style: styles.root }), body('仅导入安全会话，不启动代理。导入后请核对结果，勿重复提交。')),
-          ['review', 'import'].includes(cloudStage) && !intent && h('div', { style: styles.form },
-            body('请求未通过或结果尚未确认，请先核对状态；不会自动重试。'),
-            h(Button, { type: 'button', variant: 'outline', disabled: Boolean(state.busy) || state.refreshing, onClick: () => { void controller.refresh(); } }, '核对状态')),
-          cloudStage === 'progress' && h('div', { style: styles.form },
-            download && body(`下载${({ running: '进行中…', succeeded: '完成', partial: '部分完成', failed: '未完成' })[download.state]} · ${download.completed}/${download.total}`, { role: 'status', 'aria-live': 'polite' }),
-            view.downloadWarning && body(view.downloadWarning, { role: 'alert', style: styles.warning }),
-            download?.state === 'running' && body('可以关闭此窗口，下载在宿主中继续。'),
-            ...(download?.items ?? []).map(item => h('div', { key: item.restoreId, style: styles.project },
-              h('div', { style: styles.between }, h('strong', null, item.label), body(({ pending: '等待中', running: '下载中…', succeeded: '完成', failed: '失败', cancelled: '已停止' })[item.state])),
-              view.downloadItemErrors[item.restoreId] && body(view.downloadItemErrors[item.restoreId], { style: styles.warning }),
-              item.state === 'failed' && body('目录可能不完整，请重新选择新目录后重试', { style: styles.warning }),
-              h('details', null, h('summary', { style: styles.body }, '详情'), body(item.root, { style: styles.root }),
-                item.sessionCount !== undefined && body(`会话归档 ${item.sessionCount} 个`),
-                item.importResult && h('div', { style: styles.form },
-                  body(`已导入 ${item.importResult.importedCount ?? '未确认'} · 已跳过 ${item.importResult.skippedCount ?? '未确认'} · 失败 ${item.importResult.failedCount ?? '未确认'}`),
-                  item.importResult.state === 'failed' && body('部分会话可能已写入，勿重复导入', { style: styles.warning }),
-                  ...(item.importResult.sessions ?? []).map(session => h('div', { key: session.sourceId },
-                    body(`${session.sourceId} → ${session.sessionId ?? '无新会话 ID'} · ${{ imported: '已导入', skipped: '已跳过', failed: '失败' }[session.outcome]}`),
-                    session.workspaceAttached === false && body('未关联工作区，勿重复导入', { style: styles.warning }))))),
-              item.state === 'succeeded' && registrationControl(item.restoreId, item.root, item.label),
-              item.canImport && h(Button, { type: 'button', variant: 'outline', disabled: !view.canRecover, 'aria-label': `导入 ${item.label} 的安全会话`, onClick: () => { if (controller.prepareDownloadImport(item.restoreId)) setCloudStage('import'); } }, '导入安全会话'))),
-            h(Button, { type: 'button', variant: 'outline', disabled: Boolean(state.busy) || state.refreshing, onClick: () => { void controller.refresh(); } }, '核对状态')),
-          state.downloadError && body(state.downloadError.message, { role: 'alert', style: styles.error }),
-          state.registrationError && body(state.registrationError.message, { role: 'alert', style: styles.warning }),
-          state.downloadUncertain && body('结果未确认，请核对状态；勿重复提交。', { role: 'alert', style: styles.warning }),
-          (state.dirty || state.conflict) && body('请先保存或撤销本机同步设置更改。'))),
-      h(Modal, { open: projectManagerOpen, onClose: closeProjects, title: '管理同步项目', closeLabel: '关闭',
-        footer: projectManagerOpen && h('div', { style: styles.between },
-          h('span', { style: styles.body, role: 'status' }, state.dirty ? '未保存' : `已选择 ${view.selectedCount} 项`),
-          h('div', { style: styles.row },
-            h(Button, { type: 'button', variant: 'ghost', disabled: state.busy === 'preferences', onClick: closeProjects }, '关闭'),
-            h(Button, { type: 'button', variant: 'primary', disabled: !view.canSave, 'aria-busy': state.busy === 'preferences', onClick: saveProjects }, state.busy === 'preferences' ? '保存中…' : '保存'))) },
-        projectManagerOpen && h('div', { style: styles.form },
-          h(Input, { type: 'search', value: search, onChange: event => setSearch(event.target.value), disabled: !status,
-            placeholder: '搜索项目', 'aria-label': '搜索项目', autoComplete: 'off', spellCheck: false, 'data-modal-autofocus': '' }),
-          h('div', { style: styles.row },
-            h(Button, { type: 'button', variant: 'ghost', disabled: !view.editable || !projects.some(project => project.available),
-              onClick: () => controller.selectVisible(search, true) }, search.trim() ? '全选搜索结果' : '全选可用项目'),
-            h(Button, { type: 'button', variant: 'ghost', disabled: !view.editable || !projects.some(project => checkedIds.has(project.id)),
-              onClick: () => controller.selectVisible(search, false) }, search.trim() ? '取消搜索结果' : '全部取消')),
-          status?.projects.length === 0 ? body('暂无项目')
-            : projects.length === 0 && status ? body('无匹配项目')
-              : h('div', { style: styles.list, role: 'group', 'aria-label': '项目列表' }, ...projects.map(project => {
-                const checked = checkedIds.has(project.id);
-                return h('div', { key: project.id, style: styles.project },
-                  h(Checkbox, { checked, label: project.label + (project.available ? '' : ' · 不可用'),
-                    disabled: !view.editable || (!project.available && !checked),
-                    onChange: selected => controller.setProject(project.id, selected) }),
-                  h('p', { style: styles.root }, project.root));
-              })),
-          state.error && h('div', { role: 'alert', style: styles.error }, state.error.message),
-          (!state.ready || state.conflict) && h(Button, { type: 'button', variant: 'outline', disabled: Boolean(state.busy) || state.refreshing,
-            onClick: () => { void controller.refresh(); } }, state.refreshing ? '刷新中…' : state.conflict ? '刷新并重新选择' : '刷新'))),
-      h(Modal, { open: confirmLogout, onClose: () => { clearSecrets(); setConfirmLogout(false); }, title: '退出登录？', closeLabel: '取消',
+            h(Button, { type: 'button', variant: 'ghost', onClick: () => { clearSecrets(); controller.cancelUpdateIntent(); } }, '取消'),
+            h(Button, { type: 'button', variant: 'primary', disabled: !view.canUpdate, onClick: () => { clearSecrets(); void controller.confirmUpdate(updateIntent); } }, '确认更新')))),
+      h(Modal, { open: logoutOpen, onClose: closeLogout, title: '退出登录？', closeLabel: '取消',
         footer: h('div', { style: styles.row },
-          h(Button, { type: 'button', variant: 'ghost', onClick: () => { clearSecrets(); setConfirmLogout(false); } }, '取消'),
-          h(Button, { type: 'button', variant: 'primary', disabled: !view.canLogout, 'data-modal-autofocus': '',
-            onClick: () => { clearSecrets(); setConfirmLogout(false); void controller.logout(); } }, '退出登录')) }),
+          h(Button, { type: 'button', variant: 'ghost', onClick: closeLogout }, '取消'),
+          h(Button, { type: 'button', variant: 'primary', disabled: !view.canLogout, 'data-modal-autofocus': '', onClick: logout }, '退出登录')) }),
       h(Modal, { open: passwordOpen, onClose: closePassword, title: '修改密码', closeLabel: '取消' },
         passwordOpen && h('form', { id: `${id}-password-form`, onSubmit: changePassword, onBlur: blurSecrets, noValidate: true, autoComplete: 'off', style: styles.form },
           ...[[currentPassword, 'current-password', '当前密码'], [newPassword, 'new-password', '新密码'], [confirmPassword, 'confirm-password', '确认新密码']].map(([ref, name, label]) =>

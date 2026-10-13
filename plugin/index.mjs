@@ -16,7 +16,7 @@ export function apply(ctx, config = {}) {
   const profileDir = ctx.profileContext?.dir, dshHome = ctx.profileContext?.home;
   assert(typeof profileDir === 'string' && path.isAbsolute(profileDir), '个人同步需要可识别的 DSH profileContext');
   assert(typeof dshHome === 'string' && path.isAbsolute(dshHome), '个人同步需要可识别的 DSH 数据目录');
-  const controller = createController(ctx, { ...config, stateDir: config.stateDir || path.join(profileDir, 'dsh-personal-sync') }, { credentialKey: credentialKeyForProfile(profileDir), allowLegacyCli: config.allowLegacyCli === true });
+  const controller = createController(ctx, { ...config, stateDir: config.stateDir || path.join(profileDir, 'dsh-personal-sync') }, { credentialKey: credentialKeyForProfile(profileDir), allowLegacyCli: false });
   const updates = createUpdateService(ctx, controller);
   const settings = withUpdateStatus(withBidirectionalSync(ctx, controller, createSettingsService(ctx, controller, { profileDir, dshHome }), { profileDir, dshHome }), updates);
   const bridge = createSettingsHttp(settings);
@@ -26,23 +26,17 @@ export function apply(ctx, config = {}) {
     try { return { kind: 'success', text: JSON.stringify(await action(rawInput.trim()), null, 2) }; }
     catch (error) { return { kind: 'error', text: error.message }; }
   } });
-  register('sync-status', '查看个人同步状态，也可使用设置 → 个人云同步', () => settings.status());
-  register('sync-push', '立即同步已授权项目：/sync-push 云端项目ID', async id => { await settings.initialize(); return controller.schedulePush(id); });
-  register('sync-list', '列出项目的云端检查点', id => controller.list(id));
-  register('sync-restore', '恢复到不存在的新目录，参数 JSON {"id":"检查点","to":"绝对路径"}', input => { const args = JSON.parse(input); return controller.restore(args.id, args.to); });
-  register('sync-import', '显式导入已恢复目录中的会话，不启动执行，参数 JSON {"root":"绝对路径"}', input => controller.import(JSON.parse(input).root));
+  register('sync-status', '查看双向同步状态，也可使用设置 → 个人云同步', () => settings.syncstatus());
   register('sync-logout', '撤销个人同步登录并停止自动同步', () => settings.logout());
-  let checking = false, lastTick = Date.now();
-  // Read the live settings, not the install-time patch. A UI toggle needs no Host reload.
+  let checking = false;
+  // Only explicit v2 bindings authorize automatic sync. Retained legacy
+  // preferences and queues are not upload consent, even if autoSync was enabled.
   const timer = setInterval(async () => {
     if (checking) return; checking = true;
     try {
       await settings.initialize();
       await controller.renewAuthorization();
       await settings.tickBidirectional();
-      if (!controller.config.autoSync || Date.now() - lastTick < controller.config.intervalMs) return;
-      lastTick = Date.now();
-      if ((await controller.status()).loggedIn) await controller.tick();
     } catch { ctx.logger?.warn?.('个人同步未完成；请在设置 → 个人云同步中检查状态。'); }
     finally { checking = false; }
   }, 5000);

@@ -1,19 +1,19 @@
-# 0.9.0 原生设置页与 Client 契约
+# 0.10.0 原生设置页与 Client 契约
 
-本文对应0.9.0代码与已重新构建的 Client；入口检查通过不表示已经安装到真实 GUI。用户操作入口见[快速开始](<../README.md>)；最终全量测试及发布产物记录见[测试说明](<../docs/TESTING.md>)。
+本文对应0.10.0的单一双向同步界面；构建与入口检查不表示已经安装到真实 GUI。用户操作入口见[快速开始](<../README.md>)；最终全量测试及发布产物记录见[测试说明](<../docs/TESTING.md>)。
 
 ## 页面中的三个位置
 
 1. **账号卡片**：登录、可选“在此设备保持登录（最长90天）”、改密、退出。保持登录默认不勾选。
 2. **双向同步**：本机工作区与云端项目显式配对；先预览，再“确认并启用”。项目行提供暂停／恢复、立即同步、冲突、回收站、会话及适用时的“核对中断事务”。
-3. **旧版云端下载与插件更新**：新目录下载和原生安装仍是独立操作，不借此授予现有目录双向写入权限。
+3. **插件更新**：通过原生管理器检查、确认固定提交并安装；不升级服务器或授予项目写入权限。
 
 “本机”指 **DSH Host**。浏览器可能运行在另一台电脑；浏览器文件选择或文字路径不是 Host 写入授权。云端项目名称／源路径也只是元数据，不能成为本机目标路径。
 
 ## 配对、冲突和修复
 
 - 页面打开、刷新、登录、选工作区、选云端项目或关闭预览，都不会自行启用配对。
-- 可选择已有云端项目或明确创建新项目；首次配对不把缺失的未跟踪文件视为删除。旧项目多分支迁移必须明确选择主版本，其余差异保留。
+- 云端列表逐项独立成行，不展示“旧版／双向项目”模式标签；来源目录、版本数量和日期仅作辨识，同名项目可展开查看标识。选择已有项目或明确创建新项目；首次配对不把缺失的未跟踪文件视为删除。历史多分支接入仍必须明确选择主版本，其余差异保留，确认页说明旧客户端写入围栏。
 - 确认后由 Host 持有任务与调度。Client 关闭页面只停止观察，不靠浏览器逐文件传输，不把断线当作取消或失败证明。
 - 冲突默认保留双方；必须预览具体目标后确认采用本机、云端或保留双方。没有自动文本合并，旧预览不能覆盖后来的本机编辑。
 - 回收恢复不覆盖占用目标；恢复内容来自校验过的副本。删除／替换记录不自动清理。
@@ -35,16 +35,16 @@
 
 [预构建 Client](<dist/client.js>)是 DSH `window.__ModuleLoader__.load({id,factory})` 模块，不是独立浏览器 ESM 应用；模块 ID 为 `dsh-personal-sync`。
 
-[包定义](<../package.json>)声明 Client export、Web platform 和所需原生注入。运行时通过 `slots`、`connection` 注册原生 Settings section，复用宿主 React 与 `Button`、`Input`、`Checkbox`、`Switch`、`Modal`，不捆绑第二套 React/Vue，也不修改 Web 壳。
+[包定义](<../package.json>)声明 Client export、Web platform 和所需原生注入。运行时通过 `slots`、`connection` 注册原生 Settings section，复用宿主 React 与 `Button`、`Input`、`Checkbox`、`Modal`，不捆绑第二套 React/Vue，也不修改 Web 壳。
 
-兼容目标保持 **DSH 0.2.0-rc.2 / Session format4 / Cordis ~4.0.4 / Node.js24+**。可选原生插件管理器、目录选择器缺失时，仅相应功能不可用；不绕过宿主批准或兼容检查。
+兼容目标保持 **DSH 0.2.0-rc.2 / Session format4 / Cordis ~4.0.4 / Node.js24+**。可选原生插件管理器缺失时仅更新功能不可用；不绕过宿主批准或兼容检查。旧目录选择器依赖仅留在内部兼容边界，不再提供产品入口。
 
 ```sh
 node scripts/build-client.mjs
 node scripts/check-install.mjs
 ```
 
-修改源码后必须重建并交付[预构建入口](<dist/client.js>)。当前版本为0.9.0，已完成重建与入口检查；最终 tgz／校验和仍按发布记录核对。构建成功不表示运行中的 Host 已重载；按原生安装提示重启 DSH、刷新原页面，不另起一个 Web 服务冒充原 GUI。
+修改源码后必须重建并交付[预构建入口](<dist/client.js>)。当前版本为0.10.0，重建、入口检查与最终 tgz／校验和按发布记录核对。构建成功不表示运行中的 Host 已重载；按原生安装提示重启 DSH、刷新原页面，不另起一个 Web 服务冒充原 GUI。
 
 ## RPC 是唯一浏览器通道
 
@@ -75,11 +75,10 @@ ctx.connection.rpc.call('/api', 'dsh-personal-sync/' + action, payload, signal)
 | 本机回收 | `syncrecycle`、`syncrestoreplan`、`syncrestore` | 只操作已知回收项，确认目标仍可用；不传任意文件内容或路径。 |
 | 会话 | `syncarchives`、`syncarchiveplan`、`syncarchiveimport` | 档案 ID 与当前绑定；独立确认安全子集导入，不运行 agent。 |
 | 显式修复 | `syncrepairplan`、`syncrepair` | 绑定已知中断事务；保留新修改／备份，检查持久化结果后决定是否可重试。 |
-| 兼容下载 | `projects`、`checkpoints`、`destination*`、`download*`、`restore`、`import`、`registerproject` | 新目录、独立导入／注册确认；持久化结果不授权续写中断目录，添加工作区不勾选同步。 |
 | 本地存储预算 | `syncsettings` | 显式保存1–1024GiB整数、绑定 revision CAS；不改变选择、不清理历史。 |
 | 插件更新 | `updatestatus`、`checkupdate`、`installupdate`、`cancelupdate` | 固定来源与提交，由原生 manager 安装；不更新云服务。 |
 
-表中通配分组用于阅读，不是允许注册任意路由。确切校验以[Host 路由](<../plugin/settings-http.mjs>)和[双向服务](<../plugin/bidirectional-service.mjs>)为准。通常写意图还绑定保存的 `server/username/revision`；路径仅作为显示值，不能靠修改显示字符串扩大权限。
+共26个精确动作：账号4个、更新4个、双向18个。已移除的旧上传／下载／恢复动作即使携带有效旧请求体也返回404，不读取正文或调用内部服务。确切校验以[Host 路由](<../plugin/settings-http.mjs>)和[双向服务](<../plugin/bidirectional-service.mjs>)为准。通常写意图还绑定保存的 `server/username/revision`；路径仅作为显示值，不能靠修改显示字符串扩大权限。
 
 ### 状态与请求生命周期
 
@@ -90,15 +89,14 @@ ctx.connection.rpc.call('/api', 'dsh-personal-sync/' + action, payload, signal)
 - 已接受任务由 Host 持久化意图与结果拥有。浏览器不依据超时自动再发一次写入；续查使用同一请求，不生成新请求猜测成功。
 - 修复结果区分未接受、已接受待完成、完成和被新计划替代；不能把前置拒绝误报为已接受，也不能把部分结果当成全成。
 - 导入一旦可能已落盘，就保留不确定结果与已知新 ID，不用新请求绕过去重。
+- 账号卡片只在观察到 Host 忙碌时以受限频率只读核对状态；空闲、读取失败、认证拒绝或离开页面时停止，旧队列不触发轮询或上传。插件更新仍独立核对已接受的更新任务。
 - 页面轮询只是观察，不由页面轮询频率推导后台扫描频率。健康、可达、未暂停且未退避时，Host 约15秒核对远端，文件树元数据最多复用30秒，native 元数据每次核对；符合这些条件的调度达到5分钟阈值就强制完整核验内容。变化、未知、dirty watch、部分事务或 native 活动阻止缓存跳过；详见[运行参数](<../docs/DEPLOYMENT.md#运行参数与本地预算>)。
 
-## 旧下载与工作区登记
+## 已移除的旧入口
 
-下载使用同一 Modal 的选择、保存位置、核对、进度阶段；准入拒绝留在可操作阶段，不伪造进行中的任务。Host 恢复台账跨重启保存，并以身份命名空间、授权 epoch、清单／请求摘要隔离；它保存结果，不把中断目标变成可自动续写的目录。
+账号 Client 的传输白名单仅含8个账号／更新动作，不再保留旧项目选择、自动上传、云端下载、恢复、导入或登记工作区的控制器方法。已保存的旧设置与旧状态字段不能恢复这些功能。
 
-- 已完成的最新单次恢复／当前批次成功项按记录资格独立确认导入。资格消费和预分配的新 native 会话 ID 持久化，未知结果先核对，不用新请求重复创建。
-- “添加到DSH项目”单独确认 `registerproject`；Host 核对成功恢复的根目录，创建或复用 workspace。该操作不创建 native 会话／agent、不附带同步选择。
-- 若要继续双向同步，工作区登记后仍须独立配对、预览、确认启用；下载、登记、导入均不是配对的替代授权。
+Host 计时器只初始化、续期并调度明确的双向绑定，不调用旧上传 tick；原生命令仅提供双向状态与退出。内部数据兼容辅助代码和既有记录仍保留，不能通过旧浏览器 RPC 重新暴露。会话新 ID 导入与本机回收恢复仍属于明确配对的双向功能，不受此次旧入口移除影响。
 
 ## 存储设置
 
@@ -106,7 +104,7 @@ ctx.connection.rpc.call('/api', 'dsh-personal-sync/' + action, payload, signal)
 
 ## 代码入口与验证层次
 
-- [主设置适配器](<adapter.mjs>)、[账号／兼容状态](<state.mjs>)。
+- [主设置适配器](<adapter.mjs>)、[账号／更新状态](<state.mjs>)。
 - [双向原生面板](<bidirectional-panel.mjs>)、[双向状态与 RPC](<bidirectional-state.mjs>)。
 - [原生装配](<../plugin/index.mjs>)、[Host 双向服务](<../plugin/bidirectional-service.mjs>)、[引擎](<../src/sync-engine.mjs>)。
 - [客户端契约测试](<../tests/bidirectional-client.test.mjs>)、[认证状态测试](<../tests/auth-state-client.test.mjs>)、[生产控制器到真实 HTTP 的链路测试](<../tests/bidirectional-integration.test.mjs>)。

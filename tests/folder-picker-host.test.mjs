@@ -60,11 +60,7 @@ async function fixture(t, options = {}) {
   const binding = bound(await service.status()), pickInput = { ...binding, projectId: manifest.projectId, checkpointId: manifest.id };
   const choose = signal => service.destinationpick(pickInput, signal);
   const restore = destination => ({ ...pickInput, destinationId: destination.id, requestId: randomUUID(), confirm: true });
-  async function rpc(action, payload, signal) {
-    const response = await bridge.fetch(action, new Request(`http://dsh.internal${SETTINGS_API}${action}`, { method: 'POST', signal, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ type: 'client-request', rpcId: 'picker-rpc', method: `dsh-personal-sync/${action}`, payload }) }));
-    assert.equal(response.status, 200); return (await response.json()).result;
-  }
-  return { root, parent, source, profileDir, manifest, row, bytes, identity, records, ctx, workspaces, controller, service, bridge, binding, pickInput, choose, restore, rpc, advance(ms) { clock += ms; }, setCapability(value) { capability = value; }, replaceProvider() { provider = { capability: () => capability }; }, setRequest(value) { intercept = value; }, get importCalls() { return importCalls; } };
+  return { root, parent, source, profileDir, manifest, row, bytes, identity, records, ctx, workspaces, controller, service, bridge, binding, pickInput, choose, restore, advance(ms) { clock += ms; }, setCapability(value) { capability = value; }, replaceProvider() { provider = { capability: () => capability }; }, setRequest(value) { intercept = value; }, get importCalls() { return importCalls; } };
 }
 function listing(directory, entries = [], crumbs = []) { return { path: directory, home: directory, entries: entries.map(value => typeof value === 'string' ? { name: path.basename(value), path: value, hidden: false } : value), crumbs: crumbs.map(value => ({ name: path.basename(value) || value, path: value, hidden: false })), truncated: false }; }
 async function noEntry(filename) { await assert.rejects(fs.lstat(filename), { code: 'ENOENT' }); }
@@ -74,9 +70,9 @@ test('native Host chooser makes no destination writes; opaque plan restores byte
   assert.equal(destination.parent, f.parent); assert.equal(destination.root, path.join(f.parent, 'Cloud Project')); assert.notEqual(destination.id, destination.root);
   assert.deepEqual(await fs.readdir(f.parent), before); await noEntry(destination.root);
   const payload = f.restore(destination);
-  assert.equal((await f.rpc('restore', { ...payload, confirm: false })).error.code, 'BAD_REQUEST');
-  assert.equal((await f.rpc('restore', { ...payload, destination: path.join(f.parent, 'substitution') })).error.code, 'BAD_REQUEST');
-  assert.equal((await f.rpc('restore', { ...payload, projectId: 'foreign-project' })).error.code, 'DIRECTORY_PICKER_EXPIRED');
+  await assert.rejects(f.service.restore({ ...payload, confirm: false }), { code: 'BAD_REQUEST' });
+  await assert.rejects(f.service.restore({ ...payload, destination: path.join(f.parent, 'substitution') }), { code: 'BAD_REQUEST' });
+  await assert.rejects(f.service.restore({ ...payload, projectId: 'foreign-project' }), { code: 'DIRECTORY_PICKER_EXPIRED' });
   const accepted = await f.service.restore(payload); assert.equal(accepted.recovery.state, 'running');
   await f.controller.drain(); const recovery = (await f.service.status()).recovery;
   assert.equal(recovery.state, 'succeeded'); assert.equal(await fs.readFile(path.join(destination.root, 'hello.txt'), 'utf8'), f.bytes.toString());
@@ -96,7 +92,7 @@ test('native chooser cancellation, unavailable provider, sanitized failures and 
   await assert.rejects(f.choose(), { code: 'DIRECTORY_PICKER_UNAVAILABLE' });
   f.replaceProvider(); f.setCapability({ kind: 'native', pick: async () => null }); assert.deepEqual(await f.choose(), { cancelled: true });
   f.setCapability({ kind: 'native', pick: async () => { throw new Error('secret-token-provider-failure'); } });
-  const failed = await f.rpc('destinationpick', f.pickInput); assert.equal(failed.error.code, 'DIRECTORY_PICKER_FAILED'); assert.ok(!JSON.stringify(failed).includes('secret-token'));
+  await assert.rejects(f.choose(), error => { assert.equal(error.code, 'DIRECTORY_PICKER_FAILED'); assert.ok(!String(error).includes('secret-token')); return true; });
   for (const result of [undefined, {}, 'relative', '//server/share/folder', 'C:relative', path.join(f.parent, 'missing')]) {
     f.setCapability({ kind: 'native', pick: async () => result }); await assert.rejects(f.choose(), { code: 'BAD_DESTINATION' });
   }
@@ -153,7 +149,7 @@ test('browse validates provider topology, filters protected/hidden/links and onl
   const { browser } = await f.choose(); assert.equal(browser.path, f.parent); assert.equal(browser.selectable, true); assert.deepEqual(browser.directories.map(item => item.label), ['child']); assert.deepEqual(calls, [undefined]);
   assert.ok(browser.directories.every(item => !Object.hasOwn(item, 'path')));
   for (const nodeId of ['forged', child]) {
-    const result = await f.rpc('destinationbrowse', { ...f.binding, browserId: browser.id, nodeId }); assert.equal(result.ok, false);
+    await assert.rejects(f.service.destinationbrowse({ ...f.binding, browserId: browser.id, nodeId }), nodeId === 'forged' ? { code: 'DIRECTORY_PICKER_EXPIRED' } : { name: 'ValidationError' });
   }
   const input = { ...f.binding, browserId: browser.id, nodeId: browser.directories[0].id };
   const visited = await f.service.destinationbrowse(input); assert.equal(visited.browser.path, child); assert.equal(calls.at(-1), child);
@@ -172,16 +168,17 @@ test('browse rejects substituted current path, nonchildren, malformed ancestry a
   await assert.rejects(f.service.destinationbrowse({ ...f.binding, browserId: browser.id, nodeId: browser.directories[0].id }), { code: 'DIRECTORY_PICKER_FAILED' });
 });
 
-test('picker caps fail explicitly; expired sessions are not reused, all RPCs are exact admitted POST routes', async t => {
+test('internal picker caps fail and expire safely while legacy picker RPCs remain absent', async t => {
   const f = await fixture(t, { pickerOptions: { maxPlans: 1, maxBrowsers: 1, maxNodes: 1 } });
   await f.choose(); await assert.rejects(f.choose(), { code: 'DIRECTORY_PICKER_FAILED' }); f.advance(16 * 60_000); await f.choose();
   const child = path.join(f.parent, 'child'); await fs.mkdir(child); f.setCapability({ kind: 'browse', list: async () => listing(f.parent, [child]) });
   await assert.rejects(f.choose(), { code: 'DIRECTORY_PICKER_FAILED' });
   const routes = []; registerSettingsRoutes({ connection: { fetch: { register: value => routes.push(value) } } }, f.bridge);
-  assert.equal(routes.length, 40); assert.ok(routes.every(route => route.methods.length === 1 && route.methods[0] === 'POST' && route.requestBody === 'streaming'));
+  assert.equal(routes.length, 26); assert.ok(routes.every(route => route.methods.length === 1 && route.methods[0] === 'POST' && route.requestBody === 'streaming'));
   for (const action of ['destinationpick', 'destinationbrowse', 'destinationselect']) {
-    assert.equal((await f.bridge.fetch(action, new Request(`http://dsh.internal${SETTINGS_API}${action}`))).status, 405);
-    assert.equal((await f.rpc(action, { ...f.pickInput, path: f.parent })).error.code, 'BAD_REQUEST');
+    assert.equal(routes.some(route => route.path === SETTINGS_API + action), false);
+    assert.equal((await f.bridge.fetch(action, new Request(`http://dsh.internal${SETTINGS_API}${action}`))).status, 404);
+    await assert.rejects(f.service[action]({ ...f.pickInput, path: f.parent }), { code: 'BAD_REQUEST' });
   }
 });
 
@@ -233,7 +230,7 @@ test('legacy hydration keeps last-committed label but compares expanded ISO time
 
 test('unknown old-server projects cannot guess mapping from unrelated workspaces; invalid metadata is rejected', async t => {
   const f = await fixture(t, { noBindings: true, request: async route => { if (route === '/v1/projects') throw Object.assign(new Error('old'), { httpStatus: 404 }); } });
-  assert.equal((await f.rpc('projects', f.binding)).error.code, 'CLOUD_BROWSE_UNSUPPORTED');
+  await assert.rejects(f.service.projects(f.binding), { code: 'CLOUD_BROWSE_UNSUPPORTED' });
   const client = new SyncClient(f.identity);
   for (const optional of [{ label: { secret: 'bad' } }, { label: '\u0000bad' }, { sourceRoot: 'relative' }, { latestCheckpointId: '../bad' }, { sourceRoot: '/remote/folder', label: 'mismatch' }]) {
     f.setRequest(async route => route === '/v1/projects' ? { projects: [{ projectId: 'p', checkpointCount: 1, latestCreatedAt: f.manifest.createdAt, ...optional }] } : undefined);

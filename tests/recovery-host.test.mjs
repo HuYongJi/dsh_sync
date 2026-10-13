@@ -26,8 +26,17 @@ async function rpc(bridge, action, payload, signal) {
   assert.ok(!JSON.stringify(body).includes(password));
   return body.result;
 }
-async function good(bridge, action, payload, signal) { const result = await rpc(bridge, action, payload, signal); assert.equal(result.ok, true, JSON.stringify(result)); return result.value; }
-async function rejected(bridge, action, payload, code) { const result = await rpc(bridge, action, payload); assert.equal(result.ok, false); assert.equal(result.error.code, code); return result; }
+// Legacy safety coverage deliberately calls internal helpers, never removed RPCs.
+async function callInternal(service, action, payload, signal) {
+  const value = await service[action === 'preferences' ? 'savePreferences' : action](payload, signal);
+  assert.ok(!JSON.stringify(value).includes(password)); return value;
+}
+async function rejectInternal(service, action, payload, code) {
+  await assert.rejects(callInternal(service, action, payload), error => {
+    if (code === 'BAD_REQUEST' && error.name === 'ValidationError') return true;
+    assert.equal(error.code, code); return true;
+  });
+}
 const binding = status => ({ revision: status.revision, server: status.server, username: status.username });
 async function fixture(t, options = {}) {
   await fs.mkdir(base, { recursive: true }); const root = await fs.mkdtemp(path.join(base, 'recovery-'));
@@ -51,25 +60,26 @@ async function fixture(t, options = {}) {
     assert.equal(path.dirname(root), path.resolve(base)); assert.ok(path.basename(root).startsWith('recovery-'));
     await fs.rm(root, { recursive: true, force: true });
   });
-  const login = await good(bridge, 'login', { server, username: 'owner', password });
-  const selected = await good(bridge, 'preferences', { revision: login.revision, autoSync: false, projectIds: ['local-project'] });
+  const loggedIn = await rpc(bridge, 'login', { server, username: 'owner', password }); assert.equal(loggedIn.ok, true);
+  const login = loggedIn.value;
+  const selected = await callInternal(service, 'preferences', { revision: login.revision, autoSync: false, projectIds: ['local-project'] });
   const projectId = selected.projects.find(item => item.selected).projectId;
   const client = new SyncClient(records.get(controller.credentialKey).payload);
   let checkpointId;
   if (!options.noUpload) { await controller.push(projectId); checkpointId = (await client.list(projectId)).heads[0]; }
   const bound = binding(await service.status());
   const restorePayload = (extra = {}) => ({ ...bound, projectId, checkpointId, destination: path.join(root, `restored-${randomUUID()}`), confirm: true, requestId: randomUUID(), ...extra });
-  async function settle() { await controller.drain(); return (await good(bridge, 'status', {})).recovery; }
-  async function restore(extra) { const payload = restorePayload(extra), accepted = await good(bridge, 'restore', payload); assert.equal(accepted.recovery.state, 'running'); return { payload, recovery: await settle() }; }
+  async function settle() { await controller.drain(); return (await callInternal(service, 'status', {})).recovery; }
+  async function restore(extra) { const payload = restorePayload(extra), accepted = await callInternal(service, 'restore', payload); assert.equal(accepted.recovery.state, 'running'); return { payload, recovery: await settle() }; }
   return { root, dshHome, profileDir, source, records, workspaces, ctx, controller, service, bridge, cloud, cloudDir, server, client, bound, projectId, checkpointId, restorePayload, settle, restore, get importCalls() { return importCalls; } };
 }
 
-test('HTTP upload -> settings discover/list -> new directory restore -> explicit import; duplicate IDs never replay', async t => {
+test('internal legacy discovery, fresh-directory restore and explicit import retain loopback compatibility without replay', async t => {
   const f = await fixture(t);
   assert.equal((await fetch(`${f.server}/v1/projects`)).status, 401);
-  const discovered = await good(f.bridge, 'projects', f.bound);
+  const discovered = await callInternal(f.service, 'projects', f.bound);
   assert.deepEqual(discovered.projects.map(item => [item.projectId, item.checkpointCount]), [[f.projectId, 1]]);
-  const catalog = await good(f.bridge, 'checkpoints', { ...f.bound, projectId: f.projectId });
+  const catalog = await callInternal(f.service, 'checkpoints', { ...f.bound, projectId: f.projectId });
   assert.deepEqual(catalog.heads, [f.checkpointId]);
   assert.deepEqual(Object.keys(catalog.checkpoints[0]).sort(), ['createdAt', 'deviceId', 'fileCount', 'id', 'parentId', 'projectId', 'totalBytes']);
   assert.equal(discovered.projects[0].sourceRoot, f.source); assert.equal(discovered.projects[0].label, 'source');
@@ -78,15 +88,15 @@ test('HTTP upload -> settings discover/list -> new directory restore -> explicit
   assert.equal(await fs.readFile(path.join(recovery.root, 'hello.txt'), 'utf8'), 'synthetic project');
   await assert.rejects(fs.stat(path.join(recovery.root, '.dsh-sync', 'INCOMPLETE')), { code: 'ENOENT' });
   assert.equal(f.importCalls, 0, 'download never imports or starts sessions');
-  assert.deepEqual((await good(f.bridge, 'restore', payload)).recovery, recovery);
+  assert.deepEqual((await callInternal(f.service, 'restore', payload)).recovery, recovery);
   const input = { ...f.bound, restoreId: recovery.id, confirm: true, requestId: randomUUID() };
-  assert.equal((await good(f.bridge, 'import', input)).recovery.state, 'running');
+  assert.equal((await callInternal(f.service, 'import', input)).recovery.state, 'running');
   const imported = await f.settle();
   assert.equal(imported.state, 'succeeded'); assert.equal(imported.importedCount, 1);
   assert.deepEqual(imported.sessions, [{ sourceId: 'archived-session', sessionId: 'new-archived-session', outcome: 'imported', workspaceAttached: true }]);
-  assert.deepEqual((await good(f.bridge, 'import', input)).recovery, imported); assert.equal(f.importCalls, 1);
-  await rejected(f.bridge, 'import', { ...input, requestId: randomUUID() }, 'RECOVERY_UNAVAILABLE');
-  await rejected(f.bridge, 'restore', { ...payload, checkpointId: 'different' }, 'BAD_REQUEST');
+  assert.deepEqual((await callInternal(f.service, 'import', input)).recovery, imported); assert.equal(f.importCalls, 1);
+  await rejectInternal(f.service, 'import', { ...input, requestId: randomUUID() }, 'RECOVERY_UNAVAILABLE');
+  await rejectInternal(f.service, 'restore', { ...payload, checkpointId: 'different' }, 'BAD_REQUEST');
   assert.equal((await f.service.status()).revision, f.bound.revision);
 });
 
@@ -99,21 +109,21 @@ test('project aggregates count only committed checkpoints and derive folder name
   assert.deepEqual(projects, [{ projectId: f.projectId, checkpointCount: 2, latestCreatedAt: listed.checkpoints.map(item => item.createdAt).sort().at(-1), label: 'source', sourceRoot: f.source, latestCheckpointId: listed.checkpoints.at(-1).id }]);
 });
 
-test('new actions are exact POST and reject missing, invalid, extra and stale binding/confirmation fields', async t => {
+test('removed recovery routes return 404 while internal helpers reject missing, invalid, extra and stale authority', async t => {
   const f = await fixture(t);
   for (const action of ['projects', 'checkpoints', 'restore', 'import']) {
-    const response = await f.bridge.fetch(action, new Request(`http://dsh.internal${SETTINGS_API}${action}`, { method: 'GET' })); assert.equal(response.status, 405);
-    await rejected(f.bridge, action, {}, 'BAD_REQUEST');
+    const response = await f.bridge.fetch(action, new Request(`http://dsh.internal${SETTINGS_API}${action}`, { method: 'GET' })); assert.equal(response.status, 404);
+    await rejectInternal(f.service, action, {}, 'BAD_REQUEST');
   }
-  await rejected(f.bridge, 'projects', { ...f.bound, secret: 'never-reflect' }, 'BAD_REQUEST');
-  await rejected(f.bridge, 'projects', { ...f.bound, revision: f.bound.revision - 1 }, 'CONFIG_CONFLICT');
-  await rejected(f.bridge, 'projects', { ...f.bound, username: 'other-account' }, 'ACCOUNT_MISMATCH');
-  await rejected(f.bridge, 'checkpoints', { ...f.bound, projectId: '../bad' }, 'BAD_REQUEST');
-  for (const patch of [{ confirm: false }, { confirm: undefined }, { requestId: '../bad' }, { checkpointId: undefined }, { path: f.source }]) await rejected(f.bridge, 'restore', f.restorePayload(patch), 'BAD_REQUEST');
-  await rejected(f.bridge, 'restore', f.restorePayload({ destination: 'relative' }), 'BAD_DESTINATION');
-  if (process.platform === 'win32') await rejected(f.bridge, 'restore', f.restorePayload({ destination: '\\root-relative' }), 'BAD_DESTINATION');
-  await rejected(f.bridge, 'import', { ...f.bound, restoreId: 'unknown', confirm: true, requestId: randomUUID(), root: f.source }, 'BAD_REQUEST');
-  await rejected(f.bridge, 'import', { ...f.bound, restoreId: 'unknown', confirm: true, requestId: randomUUID() }, 'RECOVERY_UNAVAILABLE');
+  await rejectInternal(f.service, 'projects', { ...f.bound, secret: 'never-reflect' }, 'BAD_REQUEST');
+  await rejectInternal(f.service, 'projects', { ...f.bound, revision: f.bound.revision - 1 }, 'CONFIG_CONFLICT');
+  await rejectInternal(f.service, 'projects', { ...f.bound, username: 'other-account' }, 'ACCOUNT_MISMATCH');
+  await rejectInternal(f.service, 'checkpoints', { ...f.bound, projectId: '../bad' }, 'BAD_REQUEST');
+  for (const patch of [{ confirm: false }, { confirm: undefined }, { requestId: '../bad' }, { checkpointId: undefined }, { path: f.source }]) await rejectInternal(f.service, 'restore', f.restorePayload(patch), 'BAD_REQUEST');
+  await rejectInternal(f.service, 'restore', f.restorePayload({ destination: 'relative' }), 'BAD_DESTINATION');
+  if (process.platform === 'win32') await rejectInternal(f.service, 'restore', f.restorePayload({ destination: '\\root-relative' }), 'BAD_DESTINATION');
+  await rejectInternal(f.service, 'import', { ...f.bound, restoreId: 'unknown', confirm: true, requestId: randomUUID(), root: f.source }, 'BAD_REQUEST');
+  await rejectInternal(f.service, 'import', { ...f.bound, restoreId: 'unknown', confirm: true, requestId: randomUUID() }, 'RECOVERY_UNAVAILABLE');
 });
 
 test('filesystem destination admission rejects existing, protected, linked, missing-parent and unsafe Windows paths', async t => {
@@ -142,7 +152,7 @@ test('corrupt blob failure is sanitized, leaves INCOMPLETE and cannot be importe
   const { payload, recovery } = await f.restore();
   assert.equal(recovery.state, 'failed'); assert.equal(recovery.errorCode, 'RESTORE_FAILED');
   assert.ok(await fs.stat(path.join(payload.destination, '.dsh-sync', 'INCOMPLETE')));
-  await rejected(f.bridge, 'import', { ...f.bound, restoreId: recovery.id, confirm: true, requestId: randomUUID() }, 'RECOVERY_UNAVAILABLE');
+  await rejectInternal(f.service, 'import', { ...f.bound, restoreId: recovery.id, confirm: true, requestId: randomUUID() }, 'RECOVERY_UNAVAILABLE');
   assert.ok(!JSON.stringify(recovery).includes(manifest.files[0].sha256));
 });
 
@@ -150,12 +160,12 @@ test('accepted Host restore survives page abort, conflicts with recovery/upload/
   const f = await fixture(t), entered = deferred(), release = deferred(), original = SyncClient.prototype.downloadBlob;
   t.mock.method(SyncClient.prototype, 'downloadBlob', async function (...args) { const bytes = await original.apply(this, args); entered.resolve(); await release.promise; return bytes; });
   const page = new AbortController(), payload = f.restorePayload();
-  const accepted = await good(f.bridge, 'restore', payload, page.signal); page.abort(); await entered.promise;
+  const accepted = await callInternal(f.service, 'restore', payload, page.signal); page.abort(); await entered.promise;
   const status = await f.service.status(); assert.equal(status.running, true); assert.equal(status.recovery.state, 'running');
-  assert.deepEqual((await good(f.bridge, 'restore', payload)).recovery, accepted.recovery);
-  await rejected(f.bridge, 'restore', f.restorePayload(), 'BUSY');
-  await rejected(f.bridge, 'preferences', { revision: f.bound.revision, autoSync: false, projectIds: [] }, 'BUSY');
-  await rejected(f.bridge, 'sync', {}, 'BUSY');
+  assert.deepEqual((await callInternal(f.service, 'restore', payload)).recovery, accepted.recovery);
+  await rejectInternal(f.service, 'restore', f.restorePayload(), 'BUSY');
+  await rejectInternal(f.service, 'preferences', { revision: f.bound.revision, autoSync: false, projectIds: [] }, 'BUSY');
+  await rejectInternal(f.service, 'sync', {}, 'BUSY');
   await assert.rejects(f.controller.push(f.projectId), { code: 'BUSY' });
   release.resolve(); assert.equal((await f.settle()).state, 'succeeded'); assert.equal(f.importCalls, 0);
 });
@@ -163,20 +173,20 @@ test('accepted Host restore survives page abort, conflicts with recovery/upload/
 test('logout cancels/drains downloads and hides old recovery across subsequent login', async t => {
   const f = await fixture(t), entered = deferred(), release = deferred(), cancelled = deferred(), original = SyncClient.prototype.downloadBlob;
   t.mock.method(SyncClient.prototype, 'downloadBlob', async function (...args) { const bytes = await original.apply(this, args); this.signal.addEventListener('abort', () => cancelled.resolve(), { once: true }); entered.resolve(); await release.promise; return bytes; });
-  const payload = f.restorePayload(); await good(f.bridge, 'restore', payload); await entered.promise;
+  const payload = f.restorePayload(); await callInternal(f.service, 'restore', payload); await entered.promise;
   const loggingOut = f.service.logout({}); let done = false; loggingOut.then(() => { done = true; });
   await cancelled.promise; assert.equal(done, false);
   release.resolve(); const loggedOut = await loggingOut; assert.equal(loggedOut.recovery, undefined); assert.equal(loggedOut.loggedIn, false);
   assert.ok(await fs.stat(path.join(payload.destination, '.dsh-sync', 'INCOMPLETE')));
   await assert.rejects(fs.stat(path.join(payload.destination, 'hello.txt')), { code: 'ENOENT' });
   const loggedIn = await f.service.login({ server: f.server, username: 'owner', password }); assert.equal(loggedIn.recovery, undefined);
-  await rejected(f.bridge, 'restore', { ...payload, ...binding(loggedIn) }, 'RECOVERY_UNAVAILABLE');
+  await rejectInternal(f.service, 'restore', { ...payload, ...binding(loggedIn) }, 'RECOVERY_UNAVAILABLE');
 });
 
 test('disposal drains an in-flight task and cancellation prevents blob writes/finalization', async t => {
   const f = await fixture(t), entered = deferred(), release = deferred(), original = SyncClient.prototype.downloadBlob;
   t.mock.method(SyncClient.prototype, 'downloadBlob', async function (...args) { const bytes = await original.apply(this, args); entered.resolve(); await release.promise; return bytes; });
-  const payload = f.restorePayload(); await good(f.bridge, 'restore', payload); await entered.promise;
+  const payload = f.restorePayload(); await callInternal(f.service, 'restore', payload); await entered.promise;
   f.bridge.dispose(); f.controller.stop(); let done = false; const draining = f.controller.drain().then(() => { done = true; });
   await Promise.resolve(); assert.equal(done, false); release.resolve(); await draining;
   assert.ok(await fs.stat(path.join(payload.destination, '.dsh-sync', 'INCOMPLETE')));
@@ -191,33 +201,33 @@ test('partial imports preserve durable session IDs, deduplicate close failures a
     failed: [{ id: 'three', sessionId: 'new-three', reason: 'SYNTHETIC-SECRET', mayHaveDurableSession: true }, { id: 'three', sessionId: 'new-three', reason: 'close failed', mayHaveDurableSession: true }],
   }) });
   const { recovery } = await f.restore(); const payload = { ...f.bound, restoreId: recovery.id, confirm: true, requestId: randomUUID() };
-  await good(f.bridge, 'import', payload); const result = await f.settle();
+  await callInternal(f.service, 'import', payload); const result = await f.settle();
   assert.equal(result.state, 'failed'); assert.equal(result.errorCode, 'IMPORT_FAILED');
   assert.equal(result.importedCount, 1); assert.equal(result.skippedCount, 1); assert.equal(result.failedCount, 1);
   assert.deepEqual(result.sessions, [{ sourceId: 'one', sessionId: 'new-one', outcome: 'imported', workspaceAttached: false }, { sourceId: 'two', outcome: 'skipped' }, { sourceId: 'three', sessionId: 'new-three', outcome: 'failed' }]);
   assert.ok(!JSON.stringify(result).includes('SECRET'));
-  await good(f.bridge, 'import', payload); assert.equal(f.importCalls, 1);
+  await callInternal(f.service, 'import', payload); assert.equal(f.importCalls, 1);
 });
 
 test('only the latest successful restoration may be imported; no replay after uncertain adapter failure', async t => {
   const f = await fixture(t, { importSessions: async () => { throw new Error('SYNTHETIC-SECRET'); } });
   const first = await f.restore(), second = await f.restore();
-  await rejected(f.bridge, 'import', { ...f.bound, restoreId: first.recovery.id, confirm: true, requestId: randomUUID() }, 'RECOVERY_UNAVAILABLE');
+  await rejectInternal(f.service, 'import', { ...f.bound, restoreId: first.recovery.id, confirm: true, requestId: randomUUID() }, 'RECOVERY_UNAVAILABLE');
   const payload = { ...f.bound, restoreId: second.recovery.id, confirm: true, requestId: randomUUID() };
-  await good(f.bridge, 'import', payload); const failed = await f.settle(); assert.equal(failed.errorCode, 'IMPORT_FAILED');
-  await rejected(f.bridge, 'import', { ...payload, requestId: randomUUID() }, 'RECOVERY_UNAVAILABLE'); assert.equal(f.importCalls, 1);
+  await callInternal(f.service, 'import', payload); const failed = await f.settle(); assert.equal(failed.errorCode, 'IMPORT_FAILED');
+  await rejectInternal(f.service, 'import', { ...payload, requestId: randomUUID() }, 'RECOVERY_UNAVAILABLE'); assert.equal(f.importCalls, 1);
 });
 
 test('recovery request ID cap explicitly rejects instead of evicting and rerunning', async t => {
   const f = await fixture(t, { maxRecoveryRequests: 1 }), first = await f.restore();
-  await rejected(f.bridge, 'restore', f.restorePayload(), 'RECOVERY_LIMIT');
-  assert.deepEqual((await good(f.bridge, 'restore', first.payload)).recovery, first.recovery);
+  await rejectInternal(f.service, 'restore', f.restorePayload(), 'RECOVERY_LIMIT');
+  assert.deepEqual((await callInternal(f.service, 'restore', first.payload)).recovery, first.recovery);
 });
 
 test('binding is rechecked under operation lock before writes, including stale remote response', async t => {
   const f = await fixture(t), entered = deferred(), release = deferred(), original = SyncClient.prototype.getCheckpoint;
   t.mock.method(SyncClient.prototype, 'getCheckpoint', async function (...args) { const manifest = await original.apply(this, args); entered.resolve(); await release.promise; return manifest; });
-  const payload = f.restorePayload(); await good(f.bridge, 'restore', payload); await entered.promise;
+  const payload = f.restorePayload(); await callInternal(f.service, 'restore', payload); await entered.promise;
   const preferences = JSON.parse(await fs.readFile(f.service.filename, 'utf8'));
   await fs.writeFile(f.service.filename, JSON.stringify({ ...preferences, revision: preferences.revision + 1 }));
   release.resolve(); const result = await f.settle(); assert.equal(result.errorCode, 'CONFIG_CONFLICT');
@@ -227,31 +237,31 @@ test('binding is rechecked under operation lock before writes, including stale r
 test('changed native grant during remote download prevents writes and hides stale job metadata', async t => {
   const f = await fixture(t), entered = deferred(), release = deferred(), original = SyncClient.prototype.getCheckpoint;
   t.mock.method(SyncClient.prototype, 'getCheckpoint', async function (...args) { const manifest = await original.apply(this, args); entered.resolve(); await release.promise; return manifest; });
-  const payload = f.restorePayload(); await good(f.bridge, 'restore', payload); await entered.promise;
+  const payload = f.restorePayload(); await callInternal(f.service, 'restore', payload); await entered.promise;
   const prior = f.records.get(f.controller.credentialKey);
   f.records.set(f.controller.credentialKey, { ...prior, payload: { ...prior.payload, token: 'z'.repeat(43) } });
   release.resolve(); await f.controller.drain();
   assert.equal((await f.service.status()).recovery, undefined);
   await assert.rejects(fs.stat(payload.destination), { code: 'ENOENT' });
-  await rejected(f.bridge, 'restore', payload, 'RECOVERY_UNAVAILABLE');
+  await rejectInternal(f.service, 'restore', payload, 'RECOVERY_UNAVAILABLE');
 });
 
 test('restore fails BUSY instead of nesting upload or settings operation locks', async t => {
   const f = await fixture(t), entered = deferred(), release = deferred();
   const modifying = f.controller.mutate(async () => { entered.resolve(); await release.promise; }); await entered.promise;
-  await rejected(f.bridge, 'restore', f.restorePayload(), 'BUSY'); release.resolve(); await modifying;
+  await rejectInternal(f.service, 'restore', f.restorePayload(), 'BUSY'); release.resolve(); await modifying;
   const uploadEntered = deferred(), uploadRelease = deferred(), original = SyncClient.prototype.uploadBlob;
   t.mock.method(SyncClient.prototype, 'uploadBlob', async function (...args) { uploadEntered.resolve(); await uploadRelease.promise; return original.apply(this, args); });
   await fs.writeFile(path.join(f.source, 'hello.txt'), 'new content');
   const uploading = f.controller.push(f.projectId); await uploadEntered.promise;
-  await rejected(f.bridge, 'restore', f.restorePayload(), 'BUSY'); uploadRelease.resolve(); await uploading;
+  await rejectInternal(f.service, 'restore', f.restorePayload(), 'BUSY'); uploadRelease.resolve(); await uploading;
 });
 
 test('logout drains non-cancellable native import and retains partial IDs in prior job without exposing them to a fresh account', async t => {
   const entered = deferred(), release = deferred();
   const f = await fixture(t, { importSessions: async () => { entered.resolve(); await release.promise; return { imported: [{ sourceId: 'archived-session', sessionId: 'durable-new-session', workspaceAttached: true }], skipped: [], failed: [] }; } });
   const { recovery } = await f.restore(); const payload = { ...f.bound, restoreId: recovery.id, confirm: true, requestId: randomUUID() };
-  await good(f.bridge, 'import', payload); await entered.promise;
+  await callInternal(f.service, 'import', payload); await entered.promise;
   const loggingOut = f.service.logout({}); let done = false; loggingOut.then(() => { done = true; });
   await new Promise(resolve => setImmediate(resolve)); assert.equal(done, false); release.resolve();
   const value = await loggingOut; assert.equal(value.recovery, undefined); assert.equal(f.importCalls, 1);
@@ -271,7 +281,7 @@ test('import accepts a valid near-limit manifest whose restored pretty JSON exce
     return { ...restored, manifest };
   });
   const { recovery } = await f.restore(); assert.equal(recovery.state, 'succeeded');
-  await good(f.bridge, 'import', { ...f.bound, restoreId: recovery.id, confirm: true, requestId: randomUUID() });
+  await callInternal(f.service, 'import', { ...f.bound, restoreId: recovery.id, confirm: true, requestId: randomUUID() });
   assert.equal((await f.settle()).state, 'succeeded'); assert.equal(f.importCalls, 1);
 });
 

@@ -513,7 +513,8 @@ export function withBidirectionalSync(ctx, controller, legacy, { profileDir, dsh
         }
         if (cursor) partial = true;
         const old = await client.projects(); await context.check(); partial ||= old.partial === true;
-        for (const row of old.projects) if (!seen.has(row.projectId)) projects.push({ projectId: row.projectId, label: row.label ?? row.projectId, legacy: true });
+        for (const row of old.projects) if (!seen.has(row.projectId)) projects.push({ projectId: row.projectId, label: row.label ?? row.projectId, legacy: true,
+          checkpointCount: row.checkpointCount, latestCreatedAt: row.latestCreatedAt, ...(row.sourceRoot === undefined ? {} : { sourceRoot: row.sourceRoot }) });
         return { projects: projects.slice(0, 1000), ...(partial || projects.length > 1000 ? { partial: true } : {}) };
       }, { signal, checkBinding: () => payloadIdentity(input, []) });
     },

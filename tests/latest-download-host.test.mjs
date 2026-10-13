@@ -64,9 +64,21 @@ async function fixture(t) {
     const token = records.get(controller.credentialKey)?.payload?.token; if (token) assert.ok(!text.includes(token));
     return body.result;
   }
-  async function good(action, payload, signal) { const result = await rpc(action, payload, signal); assert.equal(result.ok, true, JSON.stringify(result)); return result.value; }
-  async function reject(action, payload, code) { const result = await rpc(action, payload); assert.equal(result.ok, false, JSON.stringify(result)); if (code) assert.equal(result.error.code, code); return result; }
-  const bound = binding(await good('login', { server, username: 'owner', password }));
+  // Latest-download safety is retained as internal compatibility, not RPC.
+  async function callInternal(action, payload, signal) {
+    const value = await service[action === 'preferences' ? 'savePreferences' : action](payload, signal);
+    const text = JSON.stringify(value); assert.ok(!text.includes(password));
+    const token = records.get(controller.credentialKey)?.payload?.token; if (token) assert.ok(!text.includes(token));
+    return value;
+  }
+  async function rejectInternal(action, payload, expected) {
+    await assert.rejects(callInternal(action, payload), typeof expected === 'string' ? error => {
+      if (expected === 'BAD_REQUEST' && error.name === 'ValidationError') return true;
+      assert.equal(error.code, expected); return true;
+    } : expected);
+  }
+  const login = await rpc('login', { server, username: 'owner', password }); assert.equal(login.ok, true);
+  const bound = binding(login.value);
   const client = new SyncClient(records.get(controller.credentialKey).payload);
   async function commit(projectId, id, { text = id, sourceRoot = `/remote/${projectId}`, createdAt = '2020-01-02T00:00:00.000Z', parentId = null, sessionIds = [] } = {}) {
     const files = [];
@@ -78,9 +90,9 @@ async function fixture(t) {
   }
   const manifests = [];
   for (let i = 0; i < 3; i++) manifests.push(await commit(`project-${i}`, `zzz-first-${i}`, { createdAt: '2099-01-02T00:00:00.000Z' }));
-  const pick = (projectIds = ['project-0'], signal) => good('downloadpick', { ...bound, latest: true, items: projectIds.map(projectId => ({ projectId })) }, signal);
+  const pick = (projectIds = ['project-0'], signal) => callInternal('downloadpick', { ...bound, latest: true, items: projectIds.map(projectId => ({ projectId })) }, signal);
   const payload = plan => ({ ...bound, latest: true, items: plan.destinations.map(item => ({ projectId: item.projectId, destinationId: item.id })), requestId: randomUUID(), confirm: true });
-  async function settle() { await controller.drain(); return (await good('status', {})).download; }
+  async function settle() { await controller.drain(); return (await callInternal('status', {})).download; }
   function gate(predicate = entry => entry.method === 'GET' && entry.url === '/v1/checkpoints?projectId=project-0') {
     const entered = deferred(), released = deferred(), closed = deferred(); let blocked = false;
     releases.push(released.resolve);
@@ -89,7 +101,7 @@ async function fixture(t) {
     };
     return { entered: entered.promise, release: released.resolve, closed: closed.promise };
   }
-  return { root, parent, profileDir, records, workspaces, imports, requests, controller, service, cloudDir, client, manifests, bound, pick, payload, settle, rpc, good, reject, commit, gate,
+  return { root, parent, profileDir, records, workspaces, imports, requests, controller, service, cloudDir, client, manifests, bound, pick, payload, settle, callInternal, rejectInternal, commit, gate,
     setHook(value) { hook = value; }, advance(ms) { clock += ms; }, setCapability(value) { capability = value; }, replaceProvider() { provider = { capability: () => capability }; }, get pickCalls() { return pickCalls; } };
 }
 
@@ -109,7 +121,7 @@ test('latest helper chooses last successful append commit with multiple heads an
   assert.deepEqual(history.checkpoints.map(item => item.id), [first.id, last.id]); assert.deepEqual(new Set(history.heads), new Set([first.id, last.id]));
   assert.equal((await f.client.latestCheckpoint(first.projectId)).id, last.id);
   const mark = f.requests.length, plan = await f.pick(); publicPlan(plan); assert.equal(plan.destinations[0].label, 'latest-name');
-  await f.good('downloadstart', f.payload(plan)); const result = await f.settle();
+  await f.callInternal('downloadstart', f.payload(plan)); const result = await f.settle();
   assert.equal(result.latest, true); assert.equal(result.items[0].checkpointId, last.id); assert.equal(await fs.readFile(path.join(result.items[0].root, 'hello.txt'), 'utf8'), last.id);
   assert.ok(f.requests.slice(mark).every(entry => entry.method === 'GET'), 'download never writes cloud history');
   assert.deepEqual(await f.client.list(first.projectId), history);
@@ -121,12 +133,12 @@ test('latest start refreshes plan-time content without renaming authorized root 
   const f = await fixture(t), plan = await f.pick(); publicPlan(plan);
   const plannedRoot = plan.destinations[0].root; assert.equal(path.basename(plannedRoot), 'project-0');
   const latest = await f.commit('project-0', 'new-before-click', { sourceRoot: '/remote/renamed-at-source', text: 'current cloud bytes', sessionIds: ['new-session'] });
-  const input = f.payload(plan), ack = (await f.good('downloadstart', input)).download;
+  const input = f.payload(plan), ack = (await f.callInternal('downloadstart', input)).download;
   assert.equal(ack.latest, true); assert.equal(ack.id, input.requestId); assert.equal(ack.items[0].checkpointId, latest.id); assert.equal(ack.items[0].root, plannedRoot);
   const result = await f.settle(), item = result.items[0]; assert.equal(result.state, 'succeeded'); assert.equal(item.canImport, true); assert.equal(item.sessionCount, 1);
   assert.equal(await fs.readFile(path.join(plannedRoot, 'hello.txt'), 'utf8'), 'current cloud bytes'); await missing(path.join(f.parent, 'renamed-at-source'));
   assert.equal(f.imports.length, 0); assert.equal((await f.service.status()).autoSync, false);
-  await f.good('import', { ...f.bound, restoreId: item.restoreId, requestId: randomUUID(), confirm: true });
+  await f.callInternal('import', { ...f.bound, restoreId: item.restoreId, requestId: randomUUID(), confirm: true });
   assert.equal((await f.settle()).items[0].importResult.state, 'succeeded'); assert.equal(f.imports[0].manifest.id, latest.id);
   assert.equal(f.imports[0].manifest.sourceRoot, latest.sourceRoot); assert.deepEqual(f.imports[0].manifest.sessionIds, ['new-session']);
 });
@@ -134,37 +146,37 @@ test('latest start refreshes plan-time content without renaming authorized root 
 test('accepted latest batch pins IDs despite later commits; duplicate request never refetches or rewrites after expiry', async t => {
   const f = await fixture(t), plan = await f.pick(['project-0', 'project-1']), input = f.payload(plan), page = new AbortController();
   const gate = f.gate(entry => entry.method === 'GET' && entry.url === `/v1/blobs/${f.manifests[0].files[0].sha256}`);
-  const ack = (await f.good('downloadstart', input, page.signal)).download; page.abort(); await gate.entered;
+  const ack = (await f.callInternal('downloadstart', input, page.signal)).download; page.abort(); await gate.entered;
   assert.equal(ack.latest, true); assert.deepEqual(ack.items.map(item => item.checkpointId), f.manifests.slice(0, 2).map(item => item.id));
   await f.commit('project-0', 'next-run-0'); await f.commit('project-1', 'next-run-1');
-  const beforeDuplicate = f.requests.length; assert.equal((await f.good('downloadstart', input)).download.id, input.requestId); assert.equal(f.requests.length, beforeDuplicate);
-  await f.reject('downloadstart', { ...input, requestId: randomUUID() }, 'BUSY');
+  const beforeDuplicate = f.requests.length; assert.equal((await f.callInternal('downloadstart', input)).download.id, input.requestId); assert.equal(f.requests.length, beforeDuplicate);
+  await f.rejectInternal('downloadstart', { ...input, requestId: randomUUID() }, 'BUSY');
   await assert.rejects(f.controller.runUpdate(() => assert.fail('update during accepted batch')), { code: 'BUSY' });
   f.advance(16 * 60_000); gate.release(); const result = await f.settle(); assert.equal(result.state, 'succeeded');
   for (const [index, item] of result.items.entries()) assert.equal(await fs.readFile(path.join(item.root, 'hello.txt'), 'utf8'), f.manifests[index].id);
   const target = path.join(result.items[0].root, 'hello.txt'); await fs.writeFile(target, 'local edit must survive duplicate');
-  const before = f.requests.length; assert.deepEqual((await f.good('downloadstart', input)).download, result); assert.equal(f.requests.length, before);
+  const before = f.requests.length; assert.deepEqual((await f.callInternal('downloadstart', input)).download, result); assert.equal(f.requests.length, before);
   assert.equal(await fs.readFile(target, 'utf8'), 'local edit must survive duplicate');
-  await f.reject('downloadstart', { ...input, items: [...input.items].reverse() }, 'BAD_REQUEST');
+  await f.rejectInternal('downloadstart', { ...input, items: [...input.items].reverse() }, 'BAD_REQUEST');
   const { latest, ...oldInput } = input;
-  await f.reject('downloadstart', { ...oldInput, items: input.items.map((item, index) => ({ ...item, checkpointId: result.items[index].checkpointId })) }, 'BAD_REQUEST');
-  await f.reject('downloadstart', { ...input, requestId: randomUUID() }, 'DIRECTORY_PICKER_EXPIRED');
-  const fresh = await f.pick(['project-0', 'project-1']); await f.good('downloadstart', f.payload(fresh));
+  await f.rejectInternal('downloadstart', { ...oldInput, items: input.items.map((item, index) => ({ ...item, checkpointId: result.items[index].checkpointId })) }, 'BAD_REQUEST');
+  await f.rejectInternal('downloadstart', { ...input, requestId: randomUUID() }, 'DIRECTORY_PICKER_EXPIRED');
+  const fresh = await f.pick(['project-0', 'project-1']); await f.callInternal('downloadstart', f.payload(fresh));
   const next = await f.settle(); assert.deepEqual(next.items.map(item => item.checkpointId), ['next-run-0', 'next-run-1']);
   for (const item of next.items) assert.equal(await fs.readFile(path.join(item.root, 'hello.txt'), 'utf8'), item.checkpointId);
 });
 
 test('latest protocol strictly rejects false/typed flags, injected checkpoint overrides, unknown/duplicate projects and oversized selection', async t => {
   const f = await fixture(t);
-  for (const action of ['downloadpick', 'downloadbrowse', 'downloadselect', 'downloadstart']) for (const latest of [false, null, 1, 'true', {}, []]) await f.reject(action, { ...f.bound, latest }, 'BAD_REQUEST');
-  for (const items of [[], [{ projectId: 'project-0' }, { projectId: 'project-0' }], [{ projectId: 'project-0', checkpointId: f.manifests[0].id }], [{ projectId: '../forged' }], [{ projectId: 'project-0', root: f.parent }]]) await f.reject('downloadpick', { ...f.bound, latest: true, items }, 'BAD_REQUEST');
-  await f.reject('downloadpick', { ...f.bound, latest: true, items: Array.from({ length: 21 }, (_, i) => ({ projectId: `project-${i}` })) }, 'DOWNLOAD_LIMIT');
-  await f.reject('downloadpick', { ...f.bound, latest: true, items: [{ projectId: 'unknown' }] }, 'CLOUD_PROJECT_EMPTY'); assert.equal(f.pickCalls, 0);
+  for (const action of ['downloadpick', 'downloadbrowse', 'downloadselect', 'downloadstart']) for (const latest of [false, null, 1, 'true', {}, []]) await f.rejectInternal(action, { ...f.bound, latest }, 'BAD_REQUEST');
+  for (const items of [[], [{ projectId: 'project-0' }, { projectId: 'project-0' }], [{ projectId: 'project-0', checkpointId: f.manifests[0].id }], [{ projectId: '../forged' }], [{ projectId: 'project-0', root: f.parent }]]) await f.rejectInternal('downloadpick', { ...f.bound, latest: true, items }, 'BAD_REQUEST');
+  await f.rejectInternal('downloadpick', { ...f.bound, latest: true, items: Array.from({ length: 21 }, (_, i) => ({ projectId: `project-${i}` })) }, 'DOWNLOAD_LIMIT');
+  await f.rejectInternal('downloadpick', { ...f.bound, latest: true, items: [{ projectId: 'unknown' }] }, 'CLOUD_PROJECT_EMPTY'); assert.equal(f.pickCalls, 0);
   const plan = await f.pick(), input = f.payload(plan);
-  await f.reject('downloadstart', { ...input, checkpointId: f.manifests[0].id }, 'BAD_REQUEST');
-  await f.reject('downloadstart', { ...input, items: [{ ...input.items[0], checkpointId: f.manifests[0].id }] }, 'BAD_REQUEST');
-  await f.reject('downloadstart', { ...input, items: [{ ...input.items[0], projectId: 'unknown' }] }, 'DIRECTORY_PICKER_EXPIRED');
-  await f.reject('downloadstart', { ...input, items: [{ ...input.items[0], destinationId: 'forged' }] }, 'DIRECTORY_PICKER_EXPIRED');
+  await f.rejectInternal('downloadstart', { ...input, checkpointId: f.manifests[0].id }, 'BAD_REQUEST');
+  await f.rejectInternal('downloadstart', { ...input, items: [{ ...input.items[0], checkpointId: f.manifests[0].id }] }, 'BAD_REQUEST');
+  await f.rejectInternal('downloadstart', { ...input, items: [{ ...input.items[0], projectId: 'unknown' }] }, 'DIRECTORY_PICKER_EXPIRED');
+  await f.rejectInternal('downloadstart', { ...input, items: [{ ...input.items[0], destinationId: 'forged' }] }, 'DIRECTORY_PICKER_EXPIRED');
   assert.deepEqual(await fs.readdir(f.parent), []);
   f.setCapability({ kind: 'native', pick: async () => null }); assert.deepEqual(await f.pick(), { cancelled: true });
 });
@@ -174,39 +186,39 @@ test('latest browse/select are marked and mode-bound; pinned batch and single hi
   f.setCapability({ kind: 'browse', list: async () => listing(f.parent) });
   const latestBrowser = await f.pick(); assert.equal(latestBrowser.latest, true);
   const latestInput = { ...f.bound, latest: true, browserId: latestBrowser.browser.id, nodeId: latestBrowser.browser.currentId };
-  assert.equal((await f.good('downloadbrowse', latestInput)).latest, true);
+  assert.equal((await f.callInternal('downloadbrowse', latestInput)).latest, true);
   const { latest, ...unmarked } = latestInput;
-  for (const action of ['downloadbrowse', 'downloadselect', 'destinationbrowse', 'destinationselect']) await f.reject(action, unmarked, 'DIRECTORY_PICKER_EXPIRED');
-  const plan = await f.good('downloadselect', latestInput); publicPlan(plan);
+  for (const action of ['downloadbrowse', 'downloadselect', 'destinationbrowse', 'destinationselect']) await f.rejectInternal(action, unmarked, 'DIRECTORY_PICKER_EXPIRED');
+  const plan = await f.callInternal('downloadselect', latestInput); publicPlan(plan);
   const oldItem = { projectId: old.projectId, checkpointId: old.id };
-  const pinnedBrowser = await f.good('downloadpick', { ...f.bound, items: [oldItem] }); assert.equal(Object.hasOwn(pinnedBrowser, 'latest'), false);
+  const pinnedBrowser = await f.callInternal('downloadpick', { ...f.bound, items: [oldItem] }); assert.equal(Object.hasOwn(pinnedBrowser, 'latest'), false);
   const pinnedInput = { ...f.bound, browserId: pinnedBrowser.browser.id, nodeId: pinnedBrowser.browser.currentId };
-  for (const action of ['downloadbrowse', 'downloadselect']) await f.reject(action, { ...pinnedInput, latest: true }, 'DIRECTORY_PICKER_EXPIRED');
-  const pinnedPlan = await f.good('downloadselect', pinnedInput); assert.equal(Object.hasOwn(pinnedPlan, 'latest'), false); assert.equal(pinnedPlan.destinations[0].checkpointId, old.id);
-  await f.reject('downloadstart', f.payload(pinnedPlan), 'DIRECTORY_PICKER_EXPIRED');
-  await f.reject('downloadstart', { ...f.bound, items: [{ ...oldItem, destinationId: plan.destinations[0].id }], requestId: randomUUID(), confirm: true }, 'DIRECTORY_PICKER_EXPIRED');
-  const single = await f.good('destinationpick', { ...f.bound, ...oldItem });
+  for (const action of ['downloadbrowse', 'downloadselect']) await f.rejectInternal(action, { ...pinnedInput, latest: true }, 'DIRECTORY_PICKER_EXPIRED');
+  const pinnedPlan = await f.callInternal('downloadselect', pinnedInput); assert.equal(Object.hasOwn(pinnedPlan, 'latest'), false); assert.equal(pinnedPlan.destinations[0].checkpointId, old.id);
+  await f.rejectInternal('downloadstart', f.payload(pinnedPlan), 'DIRECTORY_PICKER_EXPIRED');
+  await f.rejectInternal('downloadstart', { ...f.bound, items: [{ ...oldItem, destinationId: plan.destinations[0].id }], requestId: randomUUID(), confirm: true }, 'DIRECTORY_PICKER_EXPIRED');
+  const single = await f.callInternal('destinationpick', { ...f.bound, ...oldItem });
   const singleInput = { ...f.bound, browserId: single.browser.id, nodeId: single.browser.currentId };
-  await f.reject('downloadselect', { ...singleInput, latest: true }, 'DIRECTORY_PICKER_EXPIRED');
-  const singlePlan = await f.good('destinationselect', singleInput);
-  await f.reject('downloadstart', { ...f.payload(plan), items: [{ projectId: old.projectId, destinationId: singlePlan.destination.id }] }, 'DIRECTORY_PICKER_EXPIRED');
-  await f.reject('restore', { ...f.bound, ...oldItem, destinationId: plan.destinations[0].id, requestId: randomUUID(), confirm: true }, 'DIRECTORY_PICKER_EXPIRED');
+  await f.rejectInternal('downloadselect', { ...singleInput, latest: true }, 'DIRECTORY_PICKER_EXPIRED');
+  const singlePlan = await f.callInternal('destinationselect', singleInput);
+  await f.rejectInternal('downloadstart', { ...f.payload(plan), items: [{ projectId: old.projectId, destinationId: singlePlan.destination.id }] }, 'DIRECTORY_PICKER_EXPIRED');
+  await f.rejectInternal('restore', { ...f.bound, ...oldItem, destinationId: plan.destinations[0].id, requestId: randomUUID(), confirm: true }, 'DIRECTORY_PICKER_EXPIRED');
   const oldStart = { ...f.bound, items: [{ ...oldItem, destinationId: pinnedPlan.destinations[0].id }], requestId: randomUUID(), confirm: true };
-  assert.equal(Object.hasOwn((await f.good('downloadstart', oldStart)).download, 'latest'), false);
+  assert.equal(Object.hasOwn((await f.callInternal('downloadstart', oldStart)).download, 'latest'), false);
   const pinned = await f.settle(); assert.equal(Object.hasOwn(pinned, 'latest'), false); assert.equal(pinned.items[0].checkpointId, old.id);
   assert.equal(await fs.readFile(path.join(pinned.items[0].root, 'hello.txt'), 'utf8'), old.id);
-  await f.good('restore', { ...f.bound, ...oldItem, destinationId: singlePlan.destination.id, requestId: randomUUID(), confirm: true }); await f.controller.drain();
+  await f.callInternal('restore', { ...f.bound, ...oldItem, destinationId: singlePlan.destination.id, requestId: randomUUID(), confirm: true }); await f.controller.drain();
   assert.equal(await fs.readFile(path.join(singlePlan.destination.root, 'hello.txt'), 'utf8'), old.id);
   const commandRoot = path.join(f.parent, 'legacy-command'); await f.controller.restore(old.id, commandRoot);
   assert.equal(await fs.readFile(path.join(commandRoot, 'hello.txt'), 'utf8'), old.id);
-  await f.good('downloadstart', f.payload(plan)); assert.equal((await f.settle()).items[0].checkpointId, 'new-current');
+  await f.callInternal('downloadstart', f.payload(plan)); assert.equal((await f.settle()).items[0].checkpointId, 'new-current');
 });
 
 test('latest plan group remains atomic: partial/mixed selections and cross-project plan injection reject without files', async t => {
   const f = await fixture(t), first = await f.pick(['project-0', 'project-1']), second = await f.pick(['project-0', 'project-1']);
   const input = f.payload(first), other = f.payload(second);
   for (const items of [[input.items[0]], [input.items[0], other.items[1]], [input.items[0], { ...input.items[1], destinationId: input.items[0].destinationId }], [{ ...input.items[0], projectId: 'project-1' }, { ...input.items[1], projectId: 'project-0' }]]) {
-    await f.reject('downloadstart', { ...input, items });
+    await f.rejectInternal('downloadstart', { ...input, items });
   }
   assert.deepEqual(await fs.readdir(f.parent), []);
 });
@@ -221,18 +233,18 @@ test('empty, malformed, wrong-project and missing/corrupt latest responses rejec
     { route: `/v1/checkpoints/${last.id}`, json: { ...last, projectId: 'wrong-project' }, code: 'CHECKPOINT_MISMATCH' },
     { route: `/v1/checkpoints/${last.id}`, json: { ...last, files: [{ ...last.files[0], sha256: 'corrupt' }] }, code: 'BAD_REQUEST' },
     { route: `/v1/checkpoints/${last.id}`, json: { ...last, deviceId: 'different-device' }, code: 'BAD_REQUEST' },
-    { route: `/v1/checkpoints/${last.id}`, json: {}, status: 404, code: 'SETTINGS_FAILED' },
+    { route: `/v1/checkpoints/${last.id}`, json: {}, status: 404, code: { httpStatus: 404 } },
   ];
   for (const scenario of cases) {
     f.setHook(entry => entry.url === scenario.route ? scenario : undefined);
-    await f.reject('downloadstart', input, scenario.code); await f.controller.drain();
+    await f.rejectInternal('downloadstart', input, scenario.code); await f.controller.drain();
     assert.deepEqual(await fs.readdir(f.parent), []); assert.equal((await f.service.status()).download, undefined);
   }
   f.setHook(undefined);
   const corruptLatest = await f.commit(last.projectId, 'corrupt-newest');
   const filename = path.join(f.cloudDir, 'checkpoints', `${sha256(Buffer.from(corruptLatest.id))}.json`);
   await fs.writeFile(filename, JSON.stringify({ ...corruptLatest, sourceRoot: '/remote/tampered' }));
-  const before = f.requests.length; await f.reject('downloadstart', input); await f.controller.drain();
+  const before = f.requests.length; await f.rejectInternal('downloadstart', input); await f.controller.drain();
   assert.ok(!f.requests.slice(before).some(entry => entry.url === `/v1/checkpoints/${last.id}`), 'never fall back to an older valid snapshot');
   assert.deepEqual(await fs.readdir(f.parent), []);
 });
@@ -240,34 +252,36 @@ test('empty, malformed, wrong-project and missing/corrupt latest responses rejec
 test('planning validates latest cloud metadata before opening any chooser', async t => {
   const f = await fixture(t), last = f.manifests[0];
   f.setHook(entry => entry.url === `/v1/checkpoints/${last.id}` ? { json: { ...last, projectId: 'wrong-project' } } : undefined);
-  await f.reject('downloadpick', { ...f.bound, latest: true, items: [{ projectId: last.projectId }] }, 'CHECKPOINT_MISMATCH');
+  await f.rejectInternal('downloadpick', { ...f.bound, latest: true, items: [{ projectId: last.projectId }] }, 'CHECKPOINT_MISMATCH');
   assert.equal(f.pickCalls, 0); assert.deepEqual(await fs.readdir(f.parent), []);
 });
 
 test('TTL expiry during real latest HTTP resolution rejects before acknowledgement or any target creation', async t => {
-  const f = await fixture(t), plan = await f.pick(), gate = f.gate(), starting = f.rpc('downloadstart', f.payload(plan));
+  const f = await fixture(t), plan = await f.pick(), gate = f.gate(), starting = f.callInternal('downloadstart', f.payload(plan));
+  const rejected = assert.rejects(starting, { code: 'DIRECTORY_PICKER_EXPIRED' });
   await gate.entered; f.advance(15 * 60_000); gate.release();
-  const result = await starting; assert.equal(result.ok, false); assert.equal(result.error.code, 'DIRECTORY_PICKER_EXPIRED'); await f.controller.drain();
+  await rejected; await f.controller.drain();
   assert.deepEqual(await fs.readdir(f.parent), []); assert.equal((await f.service.status()).download, undefined);
 });
 
 test('page abort cancels actual preaccept latest HTTP, consumes no request ID, and shared guards stay busy while resolving', async t => {
   const f = await fixture(t), plan = await f.pick(), input = f.payload(plan), gate = f.gate(), page = new AbortController();
-  const starting = f.rpc('downloadstart', input, page.signal); await gate.entered;
+  const starting = f.callInternal('downloadstart', input, page.signal), rejected = assert.rejects(starting, { name: 'AbortError' }); await gate.entered;
   assert.equal((await f.service.status()).running, true);
-  await f.reject('downloadstart', { ...input, requestId: randomUUID() }, 'BUSY');
-  await f.reject('preferences', { revision: f.bound.revision, autoSync: false, projectIds: [] }, 'BUSY');
+  await f.rejectInternal('downloadstart', { ...input, requestId: randomUUID() }, 'BUSY');
+  await f.rejectInternal('preferences', { revision: f.bound.revision, autoSync: false, projectIds: [] }, 'BUSY');
   await assert.rejects(f.controller.runUpdate(() => assert.fail('update during latest resolution')), { code: 'BUSY' });
-  page.abort(); const result = await starting; assert.equal(result.ok, false); assert.equal(result.error.code, 'TIMEOUT');
+  page.abort(); await rejected;
   await gate.closed; await f.controller.drain(); assert.deepEqual(await fs.readdir(f.parent), []); assert.equal((await f.service.status()).download, undefined);
   gate.release(); f.setHook(undefined);
-  await f.good('downloadstart', input); assert.equal((await f.settle()).state, 'succeeded');
+  await f.callInternal('downloadstart', input); assert.equal((await f.settle()).state, 'succeeded');
 });
 
 test('slow latest lookup rechecks token, revision, parent identity, protected roots and picker provider before acceptance', async t => {
   for (const scenario of ['token', 'revision', 'parent', 'provider', 'occupied', 'protected']) await t.test(scenario, async t => {
-    const f = await fixture(t), plan = await f.pick(), gate = f.gate(), starting = f.rpc('downloadstart', f.payload(plan)); await gate.entered;
+    const f = await fixture(t), plan = await f.pick(), gate = f.gate(), starting = f.callInternal('downloadstart', f.payload(plan));
     let expected;
+    const rejected = assert.rejects(starting, error => { assert.equal(error.code, expected); return true; }); await gate.entered;
     if (scenario === 'token') {
       const grant = f.records.get(f.controller.credentialKey); f.records.set(f.controller.credentialKey, { ...grant, payload: { ...grant.payload, token: 'z'.repeat(43) } }); expected = 'ACCOUNT_MISMATCH';
     } else if (scenario === 'revision') {
@@ -278,7 +292,7 @@ test('slow latest lookup rechecks token, revision, parent identity, protected ro
     } else if (scenario === 'occupied') { await fs.mkdir(plan.destinations[0].root); expected = 'DESTINATION_EXISTS'; }
     else if (scenario === 'protected') { f.workspaces.set('new-registration', { id: 'new-registration', path: f.parent }); expected = 'PROTECTED_DESTINATION'; }
     else { f.replaceProvider(); expected = 'DIRECTORY_PICKER_EXPIRED'; }
-    gate.release(); const result = await starting; assert.equal(result.ok, false); assert.equal(result.error.code, expected); await f.controller.drain();
+    gate.release(); await rejected; await f.controller.drain();
     if (scenario === 'occupied') assert.deepEqual(await fs.readdir(plan.destinations[0].root), []); else assert.deepEqual(await fs.readdir(f.parent), []);
     assert.equal((await f.service.status()).download, undefined);
   });
@@ -286,10 +300,11 @@ test('slow latest lookup rechecks token, revision, parent identity, protected ro
 
 test('logout and Host lifetime abort cancel unaccepted latest network calls and drain without files', async t => {
   for (const action of ['logout', 'stop']) await t.test(action, async t => {
-    const f = await fixture(t), plan = await f.pick(), gate = f.gate(), starting = f.rpc('downloadstart', f.payload(plan)); await gate.entered;
+    const f = await fixture(t), plan = await f.pick(), gate = f.gate(), starting = f.callInternal('downloadstart', f.payload(plan));
+    const rejected = assert.rejects(starting, { name: 'AbortError' }); await gate.entered;
     let loggingOut;
     if (action === 'logout') loggingOut = f.service.logout({}); else f.controller.stop();
-    const result = await starting; assert.equal(result.ok, false); await gate.closed; await f.controller.drain();
+    await rejected; await gate.closed; await f.controller.drain();
     if (loggingOut) assert.equal((await loggingOut).loggedIn, false);
     assert.deepEqual(await fs.readdir(f.parent), []); gate.release();
   });
@@ -299,12 +314,12 @@ test('actual latest session eligibility replaces plan-time eligibility and diges
   const f = await fixture(t); await f.commit('project-0', 'with-session', { sessionIds: ['old-session'] });
   const plan = await f.pick(['project-0', 'project-1']);
   await f.commit('project-0', 'without-session'); const latest = await f.commit('project-1', 'new-session-point', { sessionIds: ['new-session'] });
-  await f.good('downloadstart', f.payload(plan)); const result = await f.settle();
+  await f.callInternal('downloadstart', f.payload(plan)); const result = await f.settle();
   assert.equal(result.items[0].canImport, false); assert.equal(result.items[0].sessionCount, 0); assert.equal(result.items[1].canImport, true);
-  await f.reject('import', { ...f.bound, restoreId: result.items[0].restoreId, requestId: randomUUID(), confirm: true }, 'RECOVERY_UNAVAILABLE');
+  await f.rejectInternal('import', { ...f.bound, restoreId: result.items[0].restoreId, requestId: randomUUID(), confirm: true }, 'RECOVERY_UNAVAILABLE');
   const filename = path.join(result.items[1].root, '.dsh-sync', 'manifest.json');
   await fs.writeFile(filename, JSON.stringify({ ...latest, sourceRoot: '/remote/tampered-after-download' }));
-  await f.good('import', { ...f.bound, restoreId: result.items[1].restoreId, requestId: randomUUID(), confirm: true });
+  await f.callInternal('import', { ...f.bound, restoreId: result.items[1].restoreId, requestId: randomUUID(), confirm: true });
   assert.equal((await f.settle()).items[1].importResult.errorCode, 'IMPORT_FAILED'); assert.equal(f.imports.length, 0);
 });
 
@@ -313,7 +328,7 @@ test('postaccept latest integrity failure stays per item while HTTP permission f
     const f = await fixture(t), latest = await f.commit('project-1', 'current-second'), plan = await f.pick(['project-0', 'project-1', 'project-2']);
     if (failure === 'integrity') await fs.writeFile(path.join(f.cloudDir, 'blobs', latest.files[0].sha256), Buffer.alloc(latest.files[0].size, 0x58));
     else f.setHook(entry => entry.url === `/v1/blobs/${latest.files[0].sha256}` ? { status: 403 } : undefined);
-    await f.good('downloadstart', f.payload(plan)); const result = await f.settle(); assert.equal(result.latest, true); assert.equal(result.state, 'partial'); assert.equal(result.completed, 3);
+    await f.callInternal('downloadstart', f.payload(plan)); const result = await f.settle(); assert.equal(result.latest, true); assert.equal(result.state, 'partial'); assert.equal(result.completed, 3);
     assert.equal(result.items[0].state, 'succeeded'); assert.equal(result.items[1].checkpointId, latest.id);
     if (failure === 'integrity') { assert.deepEqual(result.items.map(item => item.state), ['succeeded', 'failed', 'succeeded']); assert.equal(result.items[1].errorCode, 'RESTORE_FAILED'); }
     else { assert.deepEqual(result.items.map(item => item.state), ['succeeded', 'cancelled', 'cancelled']); assert.ok(result.items.slice(1).every(item => item.errorCode === 'ACCOUNT_MISMATCH')); await missing(result.items[2].root); }

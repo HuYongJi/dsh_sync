@@ -258,13 +258,13 @@ test('production Client controller completes 8-codepoint changes through Host RP
       t.after(() => ui.dispose());
       await ui.refresh(); const status = ui.getSnapshot().status;
       assert.equal(await ui.changePassword({ revision: status.revision, server: status.server, username: status.username }, { currentPassword: oldPassword, newPassword: minimumPassword, confirmPassword: minimumPassword }), true);
-      assert.equal(ui.getSnapshot().status.loggedIn, false); assert.equal(ui.getSnapshot().status.autoSync, false);
+      assert.equal(ui.getSnapshot().status.loggedIn, false); assert.equal(Object.hasOwn(ui.getSnapshot().status, 'autoSync'), false);
       assert.match(ui.getSnapshot().notice, /密码已修改/); assert.ok(!JSON.stringify(ui.getSnapshot()).includes(minimumPassword));
       await assert.rejects(first.list(id), { status: 401 }); await assert.rejects(second.list(id), { status: 401 });
       assert.equal(await ui.login({ server: f.server, username: 'owner', password: oldPassword }), false);
       assert.equal(ui.getSnapshot().status.loggedIn, false);
       assert.equal(await ui.login({ server: f.server, username: 'owner', password: minimumPassword }), true);
-      assert.equal(ui.getSnapshot().status.loggedIn, true); assert.equal(ui.getSnapshot().status.autoSync, false);
+      assert.equal(ui.getSnapshot().status.loggedIn, true); assert.equal(Object.hasOwn(ui.getSnapshot().status, 'autoSync'), false);
       const fresh = new SyncClient(f.records.get(f.controller.credentialKey).payload);
       assert.deepEqual((await fresh.list(id)).checkpoints, []);
     });

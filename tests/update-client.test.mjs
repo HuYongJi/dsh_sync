@@ -149,16 +149,22 @@ test('update candidate, commit, target and runtime changes invalidate stale conf
   }
 });
 
-test('update dirty preferences, pending sync and recovery lock installation without removing normal upload cancellation', async t => {
-  let current = status({ ...signed, update: available() }); const { controller, calls } = setup(t, () => ok(current));
-  await controller.refresh(); const intent = controller.prepareUpdate(); controller.setAutoSync(true);
+test('update Host work and active account requests lock installation without removing safe logout', async t => {
+  let current = status({ ...signed, update: available() }); const login = deferred();
+  const { controller, calls } = setup(t, call => call.action === 'login' ? login.promise : ok(current));
+  await controller.refresh(); const intent = controller.prepareUpdate(); assert.ok(intent);
+  current = { ...current, running: true }; await controller.refresh();
   assert.equal(controller.prepareUpdate(), null); assert.equal(await controller.confirmUpdate(intent), false);
-  controller.discardChanges();
-  current = status({ ...signed, running: true, update: available() }); await controller.refresh();
-  assert.equal(controller.prepareUpdate(), null); assert.equal(deriveView(controller.getSnapshot()).editable, true); assert.equal(deriveView(controller.getSnapshot()).canLogout, true);
-  current = status({ ...signed, recovery: { id: 'restore-one', kind: 'restore', state: 'running', root: 'E:\\synthetic\\new' }, update: available() }); await controller.refresh();
+  assert.equal(deriveView(controller.getSnapshot()).canLogin, false);
+  assert.equal(deriveView(controller.getSnapshot()).canLogout, true);
+  assert.equal(deriveView(controller.getSnapshot()).canChangePassword, true);
+  current = { ...current, running: false }; await controller.refresh();
+  const signingIn = controller.login({ ...signed, password: 'synthetic-secret' });
   assert.equal(controller.prepareUpdate(), null); assert.equal(await controller.confirmUpdate(intent), false);
-  assert.ok(calls.every(call => call.action === 'status'));
+  assert.equal(deriveView(controller.getSnapshot()).canLogout, false);
+  login.resolve(ok(current)); assert.equal(await signingIn, true);
+  assert.equal(deriveView(controller.getSnapshot()).canUpdate, true);
+  assert.ok(calls.every(call => ['status', 'login'].includes(call.action)));
 });
 
 test('update native running work polls local reads while logged out and survives reopen without replay', async t => {
@@ -257,7 +263,7 @@ test('update observed terminal uncertain task permits logout but transport uncer
   let current = status({ ...signed, update: running({ state: 'uncertain', errorCode: 'UPDATE_UNCERTAIN' }) });
   const { controller } = setup(t, () => ok(current)); await controller.refresh();
   assert.equal(controller.getSnapshot().updateUncertain, true); assert.equal(controller.getSnapshot().updatePendingId, null);
-  assert.equal(deriveView(controller.getSnapshot()).canLogout, true); assert.equal(deriveView(controller.getSnapshot()).canSync, false);
+  assert.equal(deriveView(controller.getSnapshot()).canLogout, true); assert.equal(deriveView(controller.getSnapshot()).canLogin, false);
   assert.equal(deriveView(controller.getSnapshot()).canChangePassword, false); assert.equal(controller.prepareUpdate(), null);
   current = status({ ...signed, update: running({ errorCode: 'UPDATE_UNCERTAIN' }) }); await controller.refresh();
   assert.equal(deriveView(controller.getSnapshot()).canLogout, false); assert.equal(deriveView(controller.getSnapshot()).updaterBusy, true);
@@ -309,13 +315,14 @@ test('update too-late cancellation is a safe warning, never a fake rollback or a
 test('update install/failure/cancel/restart gates block all writes, but allow logout only once native installer settles', async t => {
   let current = status({ ...signed, update: running() }); const { controller, calls } = setup(t, () => ok(current));
   await controller.refresh(); let view = deriveView(controller.getSnapshot());
-  for (const key of ['editable', 'canLogin', 'canLogout', 'canChangePassword', 'canSync', 'canBrowse', 'canImport', 'canRestore', 'canUpdate']) assert.equal(view[key], false, key);
-  assert.equal(await controller.logout(), false); assert.equal(await controller.savePreferences(), false); assert.equal(controller.setAutoSync(true), false);
-  assert.equal(await controller.sync(), false); assert.equal(await controller.browseProjects(), false); assert.equal(controller.prepareRestore(), null);
+  for (const key of ['canLogin', 'canLogout', 'canChangePassword', 'canCheckUpdate', 'canUpdate']) assert.equal(view[key], false, key);
+  assert.equal(await controller.logout(), false); assert.equal(await controller.checkUpdate(), false);
+  assert.equal(await controller.login({ ...signed, password: 'synthetic' }), false);
+  assert.equal(await controller.changePassword({ revision: 4, server: signed.server, username: signed.username }, { currentPassword: 'old', newPassword: 'new-password', confirmPassword: 'new-password' }), false);
   for (const terminal of ['failed', 'cancelled', 'uncertain', 'restart-required']) {
     current = status({ ...signed, update: running({ state: terminal, errorCode: terminal === 'failed' ? 'UPDATE_FAILED' : undefined }) }); await controller.refresh();
     view = deriveView(controller.getSnapshot());
-    assert.equal(view.canSync, false); assert.equal(view.editable, false); assert.equal(view.canChangePassword, false);
+    assert.equal(view.canLogin, false); assert.equal(view.canCheckUpdate, false); assert.equal(view.canChangePassword, false);
     assert.equal(view.canLogout, true); assert.equal(controller.prepareUpdate(), null);
     assert.equal(await controller.login({ ...signed, password: 'synthetic' }), false);
     assert.equal(await controller.changePassword({ revision: 4, server: signed.server, username: signed.username }, { currentPassword: 'old', newPassword: 'new-password', confirmPassword: 'new-password' }), false);
@@ -325,7 +332,7 @@ test('update install/failure/cancel/restart gates block all writes, but allow lo
   assert.ok(calls.every(call => call.action === 'status'));
   assert.equal(await controller.logout(), true); assert.equal(calls.at(-1).action, 'logout');
   current = status({ ...signed, update: update({ currentVersion: '0.6.0' }) }); await controller.refresh();
-  assert.equal(deriveView(controller.getSnapshot()).canSync, true); assert.equal(deriveView(controller.getSnapshot()).editable, true);
+  assert.equal(deriveView(controller.getSnapshot()).canLogin, true); assert.equal(deriveView(controller.getSnapshot()).canChangePassword, true);
 });
 
 test('update failed native result is not success and keeps restart gate even when install RPC itself returns ok', async t => {
@@ -338,13 +345,14 @@ test('update failed native result is not success and keeps restart gate even whe
   assert.match(deriveView(controller.getSnapshot()).updateError, /DSH Plugins/); assert.equal(deriveView(controller.getSnapshot()).canLogout, true);
 });
 
-test('update absent or unsupported never hides existing cloud features or alters running-upload cancellation', async t => {
+test('update absent or unsupported never hides account/password/logout features or recreates legacy controls', async t => {
   for (const updater of [undefined, update({ supported: false, errorCode: 'UPDATE_UNAVAILABLE' }), update({ supported: false, errorCode: 'UPDATE_UNMANAGED' })]) {
-    const { controller, calls } = setup(t, call => ok(call.action === 'projects' ? { projects: [] } : status({ ...signed, ...(updater ? { update: updater } : {}) })));
+    const { controller, calls } = setup(t, () => ok(status({ ...signed, ...(updater ? { update: updater } : {}) })));
     await controller.refresh(); const view = deriveView(controller.getSnapshot());
-    assert.equal(view.canSync, true); assert.equal(view.canBrowse, true); assert.equal(view.editable, true);
-    assert.equal(await controller.browseProjects(), true); assert.equal(controller.setAutoSync(true), true);
-    assert.equal(controller.getSnapshot().dirty, true); assert.ok(calls.every(call => ['status', 'projects'].includes(call.action)));
+    for (const key of ['canLogin', 'canLogout', 'canChangePassword']) assert.equal(view[key], true, key);
+    assert.equal(view.canUpdate, false);
+    for (const method of ['sync', 'setAutoSync', 'savePreferences', 'browseProjects', 'prepareRestore']) assert.equal(controller[method], undefined, method);
+    assert.deepEqual(calls.map(call => call.action), ['status']);
   }
 });
 
@@ -411,17 +419,17 @@ test('update native React final card has one explicit action and a concise versi
   assert.ok(page.calls.every(call => !['installupdate', 'cancelupdate'].includes(call.action)));
 });
 
-test('an available update keeps one manual-update action disabled while preferences are dirty', async t => {
-  const page = pageSetup(t, () => ok(status({ ...signed, update: available() })));
+test('an available update keeps one manual-update action disabled while the Host reports running work', async t => {
+  let current = status({ ...signed, running: true, update: available() });
+  const page = pageSetup(t, () => ok(current));
   await page.controller.refresh();
-  assert.equal(page.controller.setAutoSync(true), true);
   const card = nodes(page.tree()).find(node => node.props?.['data-personal-sync'] === 'update-summary');
   assert.equal(nodes(card).filter(node => node.type === 'native:Button').length, 1);
   assert.equal(button(card, '手动更新').props.disabled, true);
   assert.equal(nodes(card).some(node => node.type === 'native:Button' && text(node) === '检查更新'), false);
   button(card, '手动更新').props.onClick(); await settle();
   assert.deepEqual(page.calls.map(call => call.action), ['status']);
-  page.controller.discardChanges();
+  current = { ...current, running: false }; await page.controller.refresh();
   assert.equal(button(page.tree(), '手动更新').props.disabled, false);
 });
 
@@ -450,12 +458,17 @@ test('update native React failure/install/restart rendering locks controls, show
   const secretInput = nodes(page.tree()).find(node => node.type === 'native:Input' && node.props.type === 'password');
   secretInput.props.ref.current = { value: 'unsubmitted-synthetic-secret' };
   current = running(); await page.controller.refresh(); assert.equal(secretInput.props.ref.current.value, '');
-  for (const label of ['修改密码', '退出登录', '立即同步', '选择项目', '保存位置', '下载所选', '管理']) assert.equal(button(page.tree(), label).props.disabled, true, label);
-  assert.equal(nodes(page.tree()).find(node => node.type === 'native:Switch').props.disabled, true);
+  for (const label of ['修改密码', '退出登录']) assert.equal(button(page.tree(), label).props.disabled, true, label);
+  assert.equal(button(page.tree(), '更新中…').props.disabled, true);
+  for (const label of ['立即同步', '选择项目', '保存位置', '下载所选', '管理', '保存', '撤销更改']) {
+    assert.equal(nodes(page.tree()).some(node => node.type === 'native:Button' && text(node) === label), false, label);
+  }
+  assert.equal(nodes(page.tree()).some(node => node.type === 'native:Switch'), false);
   current = running({ state: 'failed', installedVersion: '0.6.0', errorCode: 'UPDATE_BUILD_APPROVAL_REQUIRED' }); await page.controller.refresh();
   assert.match(text(page.tree()), /更新未完成/); assert.equal(page.controller.getSnapshot().update.installedVersion, '0.6.0');
   assert.match(text(page.tree()), /原生安装需要脚本审批/); assert.match(text(page.tree()), /请重启 DSH/);
-  assert.equal(button(page.tree(), '退出登录').props.disabled, false); assert.equal(button(page.tree(), '立即同步').props.disabled, true);
+  assert.equal(button(page.tree(), '退出登录').props.disabled, false); assert.equal(button(page.tree(), '修改密码').props.disabled, true);
+  assert.equal(nodes(page.tree()).some(node => node.type === 'native:Button' && text(node) === '立即同步'), false);
   assert.equal(button(page.tree(), '待重启').props.disabled, true); assert.doesNotMatch(text(page.tree()), /更新成功/);
 });
 
@@ -483,6 +496,6 @@ test('update global refresh reconciles uncertainty and restart without reinstall
 test('update source keeps adapter first import exact and adds no browser fetch/navigation or SDK dependency', async () => {
   const adapter = await readFile(new URL('../client/adapter.mjs', import.meta.url), 'utf8');
   const state = await readFile(new URL('../client/state.mjs', import.meta.url), 'utf8');
-  assert.equal(adapter.split(/\r?\n/)[0], "import { createController, deriveView, filterProjects } from './state.mjs';");
+  assert.equal(adapter.split(/\r?\n/)[0], "import { createController, deriveView } from './state.mjs';");
   assert.doesNotMatch(adapter + state, /\bfetch\s*\(|window\.|location\.(?:href|assign|replace)|localStorage|sessionStorage|approvedBuilds\s*:/);
 });

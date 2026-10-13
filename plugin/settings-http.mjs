@@ -3,6 +3,9 @@ import { BIDIRECTIONAL_ACTIONS } from './bidirectional-service.mjs';
 
 export const SETTINGS_API = '/api/dsh-personal-sync/';
 export const MAX_SETTINGS_BODY = 64 * 1024;
+// One native public surface. Legacy service helpers are internal compatibility,
+// not routes, even when a caller supplies an otherwise valid old RPC payload.
+const SETTINGS_ACTIONS = Object.freeze(['status', 'login', 'password', 'logout', 'updatestatus', 'checkupdate', 'installupdate', 'cancelupdate', ...BIDIRECTIONAL_ACTIONS]);
 const messages = Object.freeze({
   BAD_REQUEST: '参数无效',
   AUTH_RENEWAL_UNCERTAIN: '登录续期结果未确认，请重新登录',
@@ -153,7 +156,7 @@ async function readBody(request, timeoutMs) {
 export function createSettingsHttp(service, { bodyTimeoutMs = 10_000, maxActive = 16 } = {}) {
   let disposed = false, active = 0;
   const loginAttempts = [];
-  const actions = new Set(['status', 'login', 'password', 'preferences', 'sync', 'logout', 'projects', 'checkpoints', 'destinationpick', 'destinationbrowse', 'destinationselect', 'downloadpick', 'downloadbrowse', 'downloadselect', 'downloadstart', 'restore', 'import', 'registerproject', 'updatestatus', 'checkupdate', 'installupdate', 'cancelupdate', ...BIDIRECTIONAL_ACTIONS]);
+  const actions = new Set(SETTINGS_ACTIONS);
   return {
     async fetch(action, request) {
       let rpcId, payload;
@@ -182,10 +185,8 @@ export function createSettingsHttp(service, { bodyTimeoutMs = 10_000, maxActive 
           if (loginAttempts.length >= 8) throw settingsFailure('RATE_LIMITED');
           loginAttempts.push(now);
           value = action === 'login' ? await service.login(payload, request.signal) : await service.password(payload, request.signal);
-        } else if (action === 'preferences') value = await service.savePreferences(payload, request.signal);
-        else if (action === 'sync') value = await service.sync(payload);
-        else if (['projects', 'checkpoints', 'destinationpick', 'destinationbrowse', 'destinationselect', 'downloadpick', 'downloadbrowse', 'downloadselect', 'downloadstart', 'restore', 'import', 'registerproject', 'updatestatus', 'checkupdate', 'installupdate', 'cancelupdate', ...BIDIRECTIONAL_ACTIONS].includes(action)) value = await service[action](payload, request.signal);
-        else value = await service.logout(payload);
+        } else if (action === 'logout') value = await service.logout(payload);
+        else value = await service[action](payload, request.signal);
         return response(rpcId ? { type: 'server-response', rpcId, result: { ok: true, value } } : value);
       } catch (error) {
         const safe = safeError(error, action);
@@ -203,7 +204,7 @@ export function createSettingsHttp(service, { bodyTimeoutMs = 10_000, maxActive 
   };
 }
 export function registerSettingsRoutes(ctx, bridge) {
-  for (const action of ['status', 'login', 'password', 'preferences', 'sync', 'logout', 'projects', 'checkpoints', 'destinationpick', 'destinationbrowse', 'destinationselect', 'downloadpick', 'downloadbrowse', 'downloadselect', 'downloadstart', 'restore', 'import', 'registerproject', 'updatestatus', 'checkupdate', 'installupdate', 'cancelupdate', ...BIDIRECTIONAL_ACTIONS]) {
+  for (const action of SETTINGS_ACTIONS) {
     ctx.connection.fetch.register({ path: SETTINGS_API + action, methods: ['POST'], requestBody: 'streaming', fetch: request => bridge.fetch(action, request) });
   }
 }

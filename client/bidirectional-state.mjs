@@ -19,7 +19,7 @@ const MESSAGES = Object.freeze({
   SYNC_PROJECT_UNAVAILABLE: '项目不可用，请检查工作区', SYNC_BINDING_NOT_FOUND: '配对已变更，请刷新',
   SYNC_BLOCKED: '存在受保护或不兼容的路径，请先处理阻止项', SYNC_CONFLICT: '项目存在冲突，请保留副本并核对',
   SYNC_CONFLICT_NOT_FOUND: '冲突已变更，请刷新列表', SYNC_RECYCLE_NOT_FOUND: '回收记录已变更，请刷新列表',
-  SYNC_DESTINATION_EXISTS: '恢复位置已有内容，请重新预览', SYNC_LEGACY_HEAD_MISMATCH: '旧版云端内容已变更，请重新预览',
+  SYNC_DESTINATION_EXISTS: '恢复位置已有内容，请重新预览', SYNC_LEGACY_HEAD_MISMATCH: '云端历史内容已变更，请重新预览',
   SYNC_HEAD_MISMATCH: '云端内容已变更，请重新预览', SYNC_LIMIT: '项目达到安全限制，请先检查内容',
   SYNC_UNCERTAIN: '结果未确认，仅核对状态；不要重复提交', SYNC_FAILED: '操作未完成，请核对项目状态',
   AUTH_RENEWAL_UNCERTAIN: '登录续期结果未确认，请重新登录',
@@ -60,6 +60,9 @@ const text = (value, maximum = 4096, empty = false) => typeof value === 'string'
 const id = value => typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9_-]{0,99}$/.test(value) && !['constructor', 'prototype', '__proto__'].includes(value.toLowerCase());
 const opaque = value => text(value, 4096);
 const absolute = value => text(value) && (value.startsWith('/') || /^[A-Za-z]:[\\/]/.test(value) || /^\\\\[^\\/]+[\\/][^\\/]+/.test(value)) && value.replaceAll('\\', '/').split('/').every(part => part !== '.' && part !== '..');
+// Match v1 projectFolderMetadata's display contract, not local-root authority.
+// Dot segments and POSIX backslash characters in historical hints are harmless text.
+const sourceHint = value => text(value) && (value.startsWith('/') || /^[A-Za-z]:[\\/]/.test(value) || /^\\\\[^\\]+\\[^\\]+/.test(value));
 const pathKey = value => /^[A-Za-z]:|^\\\\/.test(value) ? value.replaceAll('\\', '/').replace(/\/+$/, '').toLowerCase() : value.replace(/\/+$/, '');
 const relative = value => text(value, 1024) && !/[\\:]/.test(value) && value.split('/').every(part => part && part !== '.' && part !== '..');
 const accountEqual = (a, b) => Boolean(a && b && a.server === b.server && a.username === b.username);
@@ -133,7 +136,16 @@ export function parseSyncStatus(value) {
 }
 export function parseSyncProjects(value) {
   check(record(value) && (value.partial === undefined || typeof value.partial === 'boolean'));
-  return freeze({ projects: rows(value.projects, item => { check(id(item.projectId) && text(item.label, 1024) && (item.legacy === undefined || typeof item.legacy === 'boolean')); return { projectId: item.projectId, label: item.label, legacy: item.legacy === true }; }), partial: value.partial === true });
+  return freeze({ projects: rows(value.projects, item => {
+    check(id(item.projectId) && text(item.label, 1024) && (item.legacy === undefined || typeof item.legacy === 'boolean'));
+    const metadata = {};
+    // Cloud source paths are display/search hints only. Pairing sends the issued
+    // project ID and registered local workspace ID, never a remote filesystem path.
+    if (item.sourceRoot !== undefined) { check(sourceHint(item.sourceRoot)); metadata.sourceRoot = item.sourceRoot; }
+    if (item.checkpointCount !== undefined) { check(integer(item.checkpointCount) && item.checkpointCount <= 1_000_000); metadata.checkpointCount = item.checkpointCount; }
+    if (item.latestCreatedAt !== undefined) { check(date(item.latestCreatedAt)); metadata.latestCreatedAt = item.latestCreatedAt; }
+    return { projectId: item.projectId, label: item.label, legacy: item.legacy === true, ...metadata };
+  }), partial: value.partial === true });
 }
 export function parseSyncArchives(value) {
   check(record(value) && record(value.counts));

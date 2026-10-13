@@ -153,10 +153,10 @@ test('state locks serialize operations and state directory is never captured', a
   const result = await store.capture({ root, projectId: 'demo', deviceId: 'device-a' });
   assert.equal(result.manifest.files.length, 0);
 });
-test('CLI rejects command-line passwords; preview has no network or credential requirement', async t => {
+test('CLI rejects command-line passwords and retired project operations before opening state', async t => {
   assert.throws(() => parseArgs(['login', '--password', 'not-safe']));
-  const temp = await temporary(t), root = path.join(temp, 'root'); await fs.mkdir(root); await fs.writeFile(path.join(root, 'a'), 'abc');
-  const output = [];
-  await runCli(['preview', '--state', path.join(temp, 'state'), '--root', root, '--project', 'demo'], { output: data => output.push(data) });
-  assert.equal(output[0].networkUsed, false); assert.equal(output[0].bytes, 3);
+  const temp = await temporary(t), state = path.join(temp, 'unopened-state'), output = [];
+  await assert.rejects(runCli(['preview', '--state', state, '--root', temp, '--project', 'demo'], { output: data => output.push(data) }), { code: 'LEGACY_COMMAND_REMOVED' });
+  assert.deepEqual(output, []);
+  await assert.rejects(fs.stat(state), { code: 'ENOENT' });
 });

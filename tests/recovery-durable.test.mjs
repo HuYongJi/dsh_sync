@@ -9,8 +9,6 @@ import { createSettingsService, credentialKeyForProfile } from '../plugin/settin
 import { createSettingsHttp, SETTINGS_API } from '../plugin/settings-http.mjs';
 import { restoreCheckpoint, validateRestoreDestination } from '../src/snapshot.mjs';
 import { sha256, validateManifest } from '../src/protocol.mjs';
-import { createController as createUiController, parseProjectRegistration } from '../client/state.mjs';
-import { createClientPlugin } from '../client/adapter.mjs';
 
 const BASE = fileURLToPath(new URL('../.test-tmp/', import.meta.url));
 const SERVER = 'https://synthetic-durable.invalid';
@@ -289,131 +287,16 @@ test('registration final-save failure preserves pending intent and restart confi
   assert.equal(f.creates, 1);
 });
 
-test('native RPC registration route admits only exact bound consent and returns no private receipt data', async t => {
+// Internal compatibility remains covered above; the retired browser workflow is
+// deliberately absent. Real production transport must reject even valid consent.
+test('removed native registration RPC never dispatches retained internal registration', async t => {
   const f = await fixture(t, { sessionIds: [] }), restored = await f.restore(), bridge = createSettingsHttp(f.service);
   t.after(() => bridge.dispose());
   const input = { ...await f.binding(), restoreId: restored.recovery.id, requestId: 'rpc-registration', confirm: true };
-  async function rpc(payload) {
-    const request = new Request(`http://dsh.internal${SETTINGS_API}registerproject`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ type: 'client-request', rpcId: 'durable-rpc', method: 'dsh-personal-sync/registerproject', payload }) });
+  for (const payload of [input, { ...input, root: f.root }]) {
+    const request = new Request('http://dsh.internal' + SETTINGS_API + 'registerproject', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ type: 'client-request', rpcId: 'durable-rpc', method: 'dsh-personal-sync/registerproject', payload }) });
     const response = await bridge.fetch('registerproject', request);
-    assert.equal(response.status, 200); assert.equal(response.headers.get('cache-control'), 'no-store'); return (await response.json()).result;
+    assert.equal(response.status, 404); assert.equal(response.headers.get('cache-control'), 'no-store');
   }
-  assert.equal((await rpc({ ...input, root: f.root })).error.code, 'BAD_REQUEST'); assert.equal(f.creates, 0);
-  const result = await rpc(input); assert.equal(result.ok, true); assert.equal(result.value.registered, true);
-  for (const field of ['identity', 'rootIdentity', 'manifestDigest', 'token', 'refreshToken']) assert.equal(Object.hasOwn(result.value, field), false);
-  assert.equal(f.creates, 1); assert.equal(f.imports, 0);
-});
-
-const uiBinding = { revision: 2, server: SERVER, username: USERNAME };
-const uiRoot = 'E:\\synthetic-downloads\\project';
-const uiStatus = extra => ({ ...uiBinding, loggedIn: true, running: false, autoSync: false, intervalMs: 60000, pending: 0, projects: [], ...extra });
-const uiOk = value => ({ ok: true, value });
-const uiFailure = code => ({ ok: false, error: { code, message: 'untrusted-native-secret', details: {} } });
-const uiPlan = { latest: true, parent: 'E:\\synthetic-downloads', destinations: [{ id: 'destination-plan', projectId: 'archive-project', label: 'Archive', parent: 'E:\\synthetic-downloads', root: uiRoot }] };
-const uiBatch = (id, sessions = 0) => ({ id, latest: true, state: 'succeeded', completed: 1, total: 1, items: [{ projectId: 'archive-project', checkpointId: 'checkpoint', restoreId: 'completed-restore', root: uiRoot, label: 'Archive', state: 'succeeded', sessionCount: sessions, canImport: sessions > 0 }] });
-async function uiSettle() { for (let i = 0; i < 80; i++) await Promise.resolve(); }
-function uiFixture(t, custom) {
-  const calls = []; let current = uiStatus(), sequence = 0;
-  const base = call => {
-    if (call.action === 'status') return uiOk(current);
-    if (call.action === 'projects') return uiOk({ projects: [{ projectId: 'archive-project', label: 'Archive', checkpointCount: 1, latestCreatedAt: '2026-01-01T00:00:00.000Z' }] });
-    if (call.action === 'downloadpick' || call.action === 'downloadselect') return uiOk(uiPlan);
-    if (call.action === 'downloadstart') { current = uiStatus({ download: uiBatch(call.payload.requestId) }); return uiOk({ download: current.download }); }
-    if (call.action === 'registerproject') {
-      current = { ...current, projects: [{ id: 'registered-workspace', label: 'Archive', root: uiRoot, selected: false, available: true }] };
-      return uiOk({ restoreId: call.payload.restoreId, requestId: call.payload.requestId, root: uiRoot, registered: true, workspaceId: 'registered-workspace' });
-    }
-    throw new Error('Unexpected synthetic action');
-  };
-  const connection = { rpc: { async call(channel, endpoint, payload, signal) {
-    assert.equal(channel, '/api'); const call = { action: endpoint.split('/').at(-1), payload, signal }; calls.push(call);
-    return custom ? custom(call, base, { get current() { return current; }, set current(value) { current = value; } }) : base(call);
-  } } };
-  const controller = createUiController(connection, { crypto: { randomUUID: () => `a0000000-0000-4000-8000-${String(++sequence).padStart(12, '0')}` } });
-  t.after(() => controller.dispose());
-  return { connection, controller, calls, get current() { return current; }, set current(value) { current = value; } };
-}
-function uiHooks() {
-  const cells = []; let cursor = 0, effects = [];
-  const React = { createElement(type, props, ...children) { return { type, props: { ...props, children: children.flat(Infinity) } }; },
-    useSyncExternalStore(_subscribe, snapshot) { return snapshot(); }, useId: () => 'durable-ui',
-    useRef(initial) { return cells[cursor++] ??= { current: initial }; },
-    useState(initial) { const index = cursor++; if (!(index in cells)) cells[index] = initial; return [cells[index], value => { cells[index] = value; }]; },
-    useEffect(effect, deps) { const index = cursor++; if (!cells[index] || deps.some((value, at) => value !== cells[index].deps[at])) { const item = { deps, effect, cleanup: cells[index]?.cleanup }; cells[index] = item; effects.push(item); } },
-  };
-  return { React, render(Component, props) { cursor = 0; return Component(props); }, mount() { const pending = effects; effects = []; for (const item of pending) { item.cleanup?.(); item.cleanup = item.effect(); } }, unmount() { for (const cell of cells) cell?.cleanup?.(); } };
-}
-function uiNodes(root) { return !root || typeof root !== 'object' ? [] : [root, ...(root.props?.children ?? []).flatMap(uiNodes), ...uiNodes(root.props?.footer)]; }
-function uiText(root) { return typeof root === 'string' || typeof root === 'number' ? String(root) : !root || typeof root !== 'object' ? '' : (root.props?.children ?? []).map(uiText).join(' '); }
-function uiButton(root, label) { const node = uiNodes(root).find(item => item.type === 'native:Button' && uiText(item) === label); assert.ok(node, `missing ${label}`); return node; }
-function uiModal(page, title) { return uiNodes(page.tree()).find(item => item.type === 'native:Modal' && item.props.title === title); }
-function uiPage(t, custom) {
-  const f = uiFixture(t, custom), hooks = uiHooks(), cleanups = []; let slot;
-  const primitives = Object.fromEntries(['Button', 'Input', 'Checkbox', 'Switch', 'Modal'].map(name => [name, `native:${name}`]));
-  createClientPlugin(name => name === 'react' ? hooks.React : primitives).apply({ connection: f.connection, effect(fn) { cleanups.push(fn()); }, on() {}, slots: { inject(_name, fn) { fn(); }, register(spec, Component) { slot = { Component, props: spec.inject() }; } } });
-  t.after(() => { hooks.unmount(); cleanups.forEach(fn => fn?.()); });
-  return { ...f, ...hooks, controller: slot.props.controller, tree: () => hooks.render(slot.Component, slot.props) };
-}
-async function uiChoose(page) {
-  page.tree(); page.mount(); await uiSettle();
-  uiButton(page.tree(), '选择项目').props.onClick(); await uiSettle();
-  assert.equal(await page.controller.addDownloadProject('archive-project'), true);
-  return uiModal(page, '选择要下载的项目');
-}
-
-test('registration client DTOs and requests are allowlisted and unknown outcomes retain one request identity', async t => {
-  const parsed = parseProjectRegistration({ restoreId: 'completed-restore', requestId: 'registration', root: uiRoot, registered: true, workspaceId: 'native-id', token: 'secret' });
-  assert.equal(Object.hasOwn(parsed, 'token'), false); assert.equal(Object.isFrozen(parsed), true);
-  for (const patch of [{ root: 'relative' }, { registered: true, workspaceId: undefined }, { registered: false }, { requestId: '../bad' }]) assert.throws(() => parseProjectRegistration({ ...parsed, ...patch }), { code: 'INVALID_RESPONSE' });
-  let attempts = 0;
-  const f = uiFixture(t, (call, base) => call.action === 'registerproject' && ++attempts === 1 ? Promise.reject(new Error('unknown sensitive transport')) : base(call));
-  f.current = uiStatus({ download: uiBatch('old-batch') }); await f.controller.refresh();
-  assert.equal(await f.controller.registerRestoredProject('forged-root'), false); assert.equal(f.calls.length, 1);
-  assert.equal(await f.controller.registerRestoredProject('completed-restore'), false);
-  assert.equal(f.controller.getSnapshot().registrationError.code, 'PROJECT_REGISTRATION_UNCERTAIN');
-  assert.deepEqual(f.calls.map(call => call.action), ['status', 'registerproject', 'status']);
-  assert.equal(await f.controller.registerRestoredProject('completed-restore'), true);
-  const requests = f.calls.filter(call => call.action === 'registerproject');
-  assert.deepEqual(requests[0].payload, requests[1].payload);
-  assert.deepEqual(Object.keys(requests[0].payload).sort(), ['revision', 'server', 'username', 'restoreId', 'requestId', 'confirm'].sort());
-  assert.equal(Object.hasOwn(requests[0].payload, 'root'), false);
-  assert.equal(JSON.stringify(f.controller.getSnapshot()).includes('sensitive'), false);
-  assert.equal(f.calls.some(call => ['sync', 'preferences', 'import'].includes(call.action)), false);
-});
-
-test('legacy download stays in one select-destination-review-progress dialog and registers files only explicitly', async t => {
-  const p = uiPage(t); const selected = await uiChoose(p);
-  assert.equal(selected.props.open, true);
-  uiButton(selected, '下一步：保存位置').props.onClick(); await uiSettle();
-  const review = uiModal(p, '确认下载所选项目'); assert.equal(review.props.open, true); assert.match(uiText(review), /新建目录，不覆盖/);
-  assert.equal(p.calls.some(call => call.action === 'downloadstart'), false);
-  uiButton(review, '确认下载').props.onClick(); await uiSettle();
-  const progress = uiModal(p, '下载进度'); assert.equal(progress.props.open, true);
-  assert.equal(p.calls.filter(call => call.action === 'downloadstart').length, 1);
-  assert.equal(p.calls.some(call => ['registerproject', 'import', 'sync', 'preferences'].includes(call.action)), false);
-  uiButton(progress, '添加到DSH项目').props.onClick(); await uiSettle();
-  assert.match(uiText(uiModal(p, '下载进度')), /已添加到DSH项目/);
-  assert.equal(p.calls.filter(call => call.action === 'registerproject').length, 1);
-  assert.equal(p.controller.getSnapshot().status.projects[0].selected, false);
-});
-
-test('browse folder selection advances directly to review without closing the download dialog', async t => {
-  const browser = { id: 'folder-browser', path: 'E:\\synthetic-downloads', currentId: 'current-node', crumbs: [], directories: [], selectable: true, truncated: false };
-  const p = uiPage(t, (call, base) => call.action === 'downloadpick' ? uiOk({ latest: true, browser }) : base(call));
-  uiButton(await uiChoose(p), '下一步：保存位置').props.onClick(); await uiSettle();
-  const folder = uiModal(p, '选择保存位置'); assert.equal(folder.props.open, true);
-  uiButton(folder, '选择此文件夹').props.onClick(); await uiSettle();
-  assert.equal(uiModal(p, '确认下载所选项目').props.open, true);
-  assert.equal(p.calls.some(call => call.action === 'downloadstart'), false);
-});
-
-test('definitive download rejection stays in review with readonly status retry rather than fake progress', async t => {
-  const p = uiPage(t, (call, base) => call.action === 'downloadstart' ? uiFailure('BAD_DESTINATION') : base(call));
-  uiButton(await uiChoose(p), '下一步：保存位置').props.onClick(); await uiSettle();
-  uiButton(uiModal(p, '确认下载所选项目'), '确认下载').props.onClick(); await uiSettle();
-  const review = uiModal(p, '确认下载所选项目'); assert.equal(review.props.open, true); assert.match(uiText(review), /不会自动重试/);
-  assert.equal(uiModal(p, '下载进度'), undefined);
-  const writes = p.calls.filter(call => call.action === 'downloadstart').length;
-  uiButton(review, '核对状态').props.onClick(); await uiSettle();
-  assert.equal(p.calls.filter(call => call.action === 'downloadstart').length, writes); assert.equal(p.calls.at(-1).action, 'status');
+  assert.equal(f.creates, 0); assert.equal(f.imports, 0);
 });

@@ -100,7 +100,7 @@ test('password client sends only native CAS payload, permits expired tokens and 
   assert.equal(controller.getSnapshot().busy, 'password');
   assert.equal(deriveView(controller.getSnapshot()).canChangePassword, false);
   assert.equal(await controller.changePassword(identity(status()), secret()), false);
-  assert.equal(await controller.sync(), false);
+  assert.equal(await controller.logout(), false);
   for (const value of Object.values(secret())) assert.equal(JSON.stringify(controller.getSnapshot()).includes(value), false);
   pending.resolve(ok(status({ revision: 5, loggedIn: false, autoSync: false, passwordChanged: true,
     currentPassword: secret().currentPassword, newPassword: secret().newPassword, token: 'synthetic-token' })));
@@ -108,29 +108,25 @@ test('password client sends only native CAS payload, permits expired tokens and 
   const state = controller.getSnapshot();
   assert.equal(state.notice, '密码已修改，请重新登录');
   assert.equal(state.status.loggedIn, false);
-  assert.equal(state.status.autoSync, false);
-  assert.equal(state.draft.autoSync, false);
-  assert.equal(state.scheduled, false);
-  assert.equal(deriveView(state).canSync, false);
+  assert.equal(Object.hasOwn(state.status, 'autoSync'), false);
+  assert.equal(Object.hasOwn(state, 'draft'), false);
+  assert.equal(Object.hasOwn(state, 'scheduled'), false);
+  assert.equal(deriveView(state).canLogout, false);
   assert.equal(deriveView(state).canLogin, true);
   for (const value of [...Object.values(secret()), 'synthetic-token', 'passwordChanged']) assert.equal(JSON.stringify(state).includes(value), false);
   assert.deepEqual(calls.map(call => call.action), ['status', 'password']);
 });
 
-test('password client may operate while Host sync runs, and success clears its scheduling latch', async t => {
-  let running = false;
-  const { controller, calls } = controlled(t, call => {
-    if (call.action === 'sync') { running = true; return ok({ scheduled: true }); }
-    return ok(status(call.action === 'password' ? { revision: 5, loggedIn: false, running: false } : { running }));
-  });
+test('password client remains a safety control while Host work runs and accepts only signed-out success', async t => {
+  const { controller, calls } = controlled(t, call => ok(status(call.action === 'password'
+    ? { revision: 5, loggedIn: false, running: false } : { running: true })));
   await controller.refresh();
-  await controller.sync();
-  assert.equal(controller.getSnapshot().scheduled, true);
+  assert.equal(deriveView(controller.getSnapshot()).canLogin, false);
   assert.equal(deriveView(controller.getSnapshot()).canChangePassword, true);
   assert.equal(await controller.changePassword(identity(status()), secret()), true);
-  assert.equal(controller.getSnapshot().scheduled, false);
+  assert.equal(controller.getSnapshot().status.loggedIn, false);
   assert.equal(controller.getSnapshot().status.running, false);
-  assert.deepEqual(calls.map(call => call.action), ['status', 'sync', 'status', 'password']);
+  assert.deepEqual(calls.map(call => call.action), ['status', 'password']);
 });
 
 test('password client maps rejected and old-server errors to short safe text, refreshing once without clearing valid login', async t => {
@@ -144,10 +140,10 @@ test('password client maps rejected and old-server errors to short safe text, re
     const state = controller.getSnapshot();
     assert.deepEqual(state.error, { code, message });
     assert.equal(state.status.loggedIn, true);
-    assert.equal(state.status.autoSync, true);
+    assert.equal(Object.hasOwn(state.status, 'autoSync'), false);
     assert.equal(state.passwordUncertain, false);
     assert.equal(state.ready, true);
-    assert.equal(state.conflict, code === 'CONFIG_CONFLICT');
+    assert.equal(Object.hasOwn(state, 'conflict'), false);
     assert.equal(JSON.stringify(state).includes('untrusted synthetic secret'), false);
     assert.deepEqual(calls.map(call => call.action), ['status', 'password', 'status']);
   }
@@ -161,21 +157,21 @@ test('password client locks uncertain outcomes against stale logged-in refreshes
     const state = controller.getSnapshot();
     assert.deepEqual(state.error, { code: 'PASSWORD_CHANGE_UNCERTAIN', message: '结果未确认，请重新登录' });
     assert.equal(state.status.loggedIn, false);
-    assert.equal(state.status.autoSync, false);
-    assert.equal(state.draft.autoSync, false);
+    assert.equal(Object.hasOwn(state.status, 'autoSync'), false);
+    assert.equal(Object.hasOwn(state, 'draft'), false);
     assert.equal(state.passwordUncertain, true);
-    assert.equal(deriveView(state).canSync, false);
+    assert.equal(deriveView(state).canLogout, false);
     assert.equal(deriveView(state).canChangePassword, false);
-    assert.equal(controller.setAutoSync(true), false);
-    assert.equal(await controller.sync(), false);
+    assert.equal(controller.setAutoSync, undefined);
+    assert.equal(await controller.logout(), false);
     assert.equal(await controller.changePassword(identity(status()), secret()), false);
     await controller.refresh();
     assert.equal(controller.getSnapshot().status.loggedIn, false);
-    assert.equal(controller.getSnapshot().status.autoSync, false);
+    assert.equal(Object.hasOwn(controller.getSnapshot().status, 'autoSync'), false);
     assert.equal(await controller.login({ ...identity(status()), password: secret().newPassword }), true);
     assert.equal(controller.getSnapshot().passwordUncertain, false);
     assert.equal(controller.getSnapshot().status.loggedIn, true);
-    assert.equal(controller.getSnapshot().draft.autoSync, false);
+    assert.equal(Object.hasOwn(controller.getSnapshot(), 'draft'), false);
     assert.equal(calls.filter(call => call.action === 'password').length, 1);
   }
 });
@@ -189,8 +185,8 @@ test('password client marks cache unconfirmed when the single recovery read fail
   const state = controller.getSnapshot();
   assert.equal(state.ready, false);
   assert.equal(state.status.loggedIn, false);
-  assert.equal(state.status.autoSync, false);
-  assert.equal(deriveView(state).canSync, false);
+  assert.equal(Object.hasOwn(state.status, 'autoSync'), false);
+  assert.equal(deriveView(state).canLogout, false);
   assert.equal(state.error.message, '当前密码错误');
   assert.equal(JSON.stringify(state).includes('synthetic transport secret'), false);
   assert.deepEqual(calls.map(call => call.action), ['status', 'password', 'status']);
@@ -206,7 +202,7 @@ test('password client timeout cancels even an uncooperative carrier, never repla
   assert.equal(calls.find(call => call.action === 'password').signal.aborted, true);
   assert.equal(controller.getSnapshot().error.code, 'PASSWORD_CHANGE_UNCERTAIN');
   assert.equal(controller.getSnapshot().status.loggedIn, false);
-  assert.equal(controller.getSnapshot().status.autoSync, false);
+  assert.equal(Object.hasOwn(controller.getSnapshot().status, 'autoSync'), false);
   assert.equal(jobs.size, 0);
   late.resolve(ok(status({ revision: 5, loggedIn: false })));
   await settle();
@@ -337,8 +333,10 @@ test('password modal uses three uncontrolled native password refs, saved identit
   cleared(inputs);
   assert.equal(passwordModal(page).props.open, false);
   assert.match(text(page.tree()), /密码已修改，请重新登录/);
-  assert.equal(button(page.tree(), '立即同步').props.disabled, true);
+  assert.equal(button(page.tree(), '立即同步'), undefined);
+  assert.equal(page.controller.getSnapshot().status.loggedIn, false);
   assert.equal(button(page.tree(), '登录').props.disabled, false);
+  assert.equal(page.calls.some(call => ['login', 'sync', 'preferences'].includes(call.action)), false);
 });
 
 test('password change from a logged-in account restores an empty login form only after success', async t => {
@@ -477,7 +475,7 @@ test('password modal cancellation and unmount during submit abort native request
     cleared(inputs);
     assert.equal(page.calls.find(call => call.action === 'password').signal.aborted, true);
     assert.equal(page.controller.getSnapshot().status.loggedIn, false);
-    assert.equal(page.controller.getSnapshot().status.autoSync, false);
+    assert.equal(Object.hasOwn(page.controller.getSnapshot().status, 'autoSync'), false);
     assert.equal(page.calls.filter(call => call.action === 'password').length, 1);
     pending.resolve(ok(status({ loggedIn: false, revision: 5 })));
     await settle();
@@ -485,23 +483,25 @@ test('password modal cancellation and unmount during submit abort native request
   }
 });
 
-test('password modal clears login and change-password inputs for unrelated submit start and finish', async t => {
+test('password modal clears login and change-password inputs for native update check start and runtime change', async t => {
   const pending = deferred();
-  const page = setupPage(t, call => call.action === 'preferences' ? pending.promise : ok(status({ loggedIn: false })));
+  const before = { currentVersion: '0.9.0', supported: true, state: 'idle', restartRequired: false };
+  const page = setupPage(t, call => call.action === 'checkupdate' ? pending.promise : ok(status({ loggedIn: false, update: before })));
   await mounted(page);
   const modal = open(page);
   const inputs = fill(modal);
   const loginInput = nodes(page.tree()).find(node => node.type === 'native:Input' && node.props.id === 'mock-password-password');
   loginInput.props.ref.current = { value: 'synthetic-login-secret' };
-  page.controller.setProject(project.id, false);
-  const saving = page.controller.savePreferences();
+  const checking = page.controller.checkUpdate();
   cleared(inputs);
   assert.equal(loginInput.props.ref.current.value, '');
+  assert.equal(page.controller.getSnapshot().busy, 'checkupdate');
   fill(modal);
   loginInput.props.ref.current.value = 'synthetic-login-secret';
-  pending.resolve(ok(status({ loggedIn: false, revision: 5, projects: [{ ...project, selected: false }] })));
-  await saving;
+  pending.resolve(ok({ update: { ...before, currentVersion: '0.9.1', state: 'up-to-date' } }));
+  assert.equal(await checking, true);
   cleared(inputs);
   assert.equal(loginInput.props.ref.current.value, '');
   assert.equal(passwordModal(page).props.open, false);
+  assert.equal(page.calls.some(call => ['password', 'login', 'preferences', 'sync'].includes(call.action)), false);
 });

@@ -56,17 +56,18 @@ test('real HTTP two-device sync restores files/sessions/assets and preserves con
   await resumed.logout(); await assert.rejects(resumed.list('demo'), /Login required/);
   await assert.rejects(new SyncClient({ server: host.url, token }).list('demo'), { status: 401 });
 });
-test('CLI local fixture login/push/list/restore/status/logout never prints credentials', async t => {
+test('account-only CLI login/status/logout never prints credentials or authorizes project operations', async t => {
   const { temp, start } = await setup(t), host = await start();
   const root = path.join(temp, 'root'), state = path.join(temp, 'cli-state'), dest = path.join(temp, 'restored');
   await fs.mkdir(root); await fs.writeFile(path.join(root, 'hello.txt'), 'hello');
   const outputs = [], output = value => outputs.push(value), env = { SYNC_PASSWORD: password };
   const run = args => runCli([...args, '--state', state], { env, output });
   await run(['login', '--server', host.url, '--username', 'owner']);
-  await run(['push', '--project', 'demo', '--root', root]);
-  const id = outputs.at(-1).checkpointId;
-  await run(['list', '--project', 'demo']); assert.equal(outputs.at(-1).checkpoints[0].id, id);
-  await run(['restore', '--id', id, '--to', dest]); assert.equal(await fs.readFile(path.join(dest, 'hello.txt'), 'utf8'), 'hello');
+  for (const args of [['preview', '--root', root], ['push', '--project', 'demo', '--root', root], ['retry'], ['list', '--project', 'demo'], ['restore', '--id', 'old-id', '--to', dest]]) await assert.rejects(run(args), { code: 'LEGACY_COMMAND_REMOVED' });
+  assert.equal(await fs.readFile(path.join(root, 'hello.txt'), 'utf8'), 'hello');
+  await assert.rejects(fs.stat(dest), { code: 'ENOENT' });
+  const store = await new LocalStore(state).init(); assert.deepEqual(await store.pending(), []); assert.deepEqual((await store.state()).projects, {});
+  const client = new SyncClient(await store.config()); assert.deepEqual((await client.list('demo')).checkpoints, []);
   await run(['status']); assert.equal(outputs.at(-1).loggedIn, true);
   const config = JSON.parse(await fs.readFile(path.join(state, 'config.json')));
   assert.ok(!JSON.stringify(outputs).includes(config.token)); assert.ok(!JSON.stringify(outputs).includes(password));

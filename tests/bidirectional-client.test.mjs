@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createBidirectionalController, parseSyncStatus, parseSyncProjects, parseSyncArchives, canRepairBinding, STORAGE_GIB, MAX_STORAGE_GIB, validateStorageLimit } from '../client/bidirectional-state.mjs';
 import { createBidirectionalPanel } from '../client/bidirectional-panel.mjs';
+import { projectFolderMetadata } from '../src/client.mjs';
 
 // Synthetic RPC and native React/control event contracts only, not real GUI/focus integration.
 const identity = { server: 'https://synthetic.example.test', username: 'synthetic', loggedIn: true };
@@ -64,6 +65,18 @@ test('sync DTOs deep allowlist/freeze and never retain secrets or arbitrary erro
   const projects = parseSyncProjects({ projects: [{ ...catalog[0], password: 'untrusted-secret' }] }); assert.equal(JSON.stringify(projects).includes('untrusted-secret'), false);
   for (const patch of [{ revision: -1 }, { server: 'https://name:password@example.test' }, { capability: 'new-unknown-state' }, { bindings: [{ ...binding, pendingUpload: -1 }] }, { operations: [{ id: 'x', state: 'done' }] }, { workspaces: [workspaces[0], workspaces[0]] }]) assert.throws(() => parseSyncStatus(status(patch)), { code: 'INVALID_RESPONSE' });
   assert.deepEqual(parseSyncStatus({ revision: 0, loggedIn: false }).bindings, []);
+});
+
+test('historical source hints retain v1 path compatibility without relaxing local roots or pairing authority', async t => {
+  const hints = ['/old/work/../repo', '/old/./repo', '/old/work\\..\\repo', 'C:\\old\\work\\..\\repo', '\\\\server\\share\\old\\..\\repo'];
+  const projects = hints.map((sourceRoot, index) => ({ projectId: `history-${index}`, ...projectFolderMetadata(sourceRoot), legacy: true }));
+  assert.deepEqual(parseSyncProjects({ projects }).projects.map(row => row.sourceRoot), hints);
+  assert.throws(() => parseSyncStatus(status({ workspaces: [{ ...workspaces[0], root: hints[0] }] })), { code: 'INVALID_RESPONSE' });
+  const f = fixture(t, (call, base) => call.action === 'syncprojects' ? ok({ projects }) : base(call));
+  const plan = await pair(f.controller, projects[0].projectId);
+  assert.equal(plan.root, workspaces[1].root);
+  assert.deepEqual(f.calls.find(call => call.action === 'pairplan').payload, { revision: 7, server: identity.server, username: identity.username, workspaceId: workspaces[1].id, projectId: projects[0].projectId });
+  assert.equal(f.calls.some(call => call.action === 'paircommit'), false);
 });
 
 test('first-run unknown capability requires explicit catalog probe then fresh supported syncstatus before planning', async t => {
@@ -536,6 +549,53 @@ function page(t, custom, account = identity) {
 async function mount(p) { p.tree(); p.mount(); await settle(); p.tree(); p.mount(); await settle(); }
 async function openPair(p) { await mount(p); button(p.tree(), '配对项目').props.onClick(); await settle(); }
 async function selectPair(p) { await openPair(p); checkbox(modal(p), '待配对项目').props.onChange(true); checkbox(modal(p), '创建新的云端项目').props.onChange(true); button(modal(p), '预览变更').props.onClick(); await settle(); }
+
+test('cloud project metadata remains optional, readonly, validated and deeply allowlisted', async t => {
+  const row = { ...catalog[1], sourceRoot: 'E:\\synthetic\\archived', checkpointCount: 3, latestCreatedAt: '2026-01-02T03:04:05.000Z' };
+  const parsed = parseSyncProjects({ projects: [{ ...row, token: 'untrusted-secret', internalPath: 'untrusted-secret' }] });
+  assert.deepEqual(parsed.projects[0], row); assert.ok(Object.isFrozen(parsed.projects[0])); assert.equal(JSON.stringify(parsed).includes('untrusted-secret'), false);
+  for (const patch of [{ sourceRoot: 'relative/path' }, { sourceRoot: 'https://example.test/path' }, { sourceRoot: 'E:\\bad\npath' }, { checkpointCount: -1 }, { checkpointCount: 1_000_001 }, { latestCreatedAt: 'not-a-date' }]) assert.throws(() => parseSyncProjects({ projects: [{ ...row, ...patch }] }), { code: 'INVALID_RESPONSE' });
+  assert.deepEqual(parseSyncProjects({ projects: catalog }).projects, catalog, 'old Host responses remain compatible');
+  const f = fixture(t, (call, base) => call.action === 'syncprojects' ? ok({ projects: [row] }) : base(call));
+  await f.controller.refresh(); await f.controller.openPair(); f.controller.selectWorkspace(workspaces[1].id); f.controller.selectProject(row.projectId); await f.controller.planPair();
+  const payload = f.calls.find(call => call.action === 'pairplan').payload;
+  assert.equal(payload.projectId, row.projectId); assert.equal(Object.hasOwn(payload, 'sourceRoot'), false); assert.equal(JSON.stringify(payload).includes(row.sourceRoot), false);
+});
+
+test('cloud choices use separate full-width rows with neutral labels, source hints and same-name details', async t => {
+  const rows = [
+    { projectId: 'cloud-source-a', label: 'source', legacy: true, sourceRoot: 'E:\\synthetic\\original-a\\source', checkpointCount: 2, latestCreatedAt: '2026-01-02T03:04:05.000Z' },
+    { projectId: 'cloud-source-b', label: 'source', legacy: true, sourceRoot: 'E:\\synthetic\\original-b\\source', checkpointCount: 4 },
+    { projectId: 'cloud-current', label: '当前项目', legacy: false },
+  ];
+  const p = page(t, (call, base) => call.action === 'syncprojects' ? ok({ projects: rows }) : base(call)); await openPair(p);
+  let list = nodes(modal(p)).find(node => node.props?.['aria-label'] === '云端项目列表');
+  assert.equal(list.props.style.display, 'flex'); assert.equal(list.props.style.flexDirection, 'column');
+  assert.equal(list.props.children.length, 3); assert.ok(list.props.children.every(row => row.type === 'div' && row.props.style.width === '100%' && row.props.style.minWidth === 0));
+  const first = list.props.children[0], second = list.props.children[1];
+  assert.equal(checkbox(first, 'source').props.checked, false); assert.equal(checkbox(second, 'source').props.checked, false);
+  assert.match(renderedText(first), /已保存 2 个版本/); assert.ok(renderedText(first).includes(rows[0].sourceRoot));
+  assert.match(renderedText(second), /区分同名项目/); assert.ok(renderedText(second).includes(rows[1].projectId));
+  assert.doesNotMatch(renderedText(modal(p)), /历史备份|旧版|单向上传|双向项目/);
+  assert.match(renderedText(modal(p)), /已有云端内容会保留/);
+  checkbox(second, 'source').props.onChange(true); await settle();
+  list = nodes(modal(p)).find(node => node.props?.['aria-label'] === '云端项目列表');
+  assert.equal(checkbox(list.props.children[0], 'source').props.checked, false); assert.equal(checkbox(list.props.children[1], 'source').props.checked, true);
+  assert.ok(p.calls.every(call => ['syncstatus', 'syncprojects'].includes(call.action)), 'selection cannot migrate, delete or upload');
+  nodes(modal(p)).find(row => row.props?.['aria-label'] === '搜索云端项目').props.onChange({ target: { value: 'original-b' } });
+  list = nodes(modal(p)).find(node => node.props?.['aria-label'] === '云端项目列表'); assert.equal(list.props.children.length, 1); assert.equal(list.props.children[0].props['data-cloud-project-id'], rows[1].projectId);
+});
+
+test('pairing historical data discloses its write-fence consequence only in explicit review', async t => {
+  const rows = [{ projectId: 'historical-project', label: '现有云端项目', legacy: true }];
+  const p = page(t, (call, base) => call.action === 'syncprojects' ? ok({ projects: rows }) : base(call)); await openPair(p);
+  checkbox(modal(p), '待配对项目').props.onChange(true); checkbox(modal(p), '现有云端项目').props.onChange(true);
+  assert.doesNotMatch(renderedText(modal(p)), /旧版|单向上传/);
+  button(modal(p), '预览变更').props.onClick(); await settle();
+  assert.match(renderedText(modal(p)), /历史内容会保留/);
+  assert.match(renderedText(modal(p)), /旧客户端将不能再向此项目追加备份/);
+  assert.equal(p.calls.some(call => call.action === 'paircommit'), false);
+});
 
 test('native panel starts compact and inert, delegates login and never stores secrets', async t => {
   const p = page(t); await mount(p);

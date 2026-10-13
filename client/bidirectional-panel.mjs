@@ -13,6 +13,7 @@ export function createBidirectionalPanel(React, { Button, Input, Checkbox, Switc
     heading: { margin: 0, fontSize: 15, fontWeight: 600 },
     item: { display: 'flex', flexDirection: 'column', gap: 6, padding: '10px 0', borderBottom: '1px solid var(--dsw-alias-settings-card-stroke)' },
     list: { maxHeight: 260, overflowY: 'auto', overscrollBehavior: 'contain' },
+    projectOption: { display: 'flex', flexDirection: 'column', gap: 5, width: '100%', minWidth: 0, boxSizing: 'border-box', padding: 10, borderRadius: 8, border: '1px solid var(--dsw-alias-settings-card-stroke)', overflowWrap: 'anywhere' },
     grid: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 240px), 1fr))', gap: 16 },
     warning: { color: 'var(--dsw-alias-state-warning-primary, var(--dsw-alias-label-secondary))' },
   };
@@ -102,14 +103,17 @@ export function createBidirectionalPanel(React, { Button, Input, Checkbox, Switc
     const protectIme = event => { if (event.key === 'Escape' && composing(event)) { event.preventDefault(); event.stopPropagation(); } };
     const search = (value, setValue, label, autofocus = false) => h(Input, { type: 'search', value, onChange: event => setValue(event.target.value), 'aria-label': label, placeholder: label, autoComplete: 'off', spellCheck: false, maxLength: 1024, ...(autofocus ? { 'data-modal-autofocus': '' } : {}),
       onCompositionStart: () => { composition.current = { active: true, ended: false }; }, onCompositionEnd: () => { composition.current = { active: false, ended: true }; }, onKeyUp: () => { composition.current.ended = false; }, onBlur: () => { composition.current = { active: false, ended: false }; } });
-    const matches = (row, query) => !query.trim() || `${row.label ?? row.path}\n${row.root ?? ''}`.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase());
+    const matches = (row, query) => !query.trim() || `${row.label ?? row.path}\n${row.root ?? row.sourceRoot ?? ''}`.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase());
     const visibleBindings = status?.bindings.filter(row => matches(row, bindingSearch)) ?? [];
     const binding = dialog?.bindingId ? status?.bindings.find(row => row.id === dialog.bindingId) : null;
     const workspaces = status?.workspaces.filter(row => matches(row, workspaceSearch)) ?? [], projects = state.projects.items.filter(row => matches(row, projectSearch));
+    const projectNames = new Map();
+    for (const row of state.projects.items) { const key = row.label.normalize('NFC').toLocaleLowerCase(); projectNames.set(key, (projectNames.get(key) ?? 0) + 1); }
+    const duplicateProject = row => projectNames.get(row.label.normalize('NFC').toLocaleLowerCase()) > 1;
     const items = dialog?.items?.filter(row => matches(row, itemSearch)) ?? [], selected = dialog?.items?.find(row => row.id === dialog.selectedId), plan = dialog?.plan;
     const titles = { pair: '配对同步项目', conflicts: '处理文件冲突', recycle: '本机回收站', archives: '会话归档', repair: '核对中断事务' };
     const reviewTitles = { pair: '确认启用双向同步', conflicts: '确认处理冲突', recycle: '确认恢复文件', archives: '确认导入安全会话', repair: '确认修复中断事务' };
-    const title = dialog?.stage === 'review' ? reviewTitles[dialog.kind] : dialog?.stage === 'legacy' ? '选择旧版主版本' : ['progress', 'uncertain'].includes(dialog?.stage) ? '核对同步结果' : titles[dialog?.kind] ?? '本机回收站';
+    const title = dialog?.stage === 'review' ? reviewTitles[dialog.kind] : dialog?.stage === 'legacy' ? '选择云端主要版本' : ['progress', 'uncertain'].includes(dialog?.stage) ? '核对同步结果' : titles[dialog?.kind] ?? '本机回收站';
     const repairReady = canAct && canRepairBinding(binding) && !dialog?.stale;
     const planReady = Boolean(canAct && plan && plan.expiresAt > Date.now() && (dialog.kind !== 'archives' || plan.eligibility === 'unchecked') && (dialog.kind !== 'repair' || repairReady));
     const itemReady = Boolean(canAct && selected && !dialog?.stale && (dialog.kind !== 'archives' || selected.state === 'available'));
@@ -143,7 +147,7 @@ export function createBidirectionalPanel(React, { Button, Input, Checkbox, Switc
           h(Button, { type: 'button', variant: 'outline', disabled: !canDiscover, onClick: () => start(() => controller.openPair()) }, discoveryLabel))),
       body('配对前先预览，确认后才启用；不会自动选择工作区。'),
       (!identity?.loggedIn || rejectedSavedIdentity) && h('div', { style: styles.row }, body(rejectedSavedIdentity ? '同步授权已失效，请重新登录；不会自动重发凭据。' : '请先在账号卡片登录。'), h(Button, { type: 'button', variant: 'outline', onClick: requestAuthentication }, rejectedSavedIdentity ? '重新登录' : '前往登录')),
-      identity?.loggedIn && status?.capability === 'upgrade-required' && body('请升级同步服务器后使用双向同步。旧版归档仍可单独下载。', { role: 'status', style: { ...styles.body, ...styles.warning } }),
+      identity?.loggedIn && status?.capability === 'upgrade-required' && body('请升级同步服务器后使用双向同步。已有云端数据会保留，不会自动启用同步。', { role: 'status', style: { ...styles.body, ...styles.warning } }),
       identity?.loggedIn && (!state.ready || !identityMatches) && body(state.refreshing ? '正在核对账号状态…' : '状态尚未确认，请刷新。', { role: 'status' }),
       loggedIn && state.ready && status.capability === 'unknown' && body('点击“连接项目”检查服务器能力；打开页面或刷新状态不会连接云端。', { role: 'status' }),
       state.error && body(state.error.message, { role: 'alert', style: { ...styles.body, ...styles.warning } }),
@@ -193,11 +197,18 @@ export function createBidirectionalPanel(React, { Button, Input, Checkbox, Switc
                   h(Checkbox, { checked: dialog.workspaceId === row.id, label: row.label + (row.available ? '' : ' · 不可用'), disabled: !canAct || !row.available, onChange: selected => act(() => controller.selectWorkspace(selected ? row.id : '')) }), root(row.root)))),
                 !workspaces.length && body('没有匹配的工作区；请先在 DSH 中添加工作区。'), workspaces.length > 100 && body('仅显示前100项，请继续搜索。')),
               h('div', { style: styles.column }, h('h4', { style: styles.heading }, '云端项目'), search(projectSearch, setProjectSearch, '搜索云端项目'),
-                h(Checkbox, { checked: dialog.projectChoice === 'new', label: '创建新的云端项目', disabled: !canAct || !state.projects.loaded, onChange: selected => act(() => controller.selectProject(selected ? null : undefined)) }),
-                h('div', { style: styles.list, role: 'group', 'aria-label': '云端项目列表' }, ...projects.slice(0, 100).map(row => h(Checkbox, { key: row.projectId, checked: dialog.projectChoice === 'existing' && dialog.projectId === row.projectId, label: row.label + (row.legacy ? ' · 旧版' : ''), disabled: !canAct || !state.projects.loaded, onChange: selected => act(() => controller.selectProject(selected ? row.projectId : undefined)) }))),
+                h('div', { style: styles.projectOption, 'data-cloud-choice': 'new' },
+                  h(Checkbox, { checked: dialog.projectChoice === 'new', label: '创建新的云端项目', disabled: !canAct || !state.projects.loaded, onChange: selected => act(() => controller.selectProject(selected ? null : undefined)) }),
+                  root('新建独立项目，不覆盖已有备份。')),
+                h('div', { style: { ...styles.list, ...styles.column, gap: 8 }, role: 'group', 'aria-label': '云端项目列表' }, ...projects.slice(0, 100).map(row => h('div', { key: row.projectId, style: styles.projectOption, 'data-cloud-project-id': row.projectId },
+                  h(Checkbox, { checked: dialog.projectChoice === 'existing' && dialog.projectId === row.projectId, label: row.label, disabled: !canAct || !state.projects.loaded, onChange: selected => act(() => controller.selectProject(selected ? row.projectId : undefined)) }),
+                  row.sourceRoot && root(`来源：${row.sourceRoot}`),
+                  row.checkpointCount !== undefined && root(`已保存 ${row.checkpointCount} 个版本${row.latestCreatedAt ? ` · 最近 ${when(row.latestCreatedAt)}` : ''}`),
+                  duplicateProject(row) && h('details', null, h('summary', { style: styles.root }, '区分同名项目'), root(`项目标识：${row.projectId}`))))),
+                body('已有云端内容会保留；首次连接须预览并确认。'),
                 state.projects.loaded && !projects.length && body('暂无匹配的云端项目，可显式创建新项目。'), projects.length > 100 && body('仅显示前100项，请继续搜索。'), state.projects.partial && body('部分云端项目读取失败，请刷新核对。', { role: 'alert' }))),
-            dialog.legacyChoices.length > 0 && h('div', { style: styles.column, role: 'group', 'aria-label': '旧版主版本' }, body('旧版项目存在多个分支。请选择一次性主版本，其余差异仍保留，不推断历史删除。'),
-              ...dialog.legacyChoices.map(row => h(Checkbox, { key: row.id, checked: dialog.primaryLegacyId === row.id, label: row.label, disabled: !canAct, onChange: checked => { if (checked) act(() => controller.selectLegacy(row.id)); } })))),
+            dialog.legacyChoices.length > 0 && h('div', { style: styles.column, role: 'group', 'aria-label': '云端主要版本' }, body('这个项目保存过不同分支。请选择首次连接采用的主要版本，其余差异和历史内容仍保留，不会把缺少的文件当作删除指令。'),
+              ...dialog.legacyChoices.map(row => h('div', { key: row.id, style: styles.projectOption }, h(Checkbox, { checked: dialog.primaryLegacyId === row.id, label: row.label, disabled: !canAct, onChange: checked => { if (checked) act(() => controller.selectLegacy(row.id)); } }))))),
           ['conflicts', 'recycle'].includes(dialog.kind) && dialog.stage === 'choose' && h('div', { style: styles.column },
             binding && h('div', null, body(binding.label), root(binding.root)), search(itemSearch, setItemSearch, dialog.kind === 'conflicts' ? '搜索冲突文件' : '搜索回收文件', true),
             dialog.kind === 'conflicts' && body('默认保留双方。先预览目标文件，再明确确认；不提供自动文本合并。'),
@@ -228,7 +239,8 @@ export function createBidirectionalPanel(React, { Button, Input, Checkbox, Switc
             dialog.kind === 'pair' && h('div', { style: styles.column }, body(plan.label), root(plan.root),
               body(`上传 ${plan.summary.upload} · 下载 ${plan.summary.download} · 删除 ${plan.summary.delete} · 冲突 ${plan.summary.conflicts} · 阻止 ${plan.summary.blocked}`, { 'aria-label': '配对变更摘要' }),
               plan.summary.blocked > 0 && body('存在阻止项，不能启用。请返回处理后重新预览。', { role: 'alert' }),
-              body('确认后启用此配对的自动双向同步。未跟踪文件不会被当作删除；有冲突时保留副本。')),
+              body('确认后启用此配对的自动双向同步。未跟踪文件不会被当作删除；有冲突时保留副本。'),
+              state.projects.items.find(row => row.projectId === dialog.projectId)?.legacy && body('此项目的历史内容会保留。连接后以双向状态为准，旧客户端将不能再向此项目追加备份。')),
             dialog.kind === 'conflicts' && h('div', { style: styles.column }, root(plan.root), body(plan.summary),
               body(`选择：${({ both: '保留双方', local: '本机版本', remote: '云端版本' })[plan.choice]}`),
               h('ul', { style: { ...styles.body, ...styles.list }, 'aria-label': '冲突处理目标' }, ...plan.paths.map((name, index) => h('li', { key: index }, name)))),

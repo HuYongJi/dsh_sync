@@ -7,7 +7,7 @@ import { LocalStore } from '../src/local-store.mjs';
 import { SyncClient } from '../src/client.mjs';
 import { validateManifest, sha256 } from '../src/protocol.mjs';
 import { createController, apply, credentialKeyForProfile } from '../plugin/index.mjs';
-import { runCli } from '../src/cli.mjs';
+import { captureCheckpoint } from '../src/snapshot.mjs';
 import { createSyncServer, closeSyncServer } from '../server/index.mjs';
 const base = fileURLToPath(new URL('../.test-tmp/', import.meta.url));
 async function temp(t) {
@@ -20,8 +20,8 @@ test('state names containing glob syntax are excluded literally from capture and
   const store = await new LocalStore(state).init(); await store.saveConfig({ token: 'SECRET-BEARER-FIXTURE' });
   const result = await store.capture({ root, projectId: 'demo', deviceId: 'a' });
   assert.equal(result.manifest.files.length, 0);
-  const outputs = []; await runCli(['preview', '--state', state, '--project', 'demo', '--root', root], { output: item => outputs.push(item) });
-  assert.deepEqual(outputs[0].files, []);
+  const preview = await captureCheckpoint({ root, projectId: 'demo', deviceId: 'preview', excludedPaths: ['state[1]'], putBlob: async () => {} });
+  assert.deepEqual(preview.manifest.files, []);
 });
 test('queue root and server binding are checked before uploading any blob', async t => {
   const directory = await temp(t), rootA = path.join(directory, 'a'), rootB = path.join(directory, 'b');
@@ -72,8 +72,8 @@ test('plugin registers inert-by-default native login/commands and scoped setting
   apply({ profileContext: { dir: profileDir, home: path.join(directory, 'dsh-home') }, connection: { fetch: { register: value => routes.push(value) } }, authorization: { registerFlow: value => flows.push(value) }, commands: { register: value => commands.push(value) }, on: (...args) => hooks.push(args) });
   t.after(() => hooks.find(([name]) => name === 'dispose')[1]());
   assert.equal(flows[0].key, credentialKeyForProfile(profileDir)); assert.equal(flows[0].methods[0].id, 'password');
-  assert.equal(commands.length, 6); assert.ok(commands.every(command => command.recordInput === false));
-  assert.equal(routes.length, 40); assert.ok(routes.every(route => route.requestBody === 'streaming'));
+  assert.deepEqual(commands.map(command => command.name), ['sync-status', 'sync-logout']); assert.ok(commands.every(command => command.recordInput === false));
+  assert.equal(routes.length, 26); assert.ok(routes.every(route => route.requestBody === 'streaming' && route.methods.length === 1 && route.methods[0] === 'POST'));
 });
 test('native flow stores token only in its credential record and syncs only the mapped idle project', async t => {
   const directory = await temp(t), root = path.join(directory, 'root'); await fs.mkdir(root); await fs.writeFile(path.join(root, 'hello'), 'fixture');
